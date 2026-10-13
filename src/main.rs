@@ -3,7 +3,9 @@ mod config;
 mod routes;
 
 use config::Config;
+use std::time::Duration;
 mod observability;
+mod state;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -13,7 +15,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tracer_provider = observability::init(config.log_level.as_str())?;
 
     let addr = format!("{}:{}", config.host, config.port);
-    let app = app::build_app();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.upstream_timeout_secs))
+        .build()?;
+    let app_state = state::AppState {
+        client,
+        swapi_base_url: config.swapi_base_url.clone(),
+    };
+    let app = app::build_app(config, app_state);
 
     println!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr)

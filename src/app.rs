@@ -1,12 +1,16 @@
 use axum::{Router, body::Body, http::Request};
 use opentelemetry::{global, trace::TraceContextExt};
+use tower_http::limit::RequestBodyLimitLayer;
 
 use opentelemetry_http::HeaderExtractor;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-pub fn build_app() -> Router {
+use crate::config::Config;
+use crate::state;
+
+pub fn build_app(config: Config, state: state::AppState) -> Router {
     let trace_layer = TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
         let parent_context = global::get_text_map_propagator(|propagator| {
             propagator.extract(&HeaderExtractor(request.headers()))
@@ -40,7 +44,8 @@ pub fn build_app() -> Router {
         span
     });
 
-    crate::routes::router()
+    crate::routes::router(state)
+        .layer(RequestBodyLimitLayer::new(config.max_request_body_bytes))
         .layer(trace_layer)
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
