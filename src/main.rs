@@ -6,11 +6,11 @@ use config::Config;
 mod observability;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
     let config = Config::from_env()?;
 
-    observability::init(config.log_level.as_str());
+    let tracer_provider = observability::init(config.log_level.as_str())?;
 
     let addr = format!("{}:{}", config.host, config.port);
     let app = app::build_app();
@@ -23,5 +23,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .await
         .unwrap();
+    tracer_provider.shutdown()?;
     Ok(())
 }
