@@ -1,7 +1,7 @@
-use axum::{Router, routing::get};
-use tower_http::trace::TraceLayer;
-
+mod app;
 mod config;
+mod routes;
+
 use config::Config;
 mod observability;
 
@@ -13,9 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     observability::init(config.log_level.as_str());
 
     let addr = format!("{}:{}", config.host, config.port);
-    let app = Router::new()
-        .route("/", get(|| async { "Hello, world!" }))
-        .layer(TraceLayer::new_for_http());
+    let app = app::build_app();
 
     println!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr)
