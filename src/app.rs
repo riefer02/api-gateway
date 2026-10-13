@@ -2,6 +2,7 @@ use axum::{Router, body::Body, http::Request};
 use opentelemetry::{global, trace::TraceContextExt};
 
 use opentelemetry_http::HeaderExtractor;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -11,12 +12,18 @@ pub fn build_app() -> Router {
             propagator.extract(&HeaderExtractor(request.headers()))
         });
 
+        let request_id = request
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing");
+
         let span = tracing::info_span!(
             "request",
             otel.kind = "server",
             method = %request.method(),
             path = %request.uri().path(),
-
+            request_id = %request_id,
         );
 
         let has_parent = parent_context
@@ -33,5 +40,8 @@ pub fn build_app() -> Router {
         span
     });
 
-    crate::routes::router().layer(trace_layer)
+    crate::routes::router()
+        .layer(trace_layer)
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(PropagateRequestIdLayer::x_request_id())
 }
