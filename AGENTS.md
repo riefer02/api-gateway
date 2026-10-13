@@ -7,3 +7,5 @@ You can show steps and code examples.
 Do not overload user with long winded jargon answers.
 
 Read latest Rust docs as you work to stay up to date.
+
+When asked to commit you only commit words that the author has spoken. Of course clean the grammar and syntax
