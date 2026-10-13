@@ -1,6 +1,7 @@
 pub struct Config {
     pub port: u16,
     pub host: String,
+    pub log_level: String,
 }
 
 impl Config {
@@ -14,6 +15,11 @@ impl Config {
                 )) as Box<dyn std::error::Error>
             })?;
         let host = std::env::var("HOST").unwrap_or_else(|_| "localhost".to_string());
-        Ok(Self { port, host })
+        let log_level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        Ok(Self {
+            port,
+            host,
+            log_level,
+        })
     }
 }
