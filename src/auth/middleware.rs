@@ -54,6 +54,11 @@ pub(crate) async fn require_api_key(
 
     match verify_api_key(state.api_key_store.as_ref(), &key_id, secret).await {
         Ok(identity) => {
+            let span = tracing::Span::current();
+            span.record("tenant_id", identity.tenant_id.0.as_str());
+            span.record("client_id", identity.client_id.0.as_str());
+            span.record("key_id", identity.key_id.0.as_str());
+
             request
                 .extensions_mut()
                 .insert(identity);

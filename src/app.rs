@@ -28,6 +28,9 @@ pub fn build_app(config: Config, state: state::AppState) -> Router {
             method = %request.method(),
             path = %request.uri().path(),
             request_id = %request_id,
+            tenant_id = tracing::field::Empty,
+            client_id = tracing::field::Empty,
+            key_id = tracing::field::Empty,
         );
 
         let has_parent = parent_context
