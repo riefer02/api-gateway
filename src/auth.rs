@@ -3,6 +3,7 @@ use std::{collections::HashSet, time::SystemTime};
 use subtle::ConstantTimeEq;
 
 pub(crate) mod middleware;
+pub(crate) mod scopes;
 pub(crate) mod store;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -136,6 +137,37 @@ pub(crate) async fn verify_api_key(
     })
 }
 
+pub(crate) fn seed_dev_credential(
+    store: &store::InMemoryApiKeyStore,
+    secret: &str,
+) -> Result<(), store::StoreError> {
+    let tenant_id = TenantId("tenant-local".to_owned());
+    let client_id = ClientId("client-local".to_owned());
+    let key_id = ApiKeyId("dev-local".to_owned());
+
+    store.insert(CredentialContext {
+        key: ApiKeyRecord {
+            key_id,
+            client_id: client_id.clone(),
+            verifier: hash_secret(secret),
+            verifier_version: 1,
+            scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
+            created_at: SystemTime::now(),
+            expires_at: None,
+            revoked_at: None,
+        },
+        client: Client {
+            id: client_id,
+            tenant_id: tenant_id.clone(),
+            status: AccountStatus::Active,
+        },
+        tenant: Tenant {
+            id: tenant_id,
+            status: AccountStatus::Active,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,7 +190,7 @@ mod tests {
                     client_id: client_id.clone(),
                     verifier: hash_secret(TEST_SECRET),
                     verifier_version: 1,
-                    scopes: HashSet::from(["swapi:people:read".to_owned()]),
+                    scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
                     created_at: SystemTime::now(),
                     expires_at: None,
                     revoked_at: None,

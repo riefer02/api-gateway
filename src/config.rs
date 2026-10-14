@@ -1,3 +1,9 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppEnvironment {
+    Development,
+    Production,
+}
+
 pub struct Config {
     pub port: u16,
     pub host: String,
@@ -5,6 +11,7 @@ pub struct Config {
     pub swapi_base_url: String,
     pub max_request_body_bytes: usize,
     pub upstream_timeout_secs: u64,
+    pub environment: AppEnvironment,
 }
 
 impl Config {
@@ -38,6 +45,16 @@ impl Config {
                     "UPSTREAM_TIMEOUT_SECS must be a number".into(),
                 )) as Box<dyn std::error::Error + Send + Sync>
             })?;
+        let environment = match std::env::var("APP_ENV")?.as_str() {
+            "development" => AppEnvironment::Development,
+            "production" => AppEnvironment::Production,
+            _ => {
+                return Err(
+                    std::io::Error::other("APP_ENV must be development or production").into(),
+                );
+            }
+        };
+
         Ok(Self {
             port,
             host,
@@ -45,6 +62,7 @@ impl Config {
             swapi_base_url,
             max_request_body_bytes,
             upstream_timeout_secs,
+            environment,
         })
     }
 }

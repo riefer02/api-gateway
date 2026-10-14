@@ -12,16 +12,30 @@ use std::sync::Arc;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenvy::dotenv().ok();
     let config = Config::from_env()?;
-
     let tracer_provider = observability::init(config.log_level.as_str())?;
-
     let addr = format!("{}:{}", config.host, config.port);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.upstream_timeout_secs))
         .build()?;
-    let api_key_store: Arc<dyn auth::store::ApiKeyStore> =
-        Arc::new(auth::store::InMemoryApiKeyStore::default());
+    let in_memory_store = auth::store::InMemoryApiKeyStore::default();
 
+    match config.environment {
+        config::AppEnvironment::Development => {
+            let secret = std::env::var("DEV_API_KEY_SECRET")?;
+            auth::seed_dev_credential(&in_memory_store, &secret)
+                .expect("failed to seed development API key");
+        }
+        config::AppEnvironment::Production => {
+            if std::env::var_os("DEV_API_KEY_SECRET").is_some() {
+                return Err(std::io::Error::other(
+                    "DEV_API_KEY_SECRET must not be set in production",
+                )
+                .into());
+            }
+        }
+    }
+
+    let api_key_store: Arc<dyn auth::store::ApiKeyStore> = Arc::new(in_memory_store);
     let app_state = state::AppState {
         client,
         swapi_base_url: config.swapi_base_url.clone(),

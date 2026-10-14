@@ -8,6 +8,7 @@ mod swapi;
 pub(crate) fn router(state: state::AppState) -> Router {
     let protected_swapi = Router::new()
         .route("/swapi/people/1", get(swapi::person))
+        .route_layer(middleware::from_fn(auth::middleware::require_people_read))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::middleware::require_api_key,

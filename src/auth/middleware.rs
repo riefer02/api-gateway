@@ -6,9 +6,11 @@ use axum::{
 };
 
 use crate::{
-    auth::{ApiKeyId, AuthError, verify_api_key},
+    auth::{ApiKeyId, AuthError, ClientIdentity, verify_api_key},
     state::AppState,
 };
+
+use crate::auth::scopes;
 
 fn unauthorized() -> Response {
     (
@@ -60,5 +62,56 @@ pub(crate) async fn require_api_key(
         Err(AuthError::InvalidCredentials) => unauthorized(),
         Err(AuthError::Forbidden) => StatusCode::FORBIDDEN.into_response(),
         Err(AuthError::StoreUnavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn require_people_read(request: Request, next: Next) -> Response {
+    let Some(identity) = request
+        .extensions()
+        .get::<ClientIdentity>()
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    if !identity
+        .scopes
+        .contains(scopes::PEOPLE_READ)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_people_read;
+    use crate::auth::{ApiKeyId, ClientId, ClientIdentity, TenantId};
+    use axum::{Router, body::Body, extract::Request, http::StatusCode, middleware, routing::get};
+    use std::collections::HashSet;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn denies_identity_without_people_read_scope() {
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(require_people_read));
+
+        let mut request = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+
+        request
+            .extensions_mut()
+            .insert(ClientIdentity {
+                tenant_id: TenantId("tenant-test".to_owned()),
+                client_id: ClientId("client-test".to_owned()),
+                key_id: ApiKeyId("key-test".to_owned()),
+                scopes: HashSet::new(),
+            });
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
