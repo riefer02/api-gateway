@@ -4,12 +4,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use std::time::SystemTime;
 
 use super::{ApiKeyId, CredentialContext};
 
 #[derive(Debug)]
 pub(crate) enum StoreError {
     Unavailable,
+    DuplicateKey,
 }
 
 #[async_trait]
@@ -18,6 +20,8 @@ pub(crate) trait ApiKeyStore: Send + Sync {
         &self,
         key_id: &ApiKeyId,
     ) -> Result<Option<CredentialContext>, StoreError>;
+
+    async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError>;
 }
 
 #[derive(Clone, Default)]
@@ -32,8 +36,13 @@ impl InMemoryApiKeyStore {
             .write()
             .map_err(|_| StoreError::Unavailable)?;
 
-        records.insert(credential.key.key_id.clone(), credential);
-        Ok(())
+        match records.entry(credential.key.key_id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(credential);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(StoreError::DuplicateKey),
+        }
     }
 }
 
@@ -49,5 +58,22 @@ impl ApiKeyStore for InMemoryApiKeyStore {
             .map_err(|_| StoreError::Unavailable)?;
 
         Ok(records.get(key_id).cloned())
+    }
+
+    async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError> {
+        let mut records = self
+            .records
+            .write()
+            .map_err(|_| StoreError::Unavailable)?;
+
+        let Some(credential) = records.get_mut(key_id) else {
+            return Ok(false);
+        };
+
+        if credential.key.revoked_at.is_none() {
+            credential.key.revoked_at = Some(SystemTime::now());
+        }
+
+        Ok(true)
     }
 }

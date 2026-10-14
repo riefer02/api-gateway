@@ -7,6 +7,8 @@ edition = "2024"
 async-trait = "0.1.92"
 axum = "0.8"
 dotenvy = "0.15.7"
+getrandom = "0.4.3"
+hex = "0.4.3"
 opentelemetry = "0.33.1"
 opentelemetry-http = "0.33.0"
 opentelemetry-otlp = { version = "0.33.1", features = ["trace", "grpc-tonic"] }

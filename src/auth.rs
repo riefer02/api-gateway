@@ -2,10 +2,10 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, time::SystemTime};
 use subtle::ConstantTimeEq;
 
+pub(crate) mod key;
 pub(crate) mod middleware;
 pub(crate) mod scopes;
 pub(crate) mod store;
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TenantId(pub(crate) String);
 
