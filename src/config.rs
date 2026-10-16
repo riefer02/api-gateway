@@ -12,6 +12,7 @@ pub struct Config {
     pub max_request_body_bytes: usize,
     pub upstream_timeout_secs: u64,
     pub environment: AppEnvironment,
+    pub database_url: String,
 }
 
 impl Config {
@@ -54,6 +55,7 @@ impl Config {
                 );
             }
         };
+        let database_url = std::env::var("DATABASE_URL")?;
 
         Ok(Self {
             port,
@@ -63,6 +65,7 @@ impl Config {
             max_request_body_bytes,
             upstream_timeout_secs,
             environment,
+            database_url,
         })
     }
 }

@@ -8,4 +8,6 @@ Do not overload user with long winded jargon answers.
 
 Read latest Rust docs as you work to stay up to date.
 
+When directed to add packages using the cli methods is preferred.
+
 When asked to commit you only commit words that the author has spoken. Of course clean the grammar and syntax.

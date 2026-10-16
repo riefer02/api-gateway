@@ -4,9 +4,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use std::time::SystemTime;
+use time::OffsetDateTime;
 
 use super::{ApiKeyId, CredentialContext};
+
+mod postgres;
 
 #[derive(Debug)]
 pub(crate) enum StoreError {
@@ -22,6 +24,7 @@ pub(crate) trait ApiKeyStore: Send + Sync {
     ) -> Result<Option<CredentialContext>, StoreError>;
 
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError>;
+    async fn insert_credential(&self, credential: CredentialContext) -> Result<(), StoreError>;
 }
 
 #[derive(Clone, Default)]
@@ -71,9 +74,13 @@ impl ApiKeyStore for InMemoryApiKeyStore {
         };
 
         if credential.key.revoked_at.is_none() {
-            credential.key.revoked_at = Some(SystemTime::now());
+            credential.key.revoked_at = Some(OffsetDateTime::now_utc());
         }
 
         Ok(true)
+    }
+
+    async fn insert_credential(&self, credential: CredentialContext) -> Result<(), StoreError> {
+        self.insert(credential)
     }
 }

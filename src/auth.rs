@@ -1,11 +1,13 @@
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, time::SystemTime};
+use std::collections::HashSet;
 use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
 
 pub(crate) mod key;
 pub(crate) mod middleware;
 pub(crate) mod scopes;
 pub(crate) mod store;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TenantId(pub(crate) String);
 
@@ -45,9 +47,9 @@ pub(crate) struct ApiKeyRecord {
     pub(crate) verifier: SecretVerifier,
     pub(crate) verifier_version: u8,
     pub(crate) scopes: HashSet<String>,
-    pub(crate) created_at: SystemTime,
-    pub(crate) expires_at: Option<SystemTime>,
-    pub(crate) revoked_at: Option<SystemTime>,
+    pub(crate) created_at: OffsetDateTime,
+    pub(crate) expires_at: Option<OffsetDateTime>,
+    pub(crate) revoked_at: Option<OffsetDateTime>,
 }
 
 // Constructed after successful authentication; safe to pass to handlers.
@@ -106,7 +108,7 @@ pub(crate) async fn verify_api_key(
         return Err(AuthError::InvalidCredentials);
     }
 
-    let now = SystemTime::now();
+    let now = OffsetDateTime::now_utc();
 
     if credential.key.revoked_at.is_some()
         || credential
@@ -137,41 +139,44 @@ pub(crate) async fn verify_api_key(
     })
 }
 
-pub(crate) fn seed_dev_credential(
-    store: &store::InMemoryApiKeyStore,
+pub(crate) async fn seed_dev_credential(
+    store: &dyn store::ApiKeyStore,
     secret: &str,
 ) -> Result<(), store::StoreError> {
     let tenant_id = TenantId("tenant-local".to_owned());
     let client_id = ClientId("client-local".to_owned());
     let key_id = ApiKeyId("dev-local".to_owned());
 
-    store.insert(CredentialContext {
-        key: ApiKeyRecord {
-            key_id,
-            client_id: client_id.clone(),
-            verifier: hash_secret(secret),
-            verifier_version: 1,
-            scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
-            created_at: SystemTime::now(),
-            expires_at: None,
-            revoked_at: None,
-        },
-        client: Client {
-            id: client_id,
-            tenant_id: tenant_id.clone(),
-            status: AccountStatus::Active,
-        },
-        tenant: Tenant {
-            id: tenant_id,
-            status: AccountStatus::Active,
-        },
-    })
+    store
+        .insert_credential(CredentialContext {
+            key: ApiKeyRecord {
+                key_id,
+                client_id: client_id.clone(),
+                verifier: hash_secret(secret),
+                verifier_version: 1,
+                scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
+                created_at: OffsetDateTime::now_utc(),
+                expires_at: None,
+                revoked_at: None,
+            },
+            client: Client {
+                id: client_id,
+                tenant_id: tenant_id.clone(),
+                status: AccountStatus::Active,
+            },
+            tenant: Tenant {
+                id: tenant_id,
+                status: AccountStatus::Active,
+            },
+        })
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, time::SystemTime};
+    use std::collections::HashSet;
+    use time::OffsetDateTime;
 
     use store::InMemoryApiKeyStore;
 
@@ -191,7 +196,7 @@ mod tests {
                     verifier: hash_secret(TEST_SECRET),
                     verifier_version: 1,
                     scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
-                    created_at: SystemTime::now(),
+                    created_at: OffsetDateTime::now_utc(),
                     expires_at: None,
                     revoked_at: None,
                 },

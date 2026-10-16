@@ -1,6 +1,7 @@
 use super::ApiKeyId;
 
-use std::{collections::HashSet, time::SystemTime};
+use std::collections::HashSet;
+use time::OffsetDateTime;
 
 use super::{
     AccountStatus, ApiKeyRecord, Client, CredentialContext, Tenant, hash_secret,
@@ -43,8 +44,10 @@ pub(crate) fn issue_api_key(
     client: &Client,
     tenant: &Tenant,
     scopes: HashSet<String>,
-    expires_at: Option<SystemTime>,
+    expires_at: Option<OffsetDateTime>,
 ) -> Result<String, IssueKeyError> {
+    let now = OffsetDateTime::now_utc();
+
     if client.tenant_id != tenant.id {
         return Err(IssueKeyError::TenantMismatch);
     }
@@ -53,7 +56,7 @@ pub(crate) fn issue_api_key(
         return Err(IssueKeyError::InactiveAccount);
     }
 
-    if expires_at.is_some_and(|expiry| expiry <= SystemTime::now()) {
+    if expires_at.is_some_and(|expiry| expiry <= now) {
         return Err(IssueKeyError::InvalidExpiration);
     }
 
@@ -67,7 +70,7 @@ pub(crate) fn issue_api_key(
                 verifier: hash_secret(&secret),
                 verifier_version: 1,
                 scopes: scopes.clone(),
-                created_at: SystemTime::now(),
+                created_at: now,
                 expires_at,
                 revoked_at: None,
             },
