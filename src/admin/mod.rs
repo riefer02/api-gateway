@@ -71,6 +71,38 @@ pub(crate) struct UpstreamSummary {
     pub(crate) timeout_ms: u32,
 }
 
+/// Who performed a mutation. The name is bound to an admin token; there are no
+/// roles yet, so every actor is a full administrator.
+#[derive(Clone, Debug)]
+pub(crate) struct Actor {
+    pub(crate) name: String,
+    pub(crate) source_ip: Option<String>,
+}
+
+impl Actor {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source_ip: None,
+        }
+    }
+
+    pub(crate) fn with_source_ip(mut self, source_ip: Option<String>) -> Self {
+        self.source_ip = source_ip;
+        self
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AuditEntry {
+    pub(crate) occurred_at: OffsetDateTime,
+    pub(crate) actor: String,
+    pub(crate) action: String,
+    pub(crate) subject: String,
+    pub(crate) source_ip: Option<String>,
+    pub(crate) request_id: Option<String>,
+}
+
 /// The control plane. One implementation, two adapters (CLI now, HTTP later).
 pub(crate) struct AdminService {
     pool: PgPool,
@@ -94,21 +126,51 @@ impl AdminService {
         }
     }
 
-    pub(crate) async fn create_tenant(&self, id: &str) -> Result<(), AdminError> {
+    pub(crate) async fn create_tenant(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(AdminError::Store)?;
+
         sqlx::query("INSERT INTO tenants (id, status) VALUES ($1, 'active')")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| conflict_or_store(error, "tenant", id))?;
 
-        Ok(())
+        insert_audit(
+            &mut *transaction,
+            actor,
+            "tenant.create",
+            id,
+            &serde_json::json!({}),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(AdminError::Store)
     }
 
-    pub(crate) async fn create_client(&self, id: &str, tenant_id: &str) -> Result<(), AdminError> {
+    pub(crate) async fn create_client(
+        &self,
+        actor: &Actor,
+        id: &str,
+        tenant_id: &str,
+    ) -> Result<(), AdminError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(AdminError::Store)?;
+
         sqlx::query("INSERT INTO clients (id, tenant_id, status) VALUES ($1, $2, 'active')")
             .bind(id)
             .bind(tenant_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|error| {
                 if is_foreign_key_violation(&error) {
@@ -121,11 +183,25 @@ impl AdminService {
                 }
             })?;
 
-        Ok(())
+        insert_audit(
+            &mut *transaction,
+            actor,
+            "client.create",
+            id,
+            &serde_json::json!({ "tenant_id": tenant_id }),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(AdminError::Store)
     }
 
     pub(crate) async fn issue_key(
         &self,
+        actor: &Actor,
         client_id: &str,
         scopes: &[String],
         expires_at: Option<OffsetDateTime>,
@@ -151,6 +227,14 @@ impl AdminService {
 
             match self.store.insert_key(key).await {
                 Ok(()) => {
+                    self.audit_best_effort(
+                        actor,
+                        "key.create",
+                        &key_id,
+                        serde_json::json!({ "client_id": client_id, "scopes": scopes }),
+                    )
+                    .await;
+
                     return Ok(IssuedKey {
                         key_id,
                         token,
@@ -172,7 +256,11 @@ impl AdminService {
     /// Issues a replacement for `key_id` with the same client, scopes, and
     /// remaining lifetime, then revokes the old key. The old key stays valid
     /// until the revoke commits.
-    pub(crate) async fn rotate_key(&self, key_id: &str) -> Result<IssuedKey, AdminError> {
+    pub(crate) async fn rotate_key(
+        &self,
+        actor: &Actor,
+        key_id: &str,
+    ) -> Result<IssuedKey, AdminError> {
         let row = sqlx::query(
             r#"
             SELECT
@@ -218,7 +306,7 @@ impl AdminService {
         let remaining = expires_at.filter(|expires_at| *expires_at > OffsetDateTime::now_utc());
 
         let issued = self
-            .issue_key(&client_id, &scopes, remaining)
+            .issue_key(actor, &client_id, &scopes, remaining)
             .await?;
 
         let revoked = self
@@ -243,21 +331,24 @@ impl AdminService {
         Ok(issued)
     }
 
-    pub(crate) async fn revoke_key(&self, key_id: &str) -> Result<(), AdminError> {
+    pub(crate) async fn revoke_key(&self, actor: &Actor, key_id: &str) -> Result<(), AdminError> {
         let revoked = self
             .store
             .revoke_by_key_id(&auth::ApiKeyId(key_id.to_owned()))
             .await
             .map_err(store_error)?;
 
-        if revoked {
-            Ok(())
-        } else {
-            Err(AdminError::NotFound {
+        if !revoked {
+            return Err(AdminError::NotFound {
                 entity: "active key",
                 id: key_id.to_owned(),
-            })
+            });
         }
+
+        self.audit_best_effort(actor, "key.revoke", key_id, serde_json::json!({}))
+            .await;
+
+        Ok(())
     }
 
     pub(crate) async fn list_keys(&self, client_id: &str) -> Result<Vec<KeySummary>, AdminError> {
@@ -313,11 +404,18 @@ impl AdminService {
     /// before it can poison every reload.
     pub(crate) async fn put_upstream(
         &self,
+        actor: &Actor,
         id: &str,
         base_url: &str,
         timeout_ms: u32,
     ) -> Result<(), AdminError> {
         routing::validate_upstream_url(base_url, &self.allow_hosts).map_err(AdminError::Invalid)?;
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(AdminError::Store)?;
 
         sqlx::query(
             r#"
@@ -334,14 +432,27 @@ impl AdminService {
         .bind(i32::try_from(timeout_ms).map_err(|_| {
             AdminError::Invalid(format!("timeout {timeout_ms}ms does not fit in an i32"))
         })?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(AdminError::Store)?;
 
-        Ok(())
+        insert_audit(
+            &mut *transaction,
+            actor,
+            "upstream.put",
+            id,
+            &serde_json::json!({ "base_url": base_url, "timeout_ms": timeout_ms }),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(AdminError::Store)
     }
 
-    pub(crate) async fn put_route(&self, spec: RouteSpec) -> Result<(), AdminError> {
+    pub(crate) async fn put_route(&self, actor: &Actor, spec: RouteSpec) -> Result<(), AdminError> {
         routing::validate_path_prefix(&spec.path_prefix).map_err(AdminError::Invalid)?;
         routing::parse_methods(&spec.methods).map_err(AdminError::Invalid)?;
 
@@ -360,6 +471,12 @@ impl AdminService {
             .collect();
 
         self.ensure_claim_is_free(&spec).await?;
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(AdminError::Store)?;
 
         sqlx::query(
             r#"
@@ -381,7 +498,7 @@ impl AdminService {
         .bind(&methods)
         .bind(&rewrite)
         .bind(normalize_scopes(&spec.scopes)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| {
             if is_foreign_key_violation(&error) {
@@ -394,7 +511,25 @@ impl AdminService {
             }
         })?;
 
-        Ok(())
+        insert_audit(
+            &mut *transaction,
+            actor,
+            "route.put",
+            &spec.id,
+            &serde_json::json!({
+                "path_prefix": spec.path_prefix,
+                "methods": methods,
+                "upstream_id": spec.upstream_id,
+                "scopes": spec.scopes,
+            }),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(AdminError::Store)
     }
 
     pub(crate) async fn list_routes(&self) -> Result<Vec<RouteSummary>, AdminError> {
@@ -516,7 +651,17 @@ impl AdminService {
         transaction
             .commit()
             .await
-            .map_err(AdminError::Store)
+            .map_err(AdminError::Store)?;
+
+        self.audit_best_effort(
+            &Actor::new("system"),
+            "key.seed",
+            "dev-local",
+            serde_json::json!({ "scopes": scopes }),
+        )
+        .await;
+
+        Ok(())
     }
 
     async fn ensure_client_exists(&self, client_id: &str) -> Result<(), AdminError> {
@@ -533,6 +678,59 @@ impl AdminService {
                 entity: "client",
                 id: client_id.to_owned(),
             })
+        }
+    }
+
+    pub(crate) async fn list_audit(&self, limit: i64) -> Result<Vec<AuditEntry>, AdminError> {
+        let rows = sqlx::query(
+            "SELECT occurred_at, actor, action, subject, source_ip, request_id
+             FROM audit_events
+             ORDER BY occurred_at DESC, id DESC
+             LIMIT $1",
+        )
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AdminError::Store)?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(AuditEntry {
+                    occurred_at: row
+                        .try_get("occurred_at")
+                        .map_err(AdminError::Store)?,
+                    actor: row
+                        .try_get("actor")
+                        .map_err(AdminError::Store)?,
+                    action: row
+                        .try_get("action")
+                        .map_err(AdminError::Store)?,
+                    subject: row
+                        .try_get("subject")
+                        .map_err(AdminError::Store)?,
+                    source_ip: row
+                        .try_get("source_ip")
+                        .map_err(AdminError::Store)?,
+                    request_id: row
+                        .try_get("request_id")
+                        .map_err(AdminError::Store)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Store-backed mutations commit inside the store, so their audit row is a
+    /// second write. A failure is logged rather than reported as a failed
+    /// mutation, because the mutation did happen.
+    async fn audit_best_effort(
+        &self,
+        actor: &Actor,
+        action: &str,
+        subject: &str,
+        detail: serde_json::Value,
+    ) {
+        if let Err(error) = insert_audit(&self.pool, actor, action, subject, &detail).await {
+            tracing::warn!(%error, action, subject, "audit write failed");
         }
     }
 
@@ -565,6 +763,31 @@ impl AdminService {
 
         Ok(())
     }
+}
+
+async fn insert_audit<'e, E>(
+    executor: E,
+    actor: &Actor,
+    action: &str,
+    subject: &str,
+    detail: &serde_json::Value,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO audit_events (actor, action, subject, source_ip, request_id, detail)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+    )
+    .bind(&actor.name)
+    .bind(action)
+    .bind(subject)
+    .bind(&actor.source_ip)
+    .bind(crate::request_context::current())
+    .bind(detail.to_string())
+    .execute(executor)
+    .await
+    .map(|_| ())
 }
 
 fn normalize_scopes(scopes: &[String]) -> Result<Vec<String>, AdminError> {
@@ -613,4 +836,79 @@ fn store_error(error: StoreError) -> AdminError {
 
 fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("23503"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL");
+
+        crate::db::migrate(&pool)
+            .await
+            .expect("apply migrations");
+
+        Some(pool)
+    }
+
+    fn unique(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+
+        format!("{prefix}-{}-{nanos}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn mutations_record_the_actor_and_source() {
+        let Some(pool) = pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let store: Arc<dyn ApiKeyStore> = Arc::new(
+            auth::store::postgres::PostgresApiKeyStore::new(pool.clone()),
+        );
+        let service = AdminService::new(
+            pool.clone(),
+            Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+            Vec::new(),
+            store,
+        );
+
+        let tenant = unique("audit-tenant");
+        let actor = Actor::new("alice").with_source_ip(Some("10.0.0.7".to_owned()));
+
+        service
+            .create_tenant(&actor, &tenant)
+            .await
+            .expect("create tenant");
+
+        let entries = service
+            .list_audit(50)
+            .await
+            .expect("list audit");
+        let entry = entries
+            .iter()
+            .find(|entry| entry.subject == tenant)
+            .expect("audit entry for the tenant");
+
+        assert_eq!(entry.actor, "alice");
+        assert_eq!(entry.action, "tenant.create");
+        assert_eq!(entry.source_ip.as_deref(), Some("10.0.0.7"));
+
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(&tenant)
+            .execute(&pool)
+            .await
+            .ok();
+    }
 }

@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    admin::{AdminService, IssuedKey, KeySummary, RouteSpec},
+    admin::{Actor, AdminService, IssuedKey, KeySummary, RouteSpec},
     auth::{KeyVerifier, store::ApiKeyStore},
     config::Config,
     db, observability,
@@ -70,6 +70,19 @@ pub(crate) enum AdminCommand {
     Route {
         #[command(subcommand)]
         command: RouteCommand,
+    },
+    /// Read the control-plane audit trail
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuditCommand {
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
     },
 }
 
@@ -187,24 +200,62 @@ async fn dispatch(
     );
     let service = AdminService::new(pool, verifier, config.routing.allow_hosts.clone(), store);
 
+    let actor = Actor::new("cli");
+
     match command {
         AdminCommand::Tenant {
             command: TenantCommand::Create { id },
         } => {
-            service.create_tenant(&id).await?;
+            service
+                .create_tenant(&actor, &id)
+                .await?;
             println!("tenant `{id}` created");
         }
         AdminCommand::Client {
             command: ClientCommand::Create { id, tenant },
         } => {
             service
-                .create_client(&id, &tenant)
+                .create_client(&actor, &id, &tenant)
                 .await?;
             println!("client `{id}` created in tenant `{tenant}`");
         }
-        AdminCommand::Key { command } => run_key_command(&service, command).await?,
-        AdminCommand::Upstream { command } => run_upstream_command(&service, command).await?,
-        AdminCommand::Route { command } => run_route_command(&service, command).await?,
+        AdminCommand::Key { command } => run_key_command(&service, &actor, command).await?,
+        AdminCommand::Upstream { command } => {
+            run_upstream_command(&service, &actor, command).await?
+        }
+        AdminCommand::Route { command } => run_route_command(&service, &actor, command).await?,
+        AdminCommand::Audit { command } => run_audit_command(&service, command).await?,
+    }
+
+    Ok(())
+}
+
+async fn run_audit_command(
+    service: &AdminService,
+    command: AuditCommand,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match command {
+        AuditCommand::List { limit } => {
+            let entries = service.list_audit(limit).await?;
+
+            if entries.is_empty() {
+                println!("no audit events");
+                return Ok(());
+            }
+
+            for entry in entries {
+                println!(
+                    "{:<32} {:<12} {:<18} {:<24} {}",
+                    entry.occurred_at.to_string(),
+                    entry.actor,
+                    entry.action,
+                    entry.subject,
+                    entry
+                        .source_ip
+                        .unwrap_or_else(|| "-".to_owned())
+                );
+            }
+        }
     }
 
     Ok(())
@@ -212,6 +263,7 @@ async fn dispatch(
 
 async fn run_key_command(
     service: &AdminService,
+    actor: &Actor,
     command: KeyCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
@@ -231,17 +283,21 @@ async fn run_key_command(
 
             print_issued(
                 &service
-                    .issue_key(&client, &scopes, expires_at)
+                    .issue_key(actor, &client, &scopes, expires_at)
                     .await?,
             );
         }
         KeyCommand::Rotate { key_id } => {
-            let issued = service.rotate_key(&key_id).await?;
+            let issued = service
+                .rotate_key(actor, &key_id)
+                .await?;
             println!("key `{key_id}` revoked");
             print_issued(&issued);
         }
         KeyCommand::Revoke { key_id } => {
-            service.revoke_key(&key_id).await?;
+            service
+                .revoke_key(actor, &key_id)
+                .await?;
             println!("key `{key_id}` revoked");
         }
         KeyCommand::List { client } => {
@@ -263,6 +319,7 @@ async fn run_key_command(
 
 async fn run_upstream_command(
     service: &AdminService,
+    actor: &Actor,
     command: UpstreamCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
@@ -272,7 +329,7 @@ async fn run_upstream_command(
             timeout_ms,
         } => {
             service
-                .put_upstream(&id, &base_url, timeout_ms)
+                .put_upstream(actor, &id, &base_url, timeout_ms)
                 .await?;
             println!("upstream `{id}` -> {base_url} (timeout {timeout_ms}ms)");
         }
@@ -283,6 +340,7 @@ async fn run_upstream_command(
 
 async fn run_route_command(
     service: &AdminService,
+    actor: &Actor,
     command: RouteCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
@@ -295,14 +353,17 @@ async fn run_route_command(
             scopes,
         } => {
             service
-                .put_route(RouteSpec {
-                    id: id.clone(),
-                    path_prefix: prefix.clone(),
-                    methods,
-                    upstream_id: upstream,
-                    rewrite_prefix: rewrite,
-                    scopes,
-                })
+                .put_route(
+                    actor,
+                    RouteSpec {
+                        id: id.clone(),
+                        path_prefix: prefix.clone(),
+                        methods,
+                        upstream_id: upstream,
+                        rewrite_prefix: rewrite,
+                        scopes,
+                    },
+                )
                 .await?;
 
             println!("route `{id}` configured on `{prefix}`");

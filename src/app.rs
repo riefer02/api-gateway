@@ -1,10 +1,4 @@
-use axum::{
-    Router,
-    body::Body,
-    http::Request,
-    http::{HeaderValue, header},
-    response::IntoResponse,
-};
+use axum::{Router, body::Body, http::Request, http::header, response::IntoResponse};
 use opentelemetry::{global, trace::TraceContextExt};
 use std::time::Instant;
 use tower::ServiceBuilder;
@@ -66,7 +60,7 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         // Sanitise before propagation so the response echoes the value we
         // actually logged, not a client-supplied one.
-        .layer(axum::middleware::from_fn(record_request_id))
+        .layer(axum::middleware::from_fn(request_context::scope_request_id))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(axum::middleware::from_fn(record_metrics))
         .layer(trace_layer)
@@ -117,36 +111,6 @@ async fn request_deadline(
         Ok(response) => response,
         Err(_) => AppError::RequestTimeout.into_response(),
     }
-}
-
-/// Keeps log lines and response headers safe: bounded length, printable ASCII.
-fn is_valid_request_id(request_id: &str) -> bool {
-    !request_id.is_empty()
-        && request_id.len() <= 128
-        && request_id
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic())
-}
-
-async fn record_request_id(
-    mut request: Request<Body>,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let request_id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| is_valid_request_id(value))
-        .map(str::to_owned)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
-        request
-            .headers_mut()
-            .insert("x-request-id", value);
-    }
-
-    request_context::scope(request_id, next.run(request)).await
 }
 
 /// RED metrics for every request, including ones rejected before routing.

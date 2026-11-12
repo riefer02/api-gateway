@@ -124,12 +124,11 @@ fn log_startup(config: &Config, routes: &RouteTableHandle) {
         version = env!("CARGO_PKG_VERSION"),
         environment = config.environment.as_str(),
         listen = %format!("{}:{}", config.server.host, config.server.port),
-        admin = config
-            .admin
-            .token
-            .as_ref()
-            .map(|_| config.admin.bind.as_str())
-            .unwrap_or("disabled"),
+        admin = if config.admin.tokens.is_empty() {
+            "disabled"
+        } else {
+            config.admin.bind.as_str()
+        },
         routes = table.len(),
         table_version = table.version(),
         credential_cache_secs = config.auth.cache_ttl.as_secs(),
@@ -151,11 +150,11 @@ async fn start_admin(
     config: &Config,
     service: Arc<admin::AdminService>,
 ) -> Result<Option<AdminServer>, BoxError> {
-    let Some(token) = config.admin.token.clone() else {
+    if config.admin.tokens.is_empty() {
         return Ok(None);
-    };
+    }
 
-    let app = admin::http::router(service, token);
+    let app = admin::http::router(service, Arc::new(config.admin.tokens.clone()));
     let listener = tokio::net::TcpListener::bind(&config.admin.bind).await?;
 
     tracing::info!(bind = %config.admin.bind, "admin API listening");
@@ -163,11 +162,14 @@ async fn start_admin(
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let task = tokio::spawn(
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .into_future(),
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .into_future(),
     );
 
     Ok(Some(AdminServer { task, shutdown }))

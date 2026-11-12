@@ -40,7 +40,7 @@ impl Config {
         if self.retry.max_attempts <= 1 {
             notes.push("RETRY_MAX_ATTEMPTS=1: upstream retries are disabled".to_owned());
         }
-        if self.admin.token.is_none() {
+        if self.admin.tokens.is_empty() {
             notes.push("ADMIN_TOKEN is unset: the HTTP control plane is disabled".to_owned());
         }
         if self.telemetry.metrics_token.is_none() {
@@ -151,8 +151,15 @@ pub struct AuthConfig {
 pub struct AdminConfig {
     /// Bind address for the HTTP control plane. Empty disables it.
     pub bind: String,
-    /// Bearer token for the control plane. `None` disables the listener.
-    pub token: Option<SecretString>,
+    /// Named admin tokens. Empty disables the listener.
+    pub tokens: Vec<AdminToken>,
+}
+
+/// One operator credential. The name is what the audit log records.
+#[derive(Clone, Debug)]
+pub struct AdminToken {
+    pub name: String,
+    pub token: SecretString,
 }
 
 #[derive(Clone, Debug)]
@@ -291,7 +298,7 @@ impl Config {
 
         let admin = AdminConfig {
             bind: string_or(source, "ADMIN_BIND", "127.0.0.1:9090"),
-            token: non_empty(source.get("ADMIN_TOKEN")).map(SecretString::new),
+            tokens: admin_tokens(source, &mut problems),
         };
 
         let rate_limit_backend = match source
@@ -426,7 +433,7 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     if !(0.0..=10.0).contains(&config.retry.budget_ratio) {
         problems.push("RETRY_BUDGET_RATIO must be between 0 and 10".to_owned());
     }
-    if admin.token.is_some()
+    if !admin.tokens.is_empty()
         && admin
             .bind
             .parse::<std::net::SocketAddr>()
@@ -540,6 +547,65 @@ fn dev_scopes(value: Option<String>) -> Vec<String> {
     } else {
         scopes
     }
+}
+
+/// `ADMIN_TOKENS=alice:token,bob:token` for named operators; `ADMIN_TOKEN=x`
+/// remains supported and maps to the actor `admin`.
+fn admin_tokens(source: &dyn EnvSource, problems: &mut Vec<String>) -> Vec<AdminToken> {
+    let mut tokens: Vec<AdminToken> = Vec::new();
+
+    if let Some(list) = non_empty(source.get("ADMIN_TOKENS")) {
+        for entry in list.split(',') {
+            let Some((name, token)) = entry.split_once(':') else {
+                problems.push("ADMIN_TOKENS entries must look like `name:token`".to_owned());
+                continue;
+            };
+
+            let (name, token) = (name.trim(), token.trim());
+
+            if name.is_empty() || token.is_empty() {
+                problems
+                    .push("ADMIN_TOKENS entries must have a non-empty name and token".to_owned());
+                continue;
+            }
+
+            if tokens
+                .iter()
+                .any(|existing| existing.name == name)
+            {
+                problems.push(format!("ADMIN_TOKENS has a duplicate name `{name}`"));
+                continue;
+            }
+
+            if token.len() < 16 {
+                problems.push(format!(
+                    "ADMIN_TOKENS token for `{name}` must be at least 16 characters"
+                ));
+                continue;
+            }
+
+            tokens.push(AdminToken {
+                name: name.to_owned(),
+                token: SecretString::new(token),
+            });
+        }
+    }
+
+    if let Some(legacy) = non_empty(source.get("ADMIN_TOKEN")) {
+        if legacy.len() < 16 {
+            problems.push("ADMIN_TOKEN must be at least 16 characters".to_owned());
+        } else if !tokens
+            .iter()
+            .any(|existing| existing.name == "admin")
+        {
+            tokens.push(AdminToken {
+                name: "admin".to_owned(),
+                token: SecretString::new(legacy),
+            });
+        }
+    }
+
+    tokens
 }
 
 #[cfg(test)]
@@ -708,13 +774,59 @@ mod tests {
             ),
             ("AUTH_PEPPER", "a-long-production-pepper"),
             ("UPSTREAM_ALLOW_HOSTS", "swapi.dev"),
-            ("ADMIN_TOKEN", "admin-token"),
-            ("METRICS_TOKEN", "metrics-token"),
+            ("ADMIN_TOKEN", "admin-token-0123456789"),
+            ("METRICS_TOKEN", "metrics-token-0123456789"),
         ]);
 
         let config = Config::from_source(&values).expect("valid config");
 
         assert!(config.advisories().is_empty(), "{:?}", config.advisories());
+    }
+
+    #[test]
+    fn parses_named_admin_tokens() {
+        let mut values = valid_development();
+        values.insert(
+            "ADMIN_TOKENS".to_owned(),
+            "alice:alice-token-0123456, bob:bob-token-01234567".to_owned(),
+        );
+
+        let config = Config::from_source(&values).expect("valid config");
+
+        assert_eq!(config.admin.tokens.len(), 2);
+        assert_eq!(config.admin.tokens[0].name, "alice");
+        assert_eq!(config.admin.tokens[1].name, "bob");
+    }
+
+    #[test]
+    fn rejects_duplicate_admin_token_names() {
+        let mut values = valid_development();
+        values.insert(
+            "ADMIN_TOKENS".to_owned(),
+            "alice:alice-token-0123456,alice:another-token-0123".to_owned(),
+        );
+
+        let error = Config::from_source(&values).expect_err("duplicate names");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate name")
+        );
+    }
+
+    #[test]
+    fn rejects_short_admin_tokens() {
+        let mut values = valid_development();
+        values.insert("ADMIN_TOKENS".to_owned(), "alice:short".to_owned());
+
+        let error = Config::from_source(&values).expect_err("short token");
+
+        assert!(
+            error
+                .to_string()
+                .contains("at least 16")
+        );
     }
 
     #[test]

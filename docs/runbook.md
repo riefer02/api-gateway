@@ -30,9 +30,8 @@ automatically, so you never leave an unprinted active key behind.
 api-gateway admin key revoke <key-id>
 ```
 
-Effective immediately in this process. Other processes (and the CLI) are bounded by
-`AUTH_CACHE_TTL_SECS`; to make a revocation global instantly, restart the data plane or
-lower the TTL.
+Immediate in this process and broadcast to every replica over Postgres `LISTEN/NOTIFY`.
+The cache TTL (`AUTH_CACHE_TTL_SECS`) is only the fallback if a replica's listener drops.
 
 Suspending a whole client or tenant is a database operation today:
 
@@ -63,6 +62,17 @@ curl -s localhost:8080/metrics | grep gateway_circuit_open_total
 The breaker re-probes after `CIRCUIT_COOLDOWN_SECS`. If it keeps reopening, the upstream is
 still failing; fix the upstream or raise `CIRCUIT_FAILURE_THRESHOLD` temporarily. Restarting
 the gateway also resets breakers, because they are in-process.
+
+## Who changed what
+
+```bash
+api-gateway admin audit list --limit 50
+curl -s "$ADMIN/v1/audit?limit=50" -H "Authorization: Bearer $TOKEN"
+```
+
+Rows carry the actor bound to the admin token, the action, the subject, the source IP, and
+the request id from the response. There is one role today: every configured token is a full
+administrator, so `actor` answers *who*, not *what they were allowed to do*.
 
 ## Database outage
 

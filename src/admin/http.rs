@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
-    extract::{Path, Query, Request, State},
+    Extension, Json, Router,
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -12,19 +12,20 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
 
-use super::{AdminError, AdminService, RouteSpec};
-use crate::config::SecretString;
+use super::{Actor, AdminError, AdminService, RouteSpec};
+use crate::config::AdminToken;
 use crate::error::AppError;
 
 #[derive(Clone)]
 struct AdminState {
     service: Arc<AdminService>,
+    accounts: Arc<Vec<AdminToken>>,
 }
 
 /// HTTP adapter over [`AdminService`]. Separate listener, bearer token, and
 /// its own bind address; never mounted on the data plane.
-pub(crate) fn router(service: Arc<AdminService>, token: SecretString) -> Router {
-    let state = AdminState { service };
+pub(crate) fn router(service: Arc<AdminService>, accounts: Arc<Vec<AdminToken>>) -> Router {
+    let state = AdminState { service, accounts };
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -37,33 +38,69 @@ pub(crate) fn router(service: Arc<AdminService>, token: SecretString) -> Router 
         .route("/v1/upstreams/{id}", put(put_upstream))
         .route("/v1/routes", get(list_routes))
         .route("/v1/routes/{id}", put(put_route))
-        .route_layer(axum::middleware::from_fn_with_state(token, require_admin))
+        .route("/v1/audit", get(list_audit))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
+                    tower_http::request_id::MakeRequestUuid,
+                ))
+                .layer(axum::middleware::from_fn(
+                    crate::request_context::scope_request_id,
+                ))
+                .layer(tower_http::request_id::PropagateRequestIdLayer::x_request_id()),
+        )
         .with_state(state)
 }
 
 async fn require_admin(
-    State(token): State<SecretString>,
-    request: Request,
+    State(state): State<AdminState>,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let presented = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_owned);
 
-    let authorized = presented.is_some_and(|presented| {
-        presented
-            .as_bytes()
-            .ct_eq(token.expose().as_bytes())
-            .into()
-    });
+    // Compare against every account so the number of configured tokens is not
+    // observable through response timing.
+    let mut matched: Option<&AdminToken> = None;
 
-    if authorized {
-        next.run(request).await
-    } else {
-        AppError::Unauthorized.into_response()
+    for account in state.accounts.iter() {
+        let equal: bool = presented
+            .as_deref()
+            .is_some_and(|presented| {
+                presented
+                    .as_bytes()
+                    .ct_eq(account.token.expose().as_bytes())
+                    .into()
+            });
+
+        if equal {
+            matched = Some(account);
+        }
     }
+
+    let Some(account) = matched else {
+        return AppError::Unauthorized.into_response();
+    };
+
+    let source_ip = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string());
+
+    request
+        .extensions_mut()
+        .insert(Actor::new(account.name.clone()).with_source_ip(source_ip));
+
+    next.run(request).await
 }
 
 async fn healthz() -> StatusCode {
@@ -77,11 +114,12 @@ struct CreateTenant {
 
 async fn create_tenant(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<CreateTenant>,
 ) -> Result<StatusCode, AppError> {
     state
         .service
-        .create_tenant(&body.id)
+        .create_tenant(&actor, &body.id)
         .await?;
 
     Ok(StatusCode::CREATED)
@@ -95,11 +133,12 @@ struct CreateClient {
 
 async fn create_client(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<CreateClient>,
 ) -> Result<StatusCode, AppError> {
     state
         .service
-        .create_client(&body.id, &body.tenant_id)
+        .create_client(&actor, &body.id, &body.tenant_id)
         .await?;
 
     Ok(StatusCode::CREATED)
@@ -134,6 +173,7 @@ struct KeySummaryView {
 
 async fn create_key(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<CreateKey>,
 ) -> Result<(StatusCode, Json<KeyView>), AppError> {
     let expires_at = match body.expires_in_days {
@@ -147,7 +187,7 @@ async fn create_key(
 
     let issued = state
         .service
-        .issue_key(&body.client_id, &body.scopes, expires_at)
+        .issue_key(&actor, &body.client_id, &body.scopes, expires_at)
         .await?;
 
     Ok((
@@ -165,11 +205,12 @@ async fn create_key(
 
 async fn rotate_key(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Path(key_id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
     let issued = state
         .service
-        .rotate_key(&key_id)
+        .rotate_key(&actor, &key_id)
         .await?;
 
     Ok(Json(KeyView {
@@ -184,11 +225,12 @@ async fn rotate_key(
 
 async fn revoke_key(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Path(key_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     state
         .service
-        .revoke_key(&key_id)
+        .revoke_key(&actor, &key_id)
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -258,12 +300,18 @@ struct PutUpstream {
 
 async fn put_upstream(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<String>,
     Json(body): Json<PutUpstream>,
 ) -> Result<StatusCode, AppError> {
     state
         .service
-        .put_upstream(&id, &body.base_url, body.timeout_ms.unwrap_or(10_000))
+        .put_upstream(
+            &actor,
+            &id,
+            &body.base_url,
+            body.timeout_ms.unwrap_or(10_000),
+        )
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -308,19 +356,23 @@ struct PutRoute {
 
 async fn put_route(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<String>,
     Json(body): Json<PutRoute>,
 ) -> Result<StatusCode, AppError> {
     state
         .service
-        .put_route(RouteSpec {
-            id,
-            path_prefix: body.path_prefix,
-            methods: body.methods,
-            upstream_id: body.upstream_id,
-            rewrite_prefix: body.rewrite_prefix,
-            scopes: body.scopes,
-        })
+        .put_route(
+            &actor,
+            RouteSpec {
+                id,
+                path_prefix: body.path_prefix,
+                methods: body.methods,
+                upstream_id: body.upstream_id,
+                rewrite_prefix: body.rewrite_prefix,
+                scopes: body.scopes,
+            },
+        )
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -348,6 +400,8 @@ mod tests {
     use axum::body::Body;
     use tower::ServiceExt;
 
+    use crate::config::SecretString;
+
     fn router_with_token(token: &str) -> Router {
         router(
             Arc::new(AdminService::new(
@@ -358,7 +412,10 @@ mod tests {
                 Vec::new(),
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
             )),
-            SecretString::new(token),
+            Arc::new(vec![AdminToken {
+                name: "tester".to_owned(),
+                token: SecretString::new(token),
+            }]),
         )
     }
 
@@ -425,4 +482,43 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct AuditView {
+    occurred_at: String,
+    actor: String,
+    action: String,
+    subject: String,
+    source_ip: Option<String>,
+    request_id: Option<String>,
+}
+
+async fn list_audit(
+    State(state): State<AdminState>,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Vec<AuditView>>, AppError> {
+    let entries = state
+        .service
+        .list_audit(query.limit.unwrap_or(100))
+        .await?;
+
+    Ok(Json(
+        entries
+            .into_iter()
+            .map(|entry| AuditView {
+                occurred_at: entry.occurred_at.to_string(),
+                actor: entry.actor,
+                action: entry.action,
+                subject: entry.subject,
+                source_ip: entry.source_ip,
+                request_id: entry.request_id,
+            })
+            .collect(),
+    ))
 }

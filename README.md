@@ -113,8 +113,15 @@ api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing -
 api-gateway admin route list
 ```
 
-The HTTP API serves the same operations on a separate listener. Set `ADMIN_TOKEN` to
-enable it; it is off by default.
+The HTTP API serves the same operations on a separate listener. Configure named tokens
+to enable it; each name becomes the audit identity for everything that token does.
+
+```bash
+ADMIN_TOKENS="alice:$ALICE_TOKEN,bob:$BOB_TOKEN"
+```
+
+`ADMIN_TOKEN=...` still works for a single shared credential and maps to the actor
+`admin`. Tokens must be at least 16 characters; the listener stays off when neither is set.
 
 ```bash
 TOKEN=... ADMIN=http://127.0.0.1:9090
@@ -138,6 +145,25 @@ curl -s -X POST "$ADMIN/v1/keys" \
 Full surface in [`docs/openapi.yaml`](docs/openapi.yaml). Tokens are shown exactly once and
 stored only as HMAC verifiers. Rotation copies the remaining lifetime, refuses revoked keys,
 and rolls back the replacement if the old revoke fails.
+
+### Audit trail
+
+Every mutation is recorded with the actor bound to the token, the action, the subject, the
+source IP, and the request id:
+
+```bash
+curl -s "$ADMIN/v1/audit?limit=20" -H "Authorization: Bearer $BOB_TOKEN"
+api-gateway admin audit list --limit 20
+```
+
+```
+2026-11-12 18:31:07.21 +00:00  alice  upstream.put  billing   127.0.0.1
+2026-11-12 18:31:09.04 +00:00  bob    route.put     billing-v1  127.0.0.1
+```
+
+SQL-only mutations commit their audit row in the same transaction. Key issuance and
+rotation go through the credential store, so their audit write follows the mutation and a
+failure is logged rather than reported as a failed operation.
 
 Because the admin listener shares the process, a revoke invalidates the credential cache
 immediately. Revocations are also broadcast on a Postgres channel, so every replica drops
@@ -250,7 +276,8 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `AUTH_PEPPER` | dev value | Required in production; rotating it invalidates keys |
 | `AUTH_CACHE_TTL_SECS` | `30` | Credential cache lifetime; `0` disables |
 | `METRICS_TOKEN` | unset | Requires a bearer token on `/metrics` when set |
-| `ADMIN_TOKEN` | unset | Enables the HTTP control plane when set |
+| `ADMIN_TOKEN` | unset | Single shared token, actor `admin` |
+| `ADMIN_TOKENS` | unset | `name:token` pairs; enables the control plane and names the actor |
 | `ADMIN_BIND` | `127.0.0.1:9090` | Control-plane listener |
 | `DEV_API_KEY_SECRET` | — | Seeded key; rejected in production |
 | `DEV_API_KEY_SCOPES` | `read` | Scopes for the seeded key |

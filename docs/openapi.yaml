@@ -222,6 +222,28 @@ paths:
                 items:
                   $ref: "#/components/schemas/Route"
 
+  /v1/audit:
+    get:
+      tags: [audit]
+      summary: Read the control-plane audit trail
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        "200":
+          description: Most recent events first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditEntry"
+
   /v1/routes/{id}:
     put:
       tags: [routes]
@@ -270,7 +292,9 @@ components:
     adminToken:
       type: http
       scheme: bearer
-      description: Value of `ADMIN_TOKEN`.
+      description: |
+        One of the `ADMIN_TOKENS` values (`name:token`). The name is recorded as
+        the actor for every mutation. `ADMIN_TOKEN` also works and maps to `admin`.
 
   parameters:
     Id:
@@ -346,6 +370,26 @@ components:
           type: string
         rewrite_prefix:
           type: [string, "null"]
+    AuditEntry:
+      type: object
+      required: [occurred_at, actor, action, subject]
+      properties:
+        occurred_at:
+          type: string
+        actor:
+          type: string
+          description: Name bound to the admin token that made the change.
+        action:
+          type: string
+          example: route.put
+        subject:
+          type: string
+          example: billing-v1
+        source_ip:
+          type: [string, "null"]
+        request_id:
+          type: [string, "null"]
+
     Error:
       type: object
       required: [error]
