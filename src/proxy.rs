@@ -5,7 +5,10 @@ use axum::{
 };
 use reqwest::Url;
 
-use crate::{error::AppError, limits::BreakerRegistry, request_context, routing::CompiledRoute};
+use crate::{
+    error::AppError, limits::BreakerRegistry, request_context, retry::RetryPolicy,
+    routing::CompiledRoute,
+};
 
 /// Meaningful only for a single hop; must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
@@ -40,6 +43,7 @@ pub(crate) async fn forward(
     request: axum::extract::Request,
     route: &CompiledRoute,
     breakers: &BreakerRegistry,
+    retry: &RetryPolicy,
 ) -> Result<Response, AppError> {
     let upstream_id = route.upstream.id.as_str();
 
@@ -53,54 +57,134 @@ pub(crate) async fn forward(
     }
 
     let (parts, body) = request.into_parts();
+
+    let has_body = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > 0);
+
+    let replayable = crate::retry::is_replayable(
+        &parts.method,
+        has_body,
+        parts
+            .headers
+            .contains_key("idempotency-key"),
+    );
+
     let path = route.upstream_path(parts.uri.path());
     let url = upstream_url(&route.upstream.base_url, &path, parts.uri.query())?;
-    let headers = outbound_headers(&parts);
+    let mut headers = Some(outbound_headers(&parts));
 
-    let send = route
-        .upstream
-        .client
-        .request(parts.method, url)
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-        .send();
+    retry.deposit();
 
-    // Only the wait for response headers is bounded. Once headers arrive the
-    // body streams under the inbound deadline instead of being truncated by
-    // the upstream timeout.
-    let upstream = match tokio::time::timeout(route.upstream.timeout, send).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            breakers.record_failure(upstream_id);
-            return Err(upstream_error(error));
+    let mut body = Some(body);
+    let mut attempt = 1;
+
+    loop {
+        let outbound = match body.take() {
+            Some(body) => reqwest::Body::wrap_stream(body.into_data_stream()),
+            None => reqwest::Body::wrap_stream(axum::body::Body::empty().into_data_stream()),
+        };
+
+        let attempt_headers = headers
+            .take()
+            .unwrap_or_else(|| outbound_headers(&parts));
+
+        let send = route
+            .upstream
+            .client
+            .request(parts.method.clone(), url.clone())
+            .headers(attempt_headers)
+            .body(outbound)
+            .send();
+
+        // Only the wait for response headers is bounded. Once headers arrive
+        // the body streams under the inbound deadline instead of being
+        // truncated by the upstream timeout.
+        match tokio::time::timeout(route.upstream.timeout, send).await {
+            Ok(Ok(response)) => {
+                let status = response.status();
+
+                if attempt < retry.max_attempts
+                    && replayable
+                    && RetryPolicy::should_retry_status(status)
+                {
+                    if retry.try_retry() {
+                        record_retry(upstream_id, "status", attempt);
+                        tokio::time::sleep(retry.delay(attempt)).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    metrics::counter!(
+                        "gateway_retry_budget_exhausted_total",
+                        "upstream" => upstream_id.to_owned(),
+                    )
+                    .increment(1);
+                }
+
+                // A 5xx means the upstream is unhealthy; a 4xx is a valid answer.
+                if status.is_server_error() {
+                    breakers.record_failure(upstream_id);
+                } else {
+                    breakers.record_success(upstream_id);
+                }
+
+                metrics::counter!(
+                    "gateway_upstream_requests_total",
+                    "upstream" => upstream_id.to_owned(),
+                    "status" => status.as_u16().to_string(),
+                )
+                .increment(1);
+
+                return Ok(into_gateway_response(response));
+            }
+            Ok(Err(error)) => {
+                let transient = error.is_timeout() || error.is_connect();
+
+                if attempt < retry.max_attempts && replayable && transient && retry.try_retry() {
+                    record_retry(upstream_id, "transport", attempt);
+                    tokio::time::sleep(retry.delay(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+
+                breakers.record_failure(upstream_id);
+
+                return Err(upstream_error(error));
+            }
+            Err(_) => {
+                if attempt < retry.max_attempts && replayable && retry.try_retry() {
+                    record_retry(upstream_id, "timeout", attempt);
+                    tokio::time::sleep(retry.delay(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+
+                breakers.record_failure(upstream_id);
+
+                tracing::warn!(
+                    upstream = upstream_id,
+                    "upstream did not return headers in time"
+                );
+
+                return Err(AppError::UpstreamTimeout);
+            }
         }
-        Err(_) => {
-            breakers.record_failure(upstream_id);
-
-            tracing::warn!(
-                upstream = upstream_id,
-                "upstream did not return headers in time"
-            );
-
-            return Err(AppError::UpstreamTimeout);
-        }
-    };
-
-    // A 5xx means the upstream is unhealthy; a 4xx is a valid answer.
-    if upstream.status().is_server_error() {
-        breakers.record_failure(upstream_id);
-    } else {
-        breakers.record_success(upstream_id);
     }
+}
 
+fn record_retry(upstream: &str, reason: &'static str, attempt: u32) {
     metrics::counter!(
-        "gateway_upstream_requests_total",
-        "upstream" => upstream_id.to_owned(),
-        "status" => upstream.status().as_u16().to_string(),
+        "gateway_upstream_retries_total",
+        "upstream" => upstream.to_owned(),
+        "reason" => reason,
     )
     .increment(1);
 
-    Ok(into_gateway_response(upstream))
+    tracing::warn!(upstream, attempt, reason, "retrying upstream request");
 }
 
 fn upstream_url(base: &Url, path: &str, query: Option<&str>) -> Result<Url, AppError> {
@@ -213,6 +297,11 @@ fn upstream_error(error: reqwest::Error) -> AppError {
         return AppError::UpstreamTimeout;
     }
 
+    if kind == "body" {
+        tracing::warn!(kind, "request body failed while forwarding");
+        return AppError::BadGateway;
+    }
+
     tracing::warn!(kind, "upstream request failed");
     AppError::BadGateway
 }
@@ -230,6 +319,7 @@ mod tests {
     };
 
     use crate::testing;
+    use futures_util::StreamExt as _;
 
     #[tokio::test]
     async fn proxies_status_headers_and_body() {
@@ -473,6 +563,109 @@ mod tests {
                 .unwrap(),
             "yes"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_bodies_return_the_envelope() {
+        let config = testing::config_with(&[("MAX_REQUEST_BODY_BYTES", "1024")]);
+        let (app, token) =
+            testing::app_with(&config, "https://upstream.test", Duration::from_secs(1));
+
+        // No Content-Length: only reading the stream can catch this.
+        let stream = futures_util::stream::repeat_with(|| {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(&[b'x'; 4096]))
+        })
+        .take(4);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/swapi/people/1")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from_stream(stream))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("\"code\":\"payload_too_large\""));
+    }
+
+    #[tokio::test]
+    async fn retries_a_transient_upstream_failure() {
+        let upstream = MockServer::start().await;
+
+        // First request fails, the retry succeeds.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&upstream)
+            .await;
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("recovered"))
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[
+            ("RETRY_MAX_ATTEMPTS", "2"),
+            ("RETRY_BASE_DELAY_MS", "1"),
+            ("RETRY_BUDGET_RATIO", "5"),
+        ]);
+
+        let (app, token) = testing::app_with(&config, &upstream.uri(), Duration::from_secs(2));
+        let response = app
+            .oneshot(testing::authorized("/swapi/people/1", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"recovered");
+
+        let requests = upstream
+            .received_requests()
+            .await
+            .expect("recorded requests");
+        assert_eq!(requests.len(), 2, "one retry happened");
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_without_a_retry_budget() {
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[
+            ("RETRY_MAX_ATTEMPTS", "3"),
+            ("RETRY_BASE_DELAY_MS", "1"),
+            ("RETRY_BUDGET_RATIO", "0"),
+        ]);
+
+        let (app, token) = testing::app_with(&config, &upstream.uri(), Duration::from_secs(2));
+        let response = app
+            .oneshot(testing::authorized("/swapi/people/1", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let requests = upstream
+            .received_requests()
+            .await
+            .expect("recorded requests");
+        assert_eq!(requests.len(), 1, "budget denied the retry");
     }
 
     #[test]

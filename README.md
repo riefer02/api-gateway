@@ -150,6 +150,12 @@ immediately. A revoke issued from the CLI in another process is bounded by
   N replicas enforce N times the configured rate.
 - **Circuit breaker**: per upstream, consecutive-failure trigger, cooldown, single
   half-open probe. Open circuits answer `503` with `Retry-After`.
+- **Retries**: idempotent, body-less requests are retried on `502`/`503`/`504`,
+  connection failure, or header timeout — at most `RETRY_MAX_ATTEMPTS` times, with
+  exponential backoff and full jitter. A **retry budget** (`RETRY_BUDGET_RATIO`) caps
+  retries at a fraction of normal traffic, so an outage cannot be amplified. Requests
+  with bodies are never retried because the body streams and cannot be replayed;
+  `Idempotency-Key` opts a bodiless `POST` in.
 - **Deadlines**: connect and header waits are bounded per upstream; the whole request has
   its own deadline; bodies stream rather than buffer.
 - **Header hygiene**: hop-by-hop headers — including those named by `Connection` — plus
@@ -168,7 +174,7 @@ This table is the specification.
 | Path exists, method does not | `405` plus `Allow` |
 | `HEAD` on a `GET` route | Forwarded as `HEAD`, no body |
 | Oversized declared `Content-Length` | `413` envelope |
-| Oversized chunked body | Rejected mid-read by the streaming limit (plain `413`, see gaps) |
+| Oversized chunked body | `413` envelope; unknown-length bodies are buffered up to the limit |
 | Slow upstream headers | `504 upstream_timeout` |
 | Slow whole request | `408 request_timeout` |
 | Client-supplied request id | Accepted only if ≤128 printable ASCII, else replaced with a UUID |
@@ -182,6 +188,10 @@ This table is the specification.
 | Rotating a revoked key | Refused (`409`) |
 | Unknown verifier version | Rejected without comparison |
 | Circuit half-open | Exactly one probe request, the rest shed with `503` |
+| Upstream `503` on a `GET` | Retried once, then served |
+| Upstream `503` on a `POST` with a body | Never retried; the body cannot be replayed |
+| Retry budget exhausted | The failing response is served instead of amplifying |
+| Bodiless `POST` with `Idempotency-Key` | Retried |
 
 ## Observability
 
@@ -194,6 +204,9 @@ This table is the specification.
 | `gateway_upstream_requests_total` | `upstream`, `status` |
 | `gateway_auth_failures_total` | `reason` |
 | `gateway_circuit_open_total` | `upstream` |
+| `gateway_upstream_retries_total` | `upstream`, `reason` |
+| `gateway_retry_budget_exhausted_total` | `upstream` |
+| `gateway_auth_cache_total` | `result` |
 
 Spans carry `route`, `upstream`, `tenant_id`, `client_id`, and `key_id` (identifiers only,
 never secrets). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export; otherwise logs only.
@@ -246,6 +259,9 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | `0` disables |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures to open |
 | `CIRCUIT_COOLDOWN_SECS` | `30` | Open duration |
+| `RETRY_MAX_ATTEMPTS` | `2` | Total attempts; `1` disables retries |
+| `RETRY_BASE_DELAY_MS` | `50` | Backoff base, jittered, capped at 1 s |
+| `RETRY_BUDGET_RATIO` | `0.2` | Retries per request as a fraction of traffic; `0` disables |
 | `REQUEST_TIMEOUT_SECS` | `15` | Whole-request deadline |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Inbound body limit |
 | `SHUTDOWN_DRAIN_SECS` | `25` | Graceful drain budget |
@@ -281,8 +297,9 @@ just up              # compose stack (gateway + Postgres)
 Deliberately generic: no cloud provider, no vendor SDK, no auth provider. The `AuthError`
 and rate-limiter seams are where those integrations belong.
 
-Known gaps, stated plainly: chunked bodies over the limit get a plain `413` rather than the
-envelope, rate limits and breakers are per replica, and `/metrics` is unauthenticated.
+Known gaps, stated plainly: rate limits, retry budgets, and breakers are per replica;
+unknown-length request bodies are buffered up to the limit instead of streamed; and
+`/metrics` is unauthenticated.
 
 ## Further reading
 

@@ -76,12 +76,36 @@ async fn handle(state: &AppState, mut request: Request) -> Result<Response, AppE
         .extensions_mut()
         .insert(identity);
 
-    let mut response = proxy::forward(request, route, &state.breakers).await?;
+    let request = limit_undeclared_body(request, state.body_limit).await?;
+
+    let mut response = proxy::forward(request, route, &state.breakers, &state.retry).await?;
     response
         .headers_mut()
         .extend(rate_headers);
 
     Ok(response)
+}
+
+/// Bodies with a `Content-Length` are framed by hyper and streamed. Bodies
+/// without one (chunked uploads) are buffered up to the limit so an oversized
+/// request gets the JSON envelope instead of an opaque upstream failure.
+async fn limit_undeclared_body(request: Request, limit: usize) -> Result<Request, AppError> {
+    if request
+        .headers()
+        .contains_key(axum::http::header::CONTENT_LENGTH)
+    {
+        return Ok(request);
+    }
+
+    let (parts, body) = request.into_parts();
+    let collected = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| AppError::PayloadTooLarge)?;
+
+    Ok(Request::from_parts(
+        parts,
+        axum::body::Body::from(collected),
+    ))
 }
 
 /// Applies one limiter and records its headers for the eventual response.

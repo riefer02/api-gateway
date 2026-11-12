@@ -5,6 +5,7 @@ use sqlx::PgPool;
 
 use crate::auth::{KeyVerifier, store::ApiKeyStore};
 use crate::limits::{BreakerRegistry, RateLimits};
+use crate::retry::RetryPolicy;
 use crate::routing::RouteTableHandle;
 
 /// Cheap to clone: every field is a handle, never a buffer or a lock.
@@ -16,5 +17,7 @@ pub(crate) struct AppState {
     pub(crate) routes: RouteTableHandle,
     pub(crate) limits: Arc<RateLimits>,
     pub(crate) breakers: Arc<BreakerRegistry>,
+    pub(crate) retry: Arc<RetryPolicy>,
+    pub(crate) body_limit: usize,
     pub(crate) metrics: PrometheusHandle,
 }

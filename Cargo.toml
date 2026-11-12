@@ -12,6 +12,7 @@ async-trait = "0.1.92"
 axum = "0.8"
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
+fastrand = "2.5.0"
 getrandom = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
@@ -37,5 +38,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.2", features = ["v4"] }
 
 [dev-dependencies]
+futures-util = "0.3.34"
 wiremock = "0.6.5"
 

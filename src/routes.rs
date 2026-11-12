@@ -69,7 +69,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method("DELETE")
                     .uri("/swapi/people/1")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
@@ -84,7 +84,7 @@ mod tests {
                 .headers()
                 .get("allow")
                 .and_then(|value| value.to_str().ok()),
-            Some("GET, HEAD")
+            Some("GET, POST, HEAD")
         );
     }
 

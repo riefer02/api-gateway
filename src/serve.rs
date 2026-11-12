@@ -13,6 +13,7 @@ use crate::{
     db,
     limits::{BreakerRegistry, RateLimits},
     observability,
+    retry::RetryPolicy,
     routing::{RouteRefresh, RouteSource, RouteTableHandle},
     state::AppState,
 };
@@ -81,6 +82,8 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         routes,
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        retry: Arc::new(RetryPolicy::new(&config.retry)),
+        body_limit: config.server.request_body_limit_bytes,
         metrics,
     };
 

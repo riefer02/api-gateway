@@ -52,6 +52,7 @@ pub struct Config {
     pub admin: AdminConfig,
     pub routing: RoutingConfig,
     pub limits: LimitsConfig,
+    pub retry: RetryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +95,15 @@ pub struct AdminConfig {
     pub bind: String,
     /// Bearer token for the control plane. `None` disables the listener.
     pub token: Option<SecretString>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    /// Total attempts, including the first. 1 disables retries.
+    pub max_attempts: u32,
+    pub base_delay: Duration,
+    /// Retries allowed per request, as a fraction of normal traffic.
+    pub budget_ratio: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +278,17 @@ impl Config {
             backend: rate_limit_backend,
         };
 
+        let retry = RetryConfig {
+            max_attempts: number_or(source, "RETRY_MAX_ATTEMPTS", 2_u32, &mut problems),
+            base_delay: Duration::from_millis(number_or(
+                source,
+                "RETRY_BASE_DELAY_MS",
+                50_u64,
+                &mut problems,
+            )),
+            budget_ratio: ratio_or(source, "RETRY_BUDGET_RATIO", 0.2, &mut problems),
+        };
+
         let config = Self {
             environment,
             server,
@@ -277,6 +298,7 @@ impl Config {
             admin,
             routing,
             limits,
+            retry,
         };
 
         validate(&config, &mut problems);
@@ -331,6 +353,19 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     }
     if limits.circuit_cooldown.is_zero() {
         problems.push("CIRCUIT_COOLDOWN_SECS must be greater than zero".to_owned());
+    }
+
+    if config.retry.max_attempts == 0 {
+        problems.push("RETRY_MAX_ATTEMPTS must be at least 1".to_owned());
+    }
+    if config.retry.max_attempts > 10 {
+        problems.push("RETRY_MAX_ATTEMPTS must not exceed 10".to_owned());
+    }
+    if config.retry.base_delay > Duration::from_secs(5) {
+        problems.push("RETRY_BASE_DELAY_MS must not exceed 5000".to_owned());
+    }
+    if !(0.0..=10.0).contains(&config.retry.budget_ratio) {
+        problems.push("RETRY_BUDGET_RATIO must be between 0 and 10".to_owned());
     }
     if admin.token.is_some()
         && admin
@@ -408,6 +443,20 @@ fn seconds_or(
     problems: &mut Vec<String>,
 ) -> Duration {
     Duration::from_secs(number_or(source, key, default_seconds, problems))
+}
+
+fn ratio_or(source: &dyn EnvSource, key: &str, default: f64, problems: &mut Vec<String>) -> f64 {
+    let Some(raw) = non_empty(source.get(key)) else {
+        return default;
+    };
+
+    match raw.parse::<f64>() {
+        Ok(value) => value,
+        Err(_) => {
+            problems.push(format!("{key} must be a number, got `{raw}`"));
+            default
+        }
+    }
 }
 
 fn csv(value: Option<String>) -> Vec<String> {

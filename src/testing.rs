@@ -85,7 +85,7 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
     let route = CompiledRoute {
         id: "test".to_owned(),
         path_prefix: "/swapi".to_owned(),
-        methods: vec![Method::GET],
+        methods: vec![Method::GET, Method::POST],
         rewrite_prefix: None,
         scopes: SCOPES
             .iter()
@@ -102,6 +102,8 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         routes: RouteTableHandle::new(RouteTable::for_tests(1, vec![route])),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
+        body_limit: config.server.request_body_limit_bytes,
         metrics: metrics_handle(),
     };
 
@@ -119,6 +121,8 @@ pub(crate) fn empty_state() -> AppState {
         routes: RouteTableHandle::new(RouteTable::for_tests(1, Vec::new())),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
+        body_limit: config.server.request_body_limit_bytes,
         metrics: metrics_handle(),
     }
 }

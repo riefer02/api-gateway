@@ -8,6 +8,7 @@ mod limits;
 mod observability;
 mod proxy;
 mod request_context;
+mod retry;
 mod routes;
 mod routing;
 mod serve;
