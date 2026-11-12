@@ -301,8 +301,7 @@ components:
           items:
             type: string
         expires_at:
-          type: string
-          nullable: true
+          type: [string, "null"]
     KeySummary:
       type: object
       required: [key_id, client_id, scopes, created_at]
@@ -318,11 +317,9 @@ components:
         created_at:
           type: string
         expires_at:
-          type: string
-          nullable: true
+          type: [string, "null"]
         revoked_at:
-          type: string
-          nullable: true
+          type: [string, "null"]
     Upstream:
       type: object
       required: [id, base_url, timeout_ms]
@@ -348,8 +345,7 @@ components:
         upstream_id:
           type: string
         rewrite_prefix:
-          type: string
-          nullable: true
+          type: [string, "null"]
     Error:
       type: object
       required: [error]
@@ -364,8 +360,8 @@ components:
             message:
               type: string
             request_id:
-              type: string
-              nullable: true
+              type: [string, "null"]
+              description: Present when the failure happened inside an HTTP request.
 
   responses:
     BadRequest:
