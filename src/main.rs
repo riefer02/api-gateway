@@ -93,9 +93,19 @@ async fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error + Send +
         let _ = shutdown_rx.await;
     });
 
-    let handle = tokio::spawn(server.into_future());
+    let mut handle = tokio::spawn(server.into_future());
 
-    wait_for_shutdown_signal().await;
+    tokio::select! {
+        _ = wait_for_shutdown_signal() => {}
+        result = &mut handle => {
+            return match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.into()),
+                Err(join_error) => Err(join_error.into()),
+            };
+        }
+    }
+
     tracing::info!("shutdown requested; draining in-flight requests");
 
     let _ = shutdown_tx.send(());
