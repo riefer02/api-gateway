@@ -49,6 +49,10 @@ docker:
 bench:
     ./scripts/bench.sh
 
+# Starts two replicas and proves revocation + route convergence across them
+replicas:
+    ./scripts/replicas.sh
+
 up:
     docker compose up -d --build
 

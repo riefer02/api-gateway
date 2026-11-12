@@ -352,6 +352,39 @@ is the reference edge that terminates TLS and keeps `/metrics` and `/ready` priv
 `TRUSTED_PROXIES` to that proxy's address (the Caddy example runs on loopback) or every
 caller shares the proxy's bucket.
 
+## Scaling and replicas
+
+The gateway keeps no request-affecting state that needs to be shared. Run as many replicas
+as you like behind one load balancer, all pointing at the same Postgres.
+
+| State | Scope | How it converges |
+|---|---|---|
+| Route table | per replica | each replica polls `route_table_state.version` and swaps its snapshot |
+| Credential cache | per replica | revocations publish `pg_notify`; every replica invalidates on `LISTEN` |
+| Rate limits | **per replica** | deliberately not shared — N replicas allow N × the configured rate |
+| Retry budget | **per replica** | same arithmetic |
+| Circuit breakers | per replica | each replica learns an upstream's health independently |
+| Migrations | global | sqlx takes an advisory lock, so concurrent starters serialise |
+
+Prove the interesting half locally, with no cluster:
+
+```bash
+just replicas        # two containers, one database
+```
+
+It asserts three things that only exist with more than one replica: a key issued once works
+on both, a revocation reaches both immediately, and a route added through one replica's
+control plane is served by the other within one refresh interval.
+
+For a real deployment, size the knobs against the replica count: if the product promise is
+600 requests/minute per IP, set `RATE_LIMIT_IP_PER_MINUTE=600 / replicas`, or accept that
+the cluster-wide limit is N × the configured value. That is the one number that silently
+changes when you scale.
+
+Note that publishing a port rewrites the peer address, so `TRUSTED_PROXIES` must name the
+proxy's actual address on the network the gateway sees — the Docker bridge, an ingress pod
+CIDR, or `127.0.0.1` when the proxy runs in the same network namespace.
+
 ## Using this as a template
 
 1. **Rename**: `Cargo.toml` package name, the `name` in `src/admin/cli.rs`, and the
@@ -388,6 +421,7 @@ terminates at the edge rather than in the gateway.
 | `just test` | Tests; Postgres tests run only when `DATABASE_URL` is set |
 | `just deny` | Licenses, advisories, duplicates, wildcards |
 | `just bench` | Measures gateway overhead against a local stub upstream |
+| `just replicas` | Starts two replicas and proves revocation + route convergence |
 | `just demo-route` | Registers the demo upstream and route |
 | `just db-up` / `just db-down` / `just db-logs` | Local Postgres |
 
