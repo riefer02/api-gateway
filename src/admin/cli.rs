@@ -27,6 +27,8 @@ pub(crate) enum Command {
     Serve(ServeArgs),
     /// Administer tenants, clients, keys, upstreams, and routes
     Admin(AdminArgs),
+    /// Probe the local gateway (container healthcheck)
+    Healthcheck,
 }
 
 #[derive(Debug, Args)]
@@ -151,6 +153,25 @@ pub(crate) async fn run(args: AdminArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     outcome
+}
+
+/// Container/orchestrator probe: a plain HTTP GET against the local listener.
+pub(crate) async fn healthcheck() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = Config::from_env()?;
+    let url = format!("http://127.0.0.1:{}/health", config.server.port);
+
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()?
+        .get(&url)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("unhealthy: {}", response.status()).into())
+    }
 }
 
 async fn dispatch(

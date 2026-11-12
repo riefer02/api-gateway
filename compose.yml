@@ -17,5 +17,34 @@ services:
       retries: 10
       start_period: 5s
 
+  gateway:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      HOST: 0.0.0.0
+      PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Containers reach Postgres by service name, not loopback.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      AUTH_PEPPER: ${AUTH_PEPPER:-dev-pepper-change-me}
+      DEV_API_KEY_SECRET: ${DEV_API_KEY_SECRET:-}
+      DEV_API_KEY_SCOPES: ${DEV_API_KEY_SCOPES:-read}
+      UPSTREAM_ALLOW_HOSTS: ${UPSTREAM_ALLOW_HOSTS:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/api-gateway", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
 volumes:
   postgres_data:

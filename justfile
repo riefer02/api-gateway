@@ -41,3 +41,12 @@ db-logs:
 demo-route:
     cargo run --quiet -- admin upstream put swapi --base-url https://swapi.dev/api
     cargo run --quiet -- admin route put swapi-people --prefix /swapi --upstream swapi --scope read
+
+docker:
+    docker build -t api-gateway:dev .
+
+up:
+    docker compose up -d --build
+
+down:
+    docker compose down

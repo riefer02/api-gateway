@@ -26,9 +26,14 @@ pub enum AppError {
     #[allow(dead_code)] // TODO(W6): emitted by the body-limit middleware once it owns the response.
     #[error("payload too large")]
     PayloadTooLarge,
-    #[allow(dead_code)] // TODO(W8): emitted by the rate limiter.
     #[error("rate limited for {retry_after_secs}s")]
-    RateLimited { retry_after_secs: u64 },
+    RateLimited {
+        retry_after_secs: u64,
+        limit: u32,
+        reset_after_secs: u64,
+    },
+    #[error("upstream circuit is open for {retry_after_secs}s")]
+    CircuitOpen { retry_after_secs: u64 },
     #[error("upstream timed out")]
     UpstreamTimeout,
     #[error("bad gateway")]
@@ -64,6 +69,7 @@ impl AppError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::CircuitOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::BadGateway => StatusCode::BAD_GATEWAY,
             Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -79,6 +85,7 @@ impl AppError {
             Self::NotFound => "not_found",
             Self::PayloadTooLarge => "payload_too_large",
             Self::RateLimited { .. } => "rate_limited",
+            Self::CircuitOpen { .. } => "circuit_open",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
@@ -94,6 +101,7 @@ impl AppError {
             Self::NotFound => "no route matches this request".into(),
             Self::PayloadTooLarge => "request body exceeds the configured limit".into(),
             Self::RateLimited { .. } => "too many requests".into(),
+            Self::CircuitOpen { .. } => "the upstream is temporarily unavailable".into(),
             Self::UpstreamTimeout => "the upstream did not respond in time".into(),
             Self::BadGateway => "the upstream returned an invalid response".into(),
             Self::ServiceUnavailable => "the service is temporarily unavailable".into(),
@@ -133,7 +141,19 @@ impl IntoResponse for AppError {
         };
 
         let retry_after = match self {
-            Self::RateLimited { retry_after_secs } => Some(retry_after_secs),
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => Some(retry_after_secs),
+            Self::CircuitOpen { retry_after_secs } => Some(retry_after_secs),
+            _ => None,
+        };
+
+        let rate_limit = match self {
+            Self::RateLimited {
+                limit,
+                reset_after_secs,
+                ..
+            } => Some((limit, reset_after_secs)),
             _ => None,
         };
 
@@ -151,6 +171,17 @@ impl IntoResponse for AppError {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, value);
+        }
+
+        if let Some((limit, reset_after_secs)) = rate_limit {
+            let headers = response.headers_mut();
+
+            if let Ok(value) = HeaderValue::from_str(&limit.to_string()) {
+                headers.insert("ratelimit-limit", value);
+            }
+            if let Ok(value) = HeaderValue::from_str(&reset_after_secs.to_string()) {
+                headers.insert("ratelimit-reset", value);
+            }
         }
 
         response

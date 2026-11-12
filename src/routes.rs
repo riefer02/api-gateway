@@ -3,6 +3,7 @@ use crate::state;
 use axum::{Router, routing::get};
 mod health;
 mod home;
+mod metrics;
 mod upstream;
 
 pub(crate) fn router(state: state::AppState) -> Router {
@@ -10,6 +11,7 @@ pub(crate) fn router(state: state::AppState) -> Router {
         .route("/", get(home::index))
         .route("/health", get(health::live))
         .route("/ready", get(health::ready))
+        .route("/metrics", get(metrics::render))
         // Everything else is resolved against the route table, which also
         // owns authentication and authorization for proxied traffic.
         .fallback(upstream::dispatch)

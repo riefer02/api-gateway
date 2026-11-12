@@ -8,7 +8,9 @@ use crate::{
     app,
     auth::{KeyVerifier, store::postgres::PostgresApiKeyStore},
     config::Config,
-    db, observability,
+    db,
+    limits::{BreakerRegistry, RateLimits},
+    observability,
     routing::{RouteRefresh, RouteSource, RouteTableHandle},
     state::AppState,
 };
@@ -51,11 +53,16 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let refresh = RouteRefresh::new(source, routes.clone(), config.routing.refresh_interval);
     let refresh_task = tokio::spawn(refresh.run());
 
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+
     let state = AppState {
         api_key_store: Arc::new(PostgresApiKeyStore::new(pool.clone())),
         db: pool,
         verifier,
         routes,
+        limits: Arc::new(RateLimits::new(&config.limits)),
+        breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        metrics,
     };
 
     let app = app::build_app(config, state);
@@ -100,7 +107,11 @@ async fn serve_until_shutdown(
 ) -> Result<(), BoxError> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         let _ = shutdown_rx.await;
     });
 

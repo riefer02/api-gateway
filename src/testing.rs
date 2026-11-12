@@ -9,6 +9,7 @@ use crate::{
     app, auth,
     auth::{KeyVerifier, store::InMemoryApiKeyStore},
     config::{Config, EnvSource},
+    limits::{BreakerRegistry, RateLimits},
     routing::{CompiledRoute, RouteTable, RouteTableHandle, Upstream},
     state::AppState,
 };
@@ -16,13 +17,21 @@ use crate::{
 pub(crate) const SCOPES: &[&str] = &["read"];
 
 pub(crate) fn config() -> Config {
-    let source = HashMap::from([
+    config_with(&[])
+}
+
+pub(crate) fn config_with(overrides: &[(&str, &str)]) -> Config {
+    let mut source: HashMap<String, String> = HashMap::from([
         ("APP_ENV".to_owned(), "development".to_owned()),
         (
             "DATABASE_URL".to_owned(),
             "postgres://test:test@127.0.0.1:5432/test".to_owned(),
         ),
     ]);
+
+    for (key, value) in overrides {
+        source.insert((*key).to_owned(), (*value).to_owned());
+    }
 
     Config::from_source(&source as &dyn EnvSource).expect("test configuration")
 }
@@ -33,10 +42,15 @@ fn lazy_pool() -> sqlx::PgPool {
         .expect("lazy pool")
 }
 
-/// A state with one `/swapi` route pointing at `upstream_url`, and the token
-/// that authenticates against it with the [`SCOPES`] s.
-pub(crate) fn state(upstream_url: &str, timeout: Duration) -> (AppState, String) {
-    let config = config();
+pub(crate) fn metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle()
+}
+
+/// State with one `/swapi` route pointing at `upstream_url`, plus the token
+/// that authenticates against it with the [`SCOPES`] scopes.
+pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (AppState, String) {
     let verifier = KeyVerifier::new(config.auth.pepper.clone());
 
     let (key, secret) = auth::key::generate(
@@ -86,6 +100,9 @@ pub(crate) fn state(upstream_url: &str, timeout: Duration) -> (AppState, String)
         api_key_store: Arc::new(store),
         verifier: Arc::new(verifier),
         routes: RouteTableHandle::new(RouteTable::for_tests(1, vec![route])),
+        limits: Arc::new(RateLimits::new(&config.limits)),
+        breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        metrics: metrics_handle(),
     };
 
     (state, auth::key::token(&key_id, &secret))
@@ -100,14 +117,20 @@ pub(crate) fn empty_state() -> AppState {
         api_key_store: Arc::new(InMemoryApiKeyStore::default()),
         verifier: Arc::new(KeyVerifier::new(config.auth.pepper.clone())),
         routes: RouteTableHandle::new(RouteTable::for_tests(1, Vec::new())),
+        limits: Arc::new(RateLimits::new(&config.limits)),
+        breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        metrics: metrics_handle(),
     }
 }
 
 pub(crate) fn app(upstream_url: &str, timeout: Duration) -> (Router, String) {
-    let config = config();
-    let (state, token) = state(upstream_url, timeout);
+    app_with(&config(), upstream_url, timeout)
+}
 
-    (app::build_app(&config, state), token)
+pub(crate) fn app_with(config: &Config, upstream_url: &str, timeout: Duration) -> (Router, String) {
+    let (state, token) = state(config, upstream_url, timeout);
+
+    (app::build_app(config, state), token)
 }
 
 pub(crate) fn authorized(uri: &str, token: &str) -> Request<Body> {

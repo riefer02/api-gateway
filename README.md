@@ -8,10 +8,14 @@ Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33.
 
 ## Status
 
-Working data plane and control plane. Authentication, route resolution, live route
-reload, key lifecycle, and graceful shutdown are implemented and tested. Not yet built:
-rate limiting, circuit breakers, metrics export, and the HTTP admin API. Treat it as a
-strong pre-production baseline, not a finished product.
+Working data plane and control plane: API-key auth with peppered verifiers, a
+Postgres-backed route table with live reload, streaming proxy with strict header hygiene,
+per-IP and per-tenant rate limits, per-upstream circuit breakers, Prometheus metrics,
+OpenTelemetry traces, and graceful shutdown. Ships as a distroless container with a
+compose stack.
+
+Not yet built: the HTTP admin adapter, distributed rate limiting, credential caching,
+and Kubernetes manifests. Strong pre-production baseline, not a finished product.
 
 ## Requirements
 
@@ -83,6 +87,45 @@ api-gateway admin route list
 The issued token is shown exactly once. Keys are stored as HMAC verifiers, never as
 plaintext.
 
+## Protection
+
+- **Rate limits**: token buckets per client IP (before authentication) and per tenant
+  (after). `429` responses carry `Retry-After` plus `RateLimit-*` headers. Limits are
+  in-process and per replica: two replicas enforce twice the configured rate.
+- **Circuit breaker**: per upstream, consecutive failures open the circuit for a
+  cooldown, then a single half-open probe decides whether to close it. Open circuits
+  answer `503` with `Retry-After` instead of piling onto a failing upstream.
+- **Timeouts**: connect and header waits are bounded per upstream; response bodies then
+  stream under the whole-request deadline.
+- **Header hygiene**: hop-by-hop headers (including those named by `Connection`),
+  `Forwarded`/`X-Forwarded-*`, and the gateway's own credentials are stripped in both
+  directions. Upstream redirects are never followed.
+
+## Metrics
+
+`GET /metrics` renders Prometheus text from an in-process recorder:
+
+| Metric | Labels |
+|---|---|
+| `gateway_requests_total` | `method`, `status` |
+| `gateway_request_duration_seconds` | — |
+| `gateway_upstream_requests_total` | `upstream`, `status` |
+| `gateway_auth_failures_total` | `reason` |
+| `gateway_circuit_open_total` | `upstream` |
+
+The endpoint is on the main listener; keep it off the public edge with network policy
+and scrape it from your monitoring network.
+
+## Docker
+
+```bash
+docker compose up -d --build     # gateway + Postgres
+curl -s localhost:8080/health
+```
+
+The image is a distroless, non-root, read-only-friendly multi-stage build. Liveness is
+checked in-container by `api-gateway healthcheck`, so no shell or curl is required.
+
 ## Tasks
 
 | Command | What it does |
@@ -93,6 +136,8 @@ plaintext.
 | `just test` | All tests (Postgres tests need `DATABASE_URL`) |
 | `just deny` | Licenses, advisories, duplicates, wildcards |
 | `just demo-route` | Registers the SWAPI demo upstream and route |
+| `just docker` | Builds the runtime image |
+| `just up` / `just down` | Full stack in Docker (gateway + Postgres) |
 | `just db-up` / `just db-down` / `just db-logs` | Local Postgres |
 
 ## Configuration

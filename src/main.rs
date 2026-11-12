@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod limits;
 mod observability;
 mod proxy;
 mod request_context;
@@ -31,6 +32,7 @@ async fn main() -> ExitCode {
     let outcome = match command {
         Command::Serve(args) => serve::run(args).await,
         Command::Admin(args) => admin::cli::run(args).await,
+        Command::Healthcheck => admin::cli::healthcheck().await,
     };
 
     match outcome {

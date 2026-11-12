@@ -50,6 +50,7 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     pub auth: AuthConfig,
     pub routing: RoutingConfig,
+    pub limits: LimitsConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +90,17 @@ pub struct RoutingConfig {
     /// Empty means "allow any host"; production requires a non-empty list.
     pub allow_hosts: Vec<String>,
     pub refresh_interval: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct LimitsConfig {
+    /// Requests per minute per client IP. Zero disables the limiter.
+    pub ip_per_minute: u32,
+    /// Requests per minute per tenant. Zero disables the limiter.
+    pub tenant_per_minute: u32,
+    /// Consecutive upstream failures before the circuit opens.
+    pub circuit_failure_threshold: u32,
+    pub circuit_cooldown: Duration,
 }
 
 /// Anything that can supply environment-style key/value pairs.
@@ -199,12 +211,30 @@ impl Config {
             )),
         };
 
+        let limits = LimitsConfig {
+            ip_per_minute: number_or(source, "RATE_LIMIT_IP_PER_MINUTE", 600_u32, &mut problems),
+            tenant_per_minute: number_or(
+                source,
+                "RATE_LIMIT_TENANT_PER_MINUTE",
+                6_000_u32,
+                &mut problems,
+            ),
+            circuit_failure_threshold: number_or(
+                source,
+                "CIRCUIT_FAILURE_THRESHOLD",
+                5_u32,
+                &mut problems,
+            ),
+            circuit_cooldown: seconds_or(source, "CIRCUIT_COOLDOWN_SECS", 30, &mut problems),
+        };
+
         validate(
             &server,
             &database,
             &auth,
             &environment,
             &routing,
+            &limits,
             &mut problems,
         );
         validate_log_filter(&telemetry.log_level, &mut problems);
@@ -220,6 +250,7 @@ impl Config {
             telemetry,
             auth,
             routing,
+            limits,
         })
     }
 }
@@ -230,6 +261,7 @@ fn validate(
     auth: &AuthConfig,
     environment: &AppEnvironment,
     routing: &RoutingConfig,
+    limits: &LimitsConfig,
     problems: &mut Vec<String>,
 ) {
     if server.port == 0 {
@@ -259,6 +291,12 @@ fn validate(
 
     if routing.refresh_interval.is_zero() {
         problems.push("ROUTE_REFRESH_INTERVAL_MS must be greater than zero".to_owned());
+    }
+    if limits.circuit_failure_threshold == 0 {
+        problems.push("CIRCUIT_FAILURE_THRESHOLD must be at least 1".to_owned());
+    }
+    if limits.circuit_cooldown.is_zero() {
+        problems.push("CIRCUIT_COOLDOWN_SECS must be greater than zero".to_owned());
     }
 
     if environment.is_production() {

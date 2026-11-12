@@ -4,6 +4,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use opentelemetry::{global, trace::TraceContextExt};
+use std::time::Instant;
 use tower::ServiceBuilder;
 use tower_http::{
     catch_panic::CatchPanicLayer,
@@ -63,6 +64,7 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(axum::middleware::from_fn(record_request_id))
+        .layer(axum::middleware::from_fn(record_metrics))
         .layer(trace_layer)
         .layer(CatchPanicLayer::new())
         .layer(TimeoutLayer::with_status_code(
@@ -88,4 +90,22 @@ async fn record_request_id(
         .unwrap_or_else(|| "unknown".to_owned());
 
     request_context::scope(request_id, next.run(request)).await
+}
+
+/// RED metrics for every request, including ones rejected before routing.
+async fn record_metrics(
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().as_str().to_owned();
+    let started = Instant::now();
+
+    let response = next.run(request).await;
+    let status = response.status().as_u16().to_string();
+
+    metrics::counter!("gateway_requests_total", "method" => method, "status" => status)
+        .increment(1);
+    metrics::histogram!("gateway_request_duration_seconds").record(started.elapsed().as_secs_f64());
+
+    response
 }

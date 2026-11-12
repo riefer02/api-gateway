@@ -32,6 +32,8 @@ Delete anything a linter, test, or type already enforces. No repo tours.
 - Postgres is the source of truth for credentials and routes, but never on the request
   path: compile to memory at boot, swap atomically on version bump.
 - Admin mutations go through `src/admin`; the CLI is one adapter over that service.
+- Limits and breakers are in-process state (`src/limits.rs`). They are per replica and
+  deliberately not shared; do not add cross-request locks outside those structures.
 
 ## Working style
 

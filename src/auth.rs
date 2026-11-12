@@ -113,6 +113,14 @@ impl AuthError {
             Self::StoreUnavailable => AppError::ServiceUnavailable,
         }
     }
+
+    fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::InvalidCredentials => "invalid_credentials",
+            Self::Forbidden => "forbidden",
+            Self::StoreUnavailable => "store_unavailable",
+        }
+    }
 }
 
 /// Authenticates a bearer token against the credential store.
@@ -184,7 +192,15 @@ pub(crate) async fn authenticate(
         secret,
     )
     .await
-    .map_err(AuthError::into_app_error)?;
+    .map_err(|error| {
+        metrics::counter!(
+            "gateway_auth_failures_total",
+            "reason" => error.metric_reason(),
+        )
+        .increment(1);
+
+        error.into_app_error()
+    })?;
 
     let span = tracing::Span::current();
     span.record("tenant_id", identity.tenant_id.as_str());

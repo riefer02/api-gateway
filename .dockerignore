@@ -1,0 +1,10 @@
+target
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.local.md
+.github
+.vscode
+target

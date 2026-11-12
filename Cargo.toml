@@ -13,6 +13,8 @@ dotenvy = "0.15.7"
 getrandom = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry = "0.33.1"
 opentelemetry-http = "0.33.0"
 opentelemetry-otlp = { version = "0.33.1", features = ["trace", "grpc-tonic"] }
