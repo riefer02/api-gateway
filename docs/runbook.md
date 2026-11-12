@@ -74,6 +74,30 @@ Rows carry the actor bound to the admin token, the action, the subject, the sour
 the request id from the response. Tokens can be scoped (`config:read`, `keys:write`, …), so
 `actor` answers *who* and the token's scopes bound *what they could do*.
 
+## Decommission
+
+Delete from the leaves up; foreign keys refuse to orphan rows, so a wrong order returns
+`409` rather than losing data.
+
+```bash
+api-gateway admin route rm billing-v1
+api-gateway admin upstream rm billing     # 409 while routes still reference it
+api-gateway admin key revoke <key-id>
+api-gateway admin client rm acme-app      # 409 while keys still exist
+api-gateway admin tenant rm acme          # 409 while clients still exist
+```
+
+To take a route out of service without deleting it, re-register it disabled:
+
+```bash
+api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing --disabled
+```
+
+## Audit retention
+
+`AUDIT_RETENTION_DAYS` (default 90) prunes `audit_events` at boot and every six hours. Set
+it to `0` to keep everything forever, and make sure the table is backed up if you do.
+
 ## Database outage
 
 Symptoms: `/ready` returns 503, authenticated requests return `503 service_unavailable`,

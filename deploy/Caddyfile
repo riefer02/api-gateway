@@ -1,0 +1,34 @@
+# Edge TLS termination. The gateway itself speaks plain HTTP on a private
+# address; this proxy owns certificates and redirects.
+#
+# Deploy on the VM alongside the compose stack:
+#   caddy run --config deploy/Caddyfile
+
+{
+	email ops@example.com
+}
+
+gateway.example.com {
+	encode zstd gzip
+
+	# Never expose the scrape endpoint or the control plane publicly.
+	@internal {
+		path /metrics /v1/* /healthz
+	}
+	respond @internal 404
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Real-IP {remote_host}
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+}

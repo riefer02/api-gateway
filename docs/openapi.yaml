@@ -54,6 +54,21 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
 
+  /v1/tenants/{id}:
+    delete:
+      tags: [tenants]
+      summary: Delete a tenant
+      description: Fails with 409 while clients still reference it.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
   /v1/clients:
     post:
       tags: [clients]
@@ -73,6 +88,21 @@ paths:
       responses:
         "201":
           description: Created
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/clients/{id}:
+    delete:
+      tags: [clients]
+      summary: Delete a client
+      description: Fails with 409 while API keys still reference it.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "204":
+          description: Deleted
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -207,6 +237,19 @@ paths:
           description: Stored
         "400":
           $ref: "#/components/responses/BadRequest"
+    delete:
+      tags: [upstreams]
+      summary: Delete an upstream
+      description: Fails with 409 while routes still reference it.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /v1/routes:
     get:
@@ -279,6 +322,13 @@ paths:
                   type: array
                   items:
                     type: string
+                enabled:
+                  type: boolean
+                  default: true
+                priority:
+                  type: integer
+                  default: 0
+                  description: Higher wins between routes with the same prefix.
       responses:
         "204":
           description: Stored
@@ -286,6 +336,18 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [routes]
+      summary: Delete a route
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
 components:
   securitySchemes:

@@ -15,8 +15,8 @@ pub(crate) mod http;
 
 #[derive(Debug, Error)]
 pub(crate) enum AdminError {
-    #[error("{entity} `{id}` already exists")]
-    Conflict { entity: &'static str, id: String },
+    #[error("{message}")]
+    Conflict { message: String },
     #[error("{entity} `{id}` not found")]
     NotFound { entity: &'static str, id: String },
     #[error("invalid input: {0}")]
@@ -53,6 +53,8 @@ pub(crate) struct RouteSpec {
     pub(crate) upstream_id: String,
     pub(crate) rewrite_prefix: Option<String>,
     pub(crate) scopes: Vec<String>,
+    pub(crate) enabled: bool,
+    pub(crate) priority: i32,
 }
 
 #[derive(Debug)]
@@ -63,6 +65,7 @@ pub(crate) struct RouteSummary {
     pub(crate) rewrite_prefix: Option<String>,
     pub(crate) upstream_id: String,
     pub(crate) enabled: bool,
+    pub(crate) priority: i32,
 }
 
 #[derive(Debug)]
@@ -226,7 +229,7 @@ impl AdminService {
             .execute(&mut *transaction)
             .await
             .map_err(|error| {
-                if is_foreign_key_violation(&error) {
+                if is_reference_violation(&error) {
                     AdminError::NotFound {
                         entity: "tenant",
                         id: tenant_id.to_owned(),
@@ -301,8 +304,7 @@ impl AdminService {
         }
 
         Err(AdminError::Conflict {
-            entity: "key id",
-            id: "generated".to_owned(),
+            message: "could not allocate a unique key id".to_owned(),
         })
     }
 
@@ -342,8 +344,7 @@ impl AdminService {
 
         if revoked_at.is_some() {
             return Err(AdminError::Conflict {
-                entity: "active key",
-                id: key_id.to_owned(),
+                message: format!("key `{key_id}` is already revoked"),
             });
         }
 
@@ -523,6 +524,12 @@ impl AdminService {
         routing::validate_path_prefix(&spec.path_prefix).map_err(AdminError::Invalid)?;
         routing::parse_methods(&spec.methods).map_err(AdminError::Invalid)?;
 
+        if !(-1_000..=1_000).contains(&spec.priority) {
+            return Err(AdminError::Invalid(
+                "priority must be between -1000 and 1000".to_owned(),
+            ));
+        }
+
         let rewrite = match spec.rewrite_prefix.as_deref() {
             Some(rewrite) => {
                 routing::validate_rewrite(rewrite).map_err(AdminError::Invalid)?;
@@ -545,15 +552,16 @@ impl AdminService {
         sqlx::query(
             r#"
             INSERT INTO routes
-                (id, upstream_id, path_prefix, methods, rewrite_prefix, scopes)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (id, upstream_id, path_prefix, methods, rewrite_prefix, scopes, enabled, priority)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (id) DO UPDATE
                SET upstream_id = EXCLUDED.upstream_id,
                    path_prefix = EXCLUDED.path_prefix,
                    methods = EXCLUDED.methods,
                    rewrite_prefix = EXCLUDED.rewrite_prefix,
                    scopes = EXCLUDED.scopes,
-                   enabled = true,
+                   enabled = EXCLUDED.enabled,
+                   priority = EXCLUDED.priority,
                    updated_at = now()
             "#,
         )
@@ -563,10 +571,12 @@ impl AdminService {
         .bind(&methods)
         .bind(&rewrite)
         .bind(normalize_scopes(&spec.scopes)?)
+        .bind(spec.enabled)
+        .bind(spec.priority)
         .execute(&mut *transaction)
         .await
         .map_err(|error| {
-            if is_foreign_key_violation(&error) {
+            if is_reference_violation(&error) {
                 AdminError::NotFound {
                     entity: "upstream",
                     id: spec.upstream_id.clone(),
@@ -599,7 +609,7 @@ impl AdminService {
 
     pub(crate) async fn list_routes(&self) -> Result<Vec<RouteSummary>, AdminError> {
         let rows = sqlx::query(
-            "SELECT id, methods, path_prefix, rewrite_prefix, upstream_id, enabled
+            "SELECT id, methods, path_prefix, rewrite_prefix, upstream_id, enabled, priority
              FROM routes ORDER BY path_prefix",
         )
         .fetch_all(&self.pool)
@@ -626,6 +636,9 @@ impl AdminService {
                         .map_err(AdminError::Store)?,
                     enabled: row
                         .try_get("enabled")
+                        .map_err(AdminError::Store)?,
+                    priority: row
+                        .try_get("priority")
                         .map_err(AdminError::Store)?,
                 })
             })
@@ -732,6 +745,100 @@ impl AdminService {
         Ok(())
     }
 
+    pub(crate) async fn delete_tenant(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {
+        self.delete_row(
+            actor,
+            "tenant",
+            "tenant.delete",
+            id,
+            "DELETE FROM tenants WHERE id = $1",
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_client(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {
+        self.delete_row(
+            actor,
+            "client",
+            "client.delete",
+            id,
+            "DELETE FROM clients WHERE id = $1",
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_upstream(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {
+        self.delete_row(
+            actor,
+            "upstream",
+            "upstream.delete",
+            id,
+            "DELETE FROM upstreams WHERE id = $1",
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_route(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {
+        self.delete_row(
+            actor,
+            "route",
+            "route.delete",
+            id,
+            "DELETE FROM routes WHERE id = $1",
+        )
+        .await
+    }
+
+    /// One delete path for every table: unknown ids are a 404, rows still
+    /// referenced by a foreign key are a 409, and the audit row commits with
+    /// the delete.
+    async fn delete_row(
+        &self,
+        actor: &Actor,
+        entity: &'static str,
+        action: &'static str,
+        id: &str,
+        statement: &'static str,
+    ) -> Result<(), AdminError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(AdminError::Store)?;
+
+        let result = sqlx::query(statement)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                if is_reference_violation(&error) {
+                    AdminError::Conflict {
+                        message: format!(
+                            "{entity} `{id}` is still referenced and cannot be deleted"
+                        ),
+                    }
+                } else {
+                    AdminError::Store(error)
+                }
+            })?;
+
+        if result.rows_affected() == 0 {
+            return Err(AdminError::NotFound {
+                entity,
+                id: id.to_owned(),
+            });
+        }
+
+        insert_audit(&mut *transaction, actor, action, id, &serde_json::json!({}))
+            .await
+            .map_err(AdminError::Store)?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(AdminError::Store)
+    }
+
     async fn ensure_client_exists(&self, client_id: &str) -> Result<(), AdminError> {
         let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM clients WHERE id = $1")
             .bind(client_id)
@@ -747,6 +854,28 @@ impl AdminService {
                 id: client_id.to_owned(),
             })
         }
+    }
+
+    /// Deletes audit rows older than the retention window. Called at boot and
+    /// on a timer; a zero window means "keep everything".
+    pub(crate) async fn prune_audit(
+        &self,
+        retention: std::time::Duration,
+    ) -> Result<u64, AdminError> {
+        if retention.is_zero() {
+            return Ok(0);
+        }
+
+        let cutoff = OffsetDateTime::now_utc()
+            - time::Duration::seconds(i64::try_from(retention.as_secs()).unwrap_or(i64::MAX));
+
+        let result = sqlx::query("DELETE FROM audit_events WHERE occurred_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(AdminError::Store)?;
+
+        Ok(result.rows_affected())
     }
 
     pub(crate) async fn list_audit(&self, limit: i64) -> Result<Vec<AuditEntry>, AdminError> {
@@ -893,8 +1022,7 @@ fn validate_expiry(expires_at: Option<OffsetDateTime>) -> Result<(), AdminError>
 fn conflict_or_store(error: sqlx::Error, entity: &'static str, id: &str) -> AdminError {
     if is_unique_violation(&error) {
         AdminError::Conflict {
-            entity,
-            id: id.to_owned(),
+            message: format!("{entity} `{id}` already exists"),
         }
     } else {
         AdminError::Store(error)
@@ -908,14 +1036,71 @@ fn store_error(error: StoreError) -> AdminError {
     }
 }
 
-fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("23503"))
+/// A row still referenced by another table. Postgres reports `23503` for a
+/// missing parent on insert and `23001` for a RESTRICT block on delete; both
+/// mean "this would orphan something".
+fn is_reference_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|database| {
+            database.is_foreign_key_violation() || database.code().as_deref() == Some("23001")
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    async fn deleting_a_referenced_tenant_is_a_conflict() {
+        let Some(pool) = pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let store: Arc<dyn ApiKeyStore> = Arc::new(
+            auth::store::postgres::PostgresApiKeyStore::new(pool.clone()),
+        );
+        let service = AdminService::new(
+            pool.clone(),
+            Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+            Vec::new(),
+            store,
+        );
+
+        let actor = Actor::local("test");
+        let tenant = unique("del-tenant");
+        let client = unique("del-client");
+
+        service
+            .create_tenant(&actor, &tenant)
+            .await
+            .expect("create tenant");
+        service
+            .create_client(&actor, &client, &tenant)
+            .await
+            .expect("create client");
+
+        let error = service
+            .delete_tenant(&actor, &tenant)
+            .await
+            .expect_err("tenant is still referenced");
+
+        assert!(
+            matches!(error, AdminError::Conflict { .. }),
+            "expected Conflict, got {error:?}"
+        );
+
+        service
+            .delete_client(&actor, &client)
+            .await
+            .expect("delete client");
+        service
+            .delete_tenant(&actor, &tenant)
+            .await
+            .expect("delete tenant");
+    }
 
     #[test]
     fn scope_vocabulary_matches_configuration() {

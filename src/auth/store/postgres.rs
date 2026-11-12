@@ -215,7 +215,9 @@ fn insert_error(error: sqlx::Error) -> StoreError {
 }
 
 pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("23505"))
+    error
+        .as_database_error()
+        .is_some_and(|database| database.is_unique_violation())
 }
 
 #[cfg(test)]

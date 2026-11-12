@@ -103,6 +103,14 @@ impl fmt::Debug for SecretString {
     }
 }
 
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+
+        self.0.zeroize();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub environment: AppEnvironment,
@@ -123,6 +131,11 @@ pub struct ServerConfig {
     pub request_body_limit_bytes: usize,
     pub request_timeout: Duration,
     pub shutdown_drain: Duration,
+    /// Bound on reading a complete request head. Without it a client can hold
+    /// a connection open by trickling headers (slowloris).
+    pub header_read_timeout: Duration,
+    /// Hard cap on concurrent TCP connections.
+    pub max_connections: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +171,10 @@ pub struct AdminConfig {
     pub bind: String,
     /// Named admin tokens. Empty disables the listener.
     pub tokens: Vec<AdminToken>,
+    /// Deadline for one control-plane request.
+    pub timeout: Duration,
+    /// How long audit rows are kept. Zero keeps them forever.
+    pub audit_retention: Duration,
 }
 
 /// One operator credential. The name is what the audit log records; the scopes
@@ -286,6 +303,8 @@ impl Config {
             ),
             request_timeout: seconds_or(source, "REQUEST_TIMEOUT_SECS", 15, &mut problems),
             shutdown_drain: seconds_or(source, "SHUTDOWN_DRAIN_SECS", 25, &mut problems),
+            header_read_timeout: seconds_or(source, "HEADER_READ_TIMEOUT_SECS", 10, &mut problems),
+            max_connections: number_or(source, "MAX_CONNECTIONS", 1_024_usize, &mut problems),
         };
 
         let database = DatabaseConfig {
@@ -316,6 +335,10 @@ impl Config {
         let admin = AdminConfig {
             bind: string_or(source, "ADMIN_BIND", "127.0.0.1:9090"),
             tokens: admin_tokens(source, &mut problems),
+            timeout: seconds_or(source, "ADMIN_TIMEOUT_SECS", 10, &mut problems),
+            audit_retention: Duration::from_secs(
+                86_400 * number_or(source, "AUDIT_RETENTION_DAYS", 90_u64, &mut problems),
+            ),
         };
 
         let rate_limit_backend = match source
@@ -415,6 +438,12 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     if server.shutdown_drain.is_zero() {
         problems.push("SHUTDOWN_DRAIN_SECS must be greater than zero".to_owned());
     }
+    if server.header_read_timeout.is_zero() {
+        problems.push("HEADER_READ_TIMEOUT_SECS must be greater than zero".to_owned());
+    }
+    if server.max_connections == 0 {
+        problems.push("MAX_CONNECTIONS must be at least 1".to_owned());
+    }
     if database.max_connections == 0 {
         problems.push("DB_MAX_CONNECTIONS must be at least 1".to_owned());
     }
@@ -457,6 +486,9 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
             .is_err()
     {
         problems.push("ADMIN_BIND must be a socket address like 127.0.0.1:9090".to_owned());
+    }
+    if admin.timeout.is_zero() {
+        problems.push("ADMIN_TIMEOUT_SECS must be greater than zero".to_owned());
     }
 
     if environment.is_production() {

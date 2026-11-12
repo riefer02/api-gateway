@@ -89,6 +89,7 @@ pub(crate) enum AuditCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum TenantCommand {
     Create { id: String },
+    Rm { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -97,6 +98,9 @@ pub(crate) enum ClientCommand {
         id: String,
         #[arg(long)]
         tenant: String,
+    },
+    Rm {
+        id: String,
     },
 }
 
@@ -126,6 +130,9 @@ pub(crate) enum KeyCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum UpstreamCommand {
+    Rm {
+        id: String,
+    },
     Put {
         id: String,
         #[arg(long)]
@@ -137,6 +144,9 @@ pub(crate) enum UpstreamCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RouteCommand {
+    Rm {
+        id: String,
+    },
     Put {
         id: String,
         #[arg(long)]
@@ -152,6 +162,12 @@ pub(crate) enum RouteCommand {
         /// Scope a caller needs; repeat for several
         #[arg(long = "scope")]
         scopes: Vec<String>,
+        /// Register the route disabled
+        #[arg(long)]
+        disabled: bool,
+        /// Higher priority wins between routes with the same prefix
+        #[arg(long)]
+        priority: Option<i32>,
     },
     List,
 }
@@ -203,22 +219,34 @@ async fn dispatch(
     let actor = Actor::local("cli");
 
     match command {
-        AdminCommand::Tenant {
-            command: TenantCommand::Create { id },
-        } => {
-            service
-                .create_tenant(&actor, &id)
-                .await?;
-            println!("tenant `{id}` created");
-        }
-        AdminCommand::Client {
-            command: ClientCommand::Create { id, tenant },
-        } => {
-            service
-                .create_client(&actor, &id, &tenant)
-                .await?;
-            println!("client `{id}` created in tenant `{tenant}`");
-        }
+        AdminCommand::Tenant { command } => match command {
+            TenantCommand::Create { id } => {
+                service
+                    .create_tenant(&actor, &id)
+                    .await?;
+                println!("tenant `{id}` created");
+            }
+            TenantCommand::Rm { id } => {
+                service
+                    .delete_tenant(&actor, &id)
+                    .await?;
+                println!("tenant `{id}` deleted");
+            }
+        },
+        AdminCommand::Client { command } => match command {
+            ClientCommand::Create { id, tenant } => {
+                service
+                    .create_client(&actor, &id, &tenant)
+                    .await?;
+                println!("client `{id}` created in tenant `{tenant}`");
+            }
+            ClientCommand::Rm { id } => {
+                service
+                    .delete_client(&actor, &id)
+                    .await?;
+                println!("client `{id}` deleted");
+            }
+        },
         AdminCommand::Key { command } => run_key_command(&service, &actor, command).await?,
         AdminCommand::Upstream { command } => {
             run_upstream_command(&service, &actor, command).await?
@@ -323,6 +351,12 @@ async fn run_upstream_command(
     command: UpstreamCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
+        UpstreamCommand::Rm { id } => {
+            service
+                .delete_upstream(actor, &id)
+                .await?;
+            println!("upstream `{id}` deleted");
+        }
         UpstreamCommand::Put {
             id,
             base_url,
@@ -344,6 +378,10 @@ async fn run_route_command(
     command: RouteCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
+        RouteCommand::Rm { id } => {
+            service.delete_route(actor, &id).await?;
+            println!("route `{id}` deleted");
+        }
         RouteCommand::Put {
             id,
             prefix,
@@ -351,6 +389,8 @@ async fn run_route_command(
             methods,
             rewrite,
             scopes,
+            disabled,
+            priority,
         } => {
             service
                 .put_route(
@@ -362,6 +402,8 @@ async fn run_route_command(
                         upstream_id: upstream,
                         rewrite_prefix: rewrite,
                         scopes,
+                        enabled: !disabled,
+                        priority: priority.unwrap_or(0),
                     },
                 )
                 .await?;

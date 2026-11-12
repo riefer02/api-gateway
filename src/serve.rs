@@ -97,7 +97,8 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         metrics,
     };
 
-    let admin_server = start_admin(config, admin).await?;
+    let admin_server = start_admin(config, Arc::clone(&admin)).await?;
+    let audit_task = spawn_audit_pruning(config, Arc::clone(&admin));
 
     let app = app::build_app(config, state);
     let address = format!("{}:{}", config.server.host, config.server.port);
@@ -105,8 +106,19 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
 
     log_startup(config, &routes);
 
-    let outcome = serve_until_shutdown(listener, app, config).await;
+    tracing::info!("shutdown requested; draining in-flight connections");
+
+    let outcome = run_server(
+        listener,
+        app,
+        config.server.header_read_timeout,
+        config.server.max_connections,
+        config.server.shutdown_drain,
+        wait_for_shutdown_signal(),
+    )
+    .await;
     refresh_task.abort();
+    audit_task.abort();
     if let Some(task) = revocation_task {
         task.abort();
     }
@@ -143,7 +155,7 @@ fn log_startup(config: &Config, routes: &RouteTableHandle) {
     }
 }
 struct AdminServer {
-    task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    task: tokio::task::JoinHandle<Result<(), BoxError>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 async fn start_admin(
@@ -154,23 +166,28 @@ async fn start_admin(
         return Ok(None);
     }
 
-    let app = admin::http::router(service, Arc::new(config.admin.tokens.clone()));
+    let app = admin::http::router(
+        service,
+        Arc::new(config.admin.tokens.clone()),
+        config.admin.timeout,
+    );
     let listener = tokio::net::TcpListener::bind(&config.admin.bind).await?;
 
     tracing::info!(bind = %config.admin.bind, "admin API listening");
 
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let task = tokio::spawn(
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
+    let task = tokio::spawn(run_server(
+        listener,
+        app,
+        config.server.header_read_timeout,
+        // The control plane is an internal listener; keep its footprint small.
+        64,
+        std::time::Duration::from_secs(5),
+        async move {
             let _ = shutdown_rx.await;
-        })
-        .into_future(),
-    );
+        },
+    ));
 
     Ok(Some(AdminServer { task, shutdown }))
 }
@@ -182,12 +199,35 @@ async fn stop_admin(server: Option<AdminServer>) {
 
     let _ = server.shutdown.send(());
 
-    if tokio::time::timeout(std::time::Duration::from_secs(5), server.task)
-        .await
-        .is_err()
-    {
-        tracing::warn!("admin API did not drain within 5s");
+    match tokio::time::timeout(std::time::Duration::from_secs(5), server.task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => tracing::warn!(%error, "admin API stopped with an error"),
+        Ok(Err(join_error)) => tracing::warn!(%join_error, "admin API task failed"),
+        Err(_) => tracing::warn!("admin API did not drain within 5s"),
     }
+}
+
+/// Audit rows are append-only by design, so retention is a scheduled delete
+/// rather than an overwrite.
+fn spawn_audit_pruning(
+    config: &Config,
+    service: Arc<admin::AdminService>,
+) -> tokio::task::JoinHandle<()> {
+    let retention = config.admin.audit_retention;
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+
+        loop {
+            ticker.tick().await;
+
+            match service.prune_audit(retention).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "pruned audit rows"),
+                Err(error) => tracing::warn!(%error, "audit pruning failed"),
+            }
+        }
+    })
 }
 
 async fn seed_development_key(
@@ -207,52 +247,119 @@ async fn seed_development_key(
     Ok(())
 }
 
-async fn serve_until_shutdown(
+/// Serves one listener with a bounded connection count, a header-read timeout,
+/// and graceful drain. Returns when `shutdown` resolves and every connection
+/// has finished or the drain budget expires.
+async fn run_server(
     listener: tokio::net::TcpListener,
     app: axum::Router,
-    config: &Config,
+    header_read_timeout: std::time::Duration,
+    max_connections: usize,
+    drain: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), BoxError> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo, TokioTimer},
+        server::conn::auto,
+        service::TowerToHyperService,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Semaphore, watch};
+    use tower::ServiceExt as _;
 
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.await;
-    });
+    let permits = Arc::new(Semaphore::new(max_connections));
+    let (stop_tx, stop_rx) = watch::channel(());
+    let mut connections = tokio::task::JoinSet::new();
+    let mut shutdown = std::pin::pin!(shutdown);
 
-    let mut handle = tokio::spawn(server.into_future());
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "accept failed; continuing");
+                        continue;
+                    }
+                };
 
-    tokio::select! {
-        _ = wait_for_shutdown_signal() => {}
-        result = &mut handle => {
-            return match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(error.into()),
-                Err(join_error) => Err(join_error.into()),
-            };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    metrics::counter!("gateway_connections_rejected_total").increment(1);
+                    tracing::warn!(%peer, "connection limit reached; refusing");
+                    drop(stream);
+                    continue;
+                };
+
+                let app = app.clone();
+                let mut stop = stop_rx.clone();
+
+                connections.spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = TowerToHyperService::new(tower::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let app = app.clone();
+
+                            async move {
+                                app.oneshot(request.map(axum::body::Body::new)).await
+                            }
+                        },
+                    ));
+
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(header_read_timeout);
+
+                    let connection = builder.serve_connection_with_upgrades(io, service);
+                    tokio::pin!(connection);
+
+                    tokio::select! {
+                        result = connection.as_mut() => {
+                            if let Err(error) = result {
+                                tracing::debug!(%error, "connection ended with an error");
+                            }
+                        }
+                        _ = stop.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                    }
+
+                    drop(permit);
+                });
+            }
         }
     }
 
-    tracing::info!("shutdown requested; draining in-flight requests");
-    let _ = shutdown_tx.send(());
+    let _ = stop_tx.send(());
 
-    match tokio::time::timeout(config.server.shutdown_drain, handle).await {
-        Ok(Ok(Ok(()))) => {
-            tracing::info!("drained cleanly");
-            Ok(())
-        }
-        Ok(Ok(Err(error))) => Err(error.into()),
-        Ok(Err(join_error)) => Err(join_error.into()),
-        Err(_) => {
-            tracing::warn!(
-                drain_timeout_secs = config.server.shutdown_drain.as_secs(),
-                "drain timed out; exiting with requests in flight"
-            );
-            Ok(())
+    let deadline = tokio::time::sleep(drain);
+    tokio::pin!(deadline);
+    let mut drained = true;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                drained = false;
+                break;
+            }
+            joined = connections.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+            }
         }
     }
+
+    if drained {
+        tracing::info!("drained cleanly");
+    } else {
+        tracing::warn!("drain timed out; exiting with connections still open");
+    }
+
+    Ok(())
 }
 
 async fn wait_for_shutdown_signal() {

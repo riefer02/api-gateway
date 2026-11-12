@@ -87,6 +87,8 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac",
+ "hyper",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
@@ -109,6 +111,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

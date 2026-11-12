@@ -77,7 +77,7 @@ allowlisted upstream
 | `src/error.rs` | `AppError` and the JSON error envelope. |
 | `examples/` | Stub upstream and load generator for `just bench`. |
 | `docs/` | Threat model, runbook, and control-plane OpenAPI. |
-| `deploy/` | Prometheus alert rules. |
+| `deploy/` | Prometheus alerts, Kubernetes manifests, Caddy edge config. |
 
 Requests never touch Postgres to resolve a route or render a policy: the table is compiled
 to memory at boot and swapped atomically when the version counter changes.
@@ -110,7 +110,13 @@ api-gateway admin key list --client acme-app
 
 api-gateway admin upstream put billing --base-url https://billing.internal --timeout-ms 5000
 api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing --scope billing:read
+api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing --disabled
 api-gateway admin route list
+
+api-gateway admin route rm billing-v1
+api-gateway admin upstream rm billing
+api-gateway admin client rm acme-app
+api-gateway admin tenant rm acme
 ```
 
 The HTTP API serves the same operations on a separate listener. Configure named tokens
@@ -191,7 +197,10 @@ whose listener is disconnected.
   with bodies are never retried because the body streams and cannot be replayed;
   `Idempotency-Key` opts a bodiless `POST` in.
 - **Deadlines**: connect and header waits are bounded per upstream; the whole request has
-  its own deadline; bodies stream rather than buffer.
+  its own deadline; request heads must arrive within `HEADER_READ_TIMEOUT_SECS`, and
+  `MAX_CONNECTIONS` caps open sockets so a slowloris cannot exhaust file descriptors.
+- **Bounded growth**: audit rows are pruned on a timer (`AUDIT_RETENTION_DAYS`); the rate
+  limiter and credential cache sweep their shards on a timer, not on every insert.
 - **Header hygiene**: hop-by-hop headers — including those named by `Connection` — plus
   `Forwarded`/`X-Forwarded-*`, `Host`, `Authorization`, and `Cookie` are stripped before
   forwarding. `Server` and `Set-Cookie` are stripped on the way back. Redirects are never
@@ -299,6 +308,10 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `RETRY_BASE_DELAY_MS` | `50` | Backoff base, jittered, capped at 1 s |
 | `RETRY_BUDGET_RATIO` | `0.2` | Retries per request as a fraction of traffic; `0` disables |
 | `REQUEST_TIMEOUT_SECS` | `15` | Whole-request deadline |
+| `HEADER_READ_TIMEOUT_SECS` | `10` | Bound on receiving a complete request head |
+| `MAX_CONNECTIONS` | `1024` | Concurrent socket cap |
+| `ADMIN_TIMEOUT_SECS` | `10` | Control-plane request deadline |
+| `AUDIT_RETENTION_DAYS` | `90` | Audit pruning window; `0` keeps forever |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Inbound body limit |
 | `SHUTDOWN_DRAIN_SECS` | `25` | Graceful drain budget |
 | `DB_MAX_CONNECTIONS` / `DB_MIN_CONNECTIONS` / `DB_ACQUIRE_TIMEOUT_SECS` | `10` / `1` / `5` | Pool sizing |

@@ -19,25 +19,43 @@ use crate::error::AppError;
 struct AdminState {
     service: Arc<AdminService>,
     accounts: Arc<Vec<AdminToken>>,
+    timeout: std::time::Duration,
 }
 
 /// HTTP adapter over [`AdminService`]. Separate listener, bearer token, and
 /// its own bind address; never mounted on the data plane.
-pub(crate) fn router(service: Arc<AdminService>, accounts: Arc<Vec<AdminToken>>) -> Router {
-    let state = AdminState { service, accounts };
+pub(crate) fn router(
+    service: Arc<AdminService>,
+    accounts: Arc<Vec<AdminToken>>,
+    timeout: std::time::Duration,
+) -> Router {
+    let state = AdminState {
+        service,
+        accounts,
+        timeout,
+    };
 
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/tenants", post(create_tenant))
+        .route("/v1/tenants/{id}", delete(delete_tenant))
         .route("/v1/clients", post(create_client))
+        .route("/v1/clients/{id}", delete(delete_client))
         .route("/v1/keys", post(create_key).get(list_keys))
         .route("/v1/keys/{key_id}", delete(revoke_key))
         .route("/v1/keys/{key_id}/rotate", post(rotate_key))
         .route("/v1/upstreams", get(list_upstreams))
-        .route("/v1/upstreams/{id}", put(put_upstream))
+        .route(
+            "/v1/upstreams/{id}",
+            put(put_upstream).delete(delete_upstream),
+        )
         .route("/v1/routes", get(list_routes))
-        .route("/v1/routes/{id}", put(put_route))
+        .route("/v1/routes/{id}", put(put_route).delete(delete_route))
         .route("/v1/audit", get(list_audit))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            enforce_admin_deadline,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -60,6 +78,11 @@ async fn require_admin(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let source_ip = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string());
+
     // Compare against every account so the number of configured tokens is not
     // observable through response timing.
     let mut matched: Option<&AdminToken> = None;
@@ -71,13 +94,16 @@ async fn require_admin(
     }
 
     let Some(account) = matched else {
+        metrics::counter!("gateway_admin_auth_failures_total").increment(1);
+        tracing::warn!(
+            source_ip = source_ip
+                .as_deref()
+                .unwrap_or("unknown"),
+            "admin authentication failed"
+        );
+
         return AppError::Unauthorized.into_response();
     };
-
-    let source_ip = request
-        .extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|connect| connect.0.ip().to_string());
 
     request
         .extensions_mut()
@@ -129,6 +155,18 @@ where
                 rejection.body_text()
             ))),
         }
+    }
+}
+
+/// One control-plane request may not outlive `ADMIN_TIMEOUT_SECS`.
+async fn enforce_admin_deadline(
+    State(state): State<AdminState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(state.timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => AppError::RequestTimeout.into_response(),
     }
 }
 
@@ -372,6 +410,7 @@ struct RouteView {
     upstream_id: String,
     rewrite_prefix: Option<String>,
     enabled: bool,
+    priority: i32,
 }
 
 async fn list_routes(
@@ -392,6 +431,7 @@ async fn list_routes(
                 upstream_id: route.upstream_id,
                 rewrite_prefix: route.rewrite_prefix,
                 enabled: route.enabled,
+                priority: route.priority,
             })
             .collect(),
     ))
@@ -406,6 +446,8 @@ struct PutRoute {
     rewrite_prefix: Option<String>,
     #[serde(default)]
     scopes: Vec<String>,
+    enabled: Option<bool>,
+    priority: Option<i32>,
 }
 
 async fn put_route(
@@ -427,8 +469,66 @@ async fn put_route(
                 upstream_id: body.upstream_id,
                 rewrite_prefix: body.rewrite_prefix,
                 scopes: body.scopes,
+                enabled: body.enabled.unwrap_or(true),
+                priority: body.priority.unwrap_or(0),
             },
         )
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_tenant(
+    State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::TenantsWrite)?;
+    state
+        .service
+        .delete_tenant(&actor, &id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_client(
+    State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::TenantsWrite)?;
+    state
+        .service
+        .delete_client(&actor, &id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_upstream(
+    State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::ConfigWrite)?;
+    state
+        .service
+        .delete_upstream(&actor, &id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_route(
+    State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::ConfigWrite)?;
+    state
+        .service
+        .delete_route(&actor, &id)
         .await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -437,8 +537,8 @@ async fn put_route(
 impl From<AdminError> for AppError {
     fn from(error: AdminError) -> Self {
         match error {
-            AdminError::Conflict { entity, id } => AppError::Conflict {
-                message: format!("{entity} `{id}` already exists").into(),
+            AdminError::Conflict { message } => AppError::Conflict {
+                message: message.into(),
             },
             AdminError::NotFound { entity, id } => AppError::NotFound {
                 message: format!("{entity} `{id}` not found").into(),
@@ -469,6 +569,7 @@ mod tests {
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
             )),
             Arc::new(accounts),
+            std::time::Duration::from_secs(5),
         )
     }
 
@@ -621,6 +722,7 @@ mod scope_tests {
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
             )),
             Arc::new(accounts),
+            std::time::Duration::from_secs(5),
         )
     }
 
