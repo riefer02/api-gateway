@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 use crate::error::AppError;
 use crate::state::AppState;
 
+pub(crate) mod cache;
 pub(crate) mod key;
 pub(crate) mod store;
 pub(crate) mod verifier;

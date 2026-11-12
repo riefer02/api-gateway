@@ -21,8 +21,10 @@ pub enum AppError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
-    #[error("not found")]
-    NotFound,
+    #[error("not found: {message}")]
+    NotFound { message: Cow<'static, str> },
+    #[error("conflict: {message}")]
+    Conflict { message: Cow<'static, str> },
     #[error("payload too large")]
     PayloadTooLarge,
     #[error("request deadline exceeded")]
@@ -64,12 +66,19 @@ impl AppError {
         }
     }
 
+    pub(crate) fn not_found() -> Self {
+        Self::NotFound {
+            message: "no route matches this request".into(),
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound { .. } => StatusCode::NOT_FOUND,
+            Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
@@ -87,7 +96,8 @@ impl AppError {
             Self::BadRequest { .. } => "bad_request",
             Self::Unauthorized => "invalid_credentials",
             Self::Forbidden => "forbidden",
-            Self::NotFound => "not_found",
+            Self::NotFound { .. } => "not_found",
+            Self::Conflict { .. } => "conflict",
             Self::PayloadTooLarge => "payload_too_large",
             Self::RequestTimeout => "request_timeout",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
@@ -105,7 +115,8 @@ impl AppError {
             Self::BadRequest { message } => message.clone(),
             Self::Unauthorized => "invalid or missing bearer credentials".into(),
             Self::Forbidden => "the credential is not permitted to perform this request".into(),
-            Self::NotFound => "no route matches this request".into(),
+            Self::NotFound { message } => message.clone(),
+            Self::Conflict { message } => message.clone(),
             Self::PayloadTooLarge => "request body exceeds the configured limit".into(),
             Self::RequestTimeout => "the request exceeded the server deadline".into(),
             Self::MethodNotAllowed { .. } => "this route does not accept that method".into(),

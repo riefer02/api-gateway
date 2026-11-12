@@ -1,0 +1,388 @@
+openapi: 3.1.0
+info:
+  title: api-gateway control plane
+  version: 0.1.0
+  description: |
+    Administrative API for the gateway. Served on `ADMIN_BIND` (default
+    `127.0.0.1:9090`) and only when `ADMIN_TOKEN` is set. Every operation is
+    also available through the `api-gateway admin` CLI, which uses the same
+    service layer.
+
+    Mutations take effect on the data plane without a restart: the route table
+    version counter changes and each replica swaps its snapshot within
+    `ROUTE_REFRESH_INTERVAL_MS`.
+servers:
+  - url: http://127.0.0.1:9090
+security:
+  - adminToken: []
+tags:
+  - name: tenants
+  - name: clients
+  - name: keys
+  - name: upstreams
+  - name: routes
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness of the control-plane listener
+      security: []
+      responses:
+        "200":
+          description: Listening
+
+  /v1/tenants:
+    post:
+      tags: [tenants]
+      summary: Create a tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  example: acme
+      responses:
+        "201":
+          description: Created
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/clients:
+    post:
+      tags: [clients]
+      summary: Create a client inside a tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, tenant_id]
+              properties:
+                id:
+                  type: string
+                tenant_id:
+                  type: string
+      responses:
+        "201":
+          description: Created
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/keys:
+    post:
+      tags: [keys]
+      summary: Issue an API key
+      description: The `token` is returned exactly once and never again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [client_id]
+              properties:
+                client_id:
+                  type: string
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                expires_in_days:
+                  type: integer
+                  minimum: 1
+      responses:
+        "201":
+          description: Issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedKey"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    get:
+      tags: [keys]
+      summary: List a client's keys (never returns tokens)
+      parameters:
+        - name: client_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Keys
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KeySummary"
+
+  /v1/keys/{key_id}:
+    delete:
+      tags: [keys]
+      summary: Revoke a key
+      description: Takes effect immediately for this process; other processes are bounded by `AUTH_CACHE_TTL_SECS`.
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "204":
+          description: Revoked
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/keys/{key_id}/rotate:
+    post:
+      tags: [keys]
+      summary: Replace a key with an equivalent one
+      description: |
+        Issues a new key with the same client, scopes, and remaining lifetime,
+        then revokes the old one. Refuses keys that are already revoked.
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "200":
+          description: Replacement issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedKey"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v1/upstreams:
+    get:
+      tags: [upstreams]
+      summary: List upstreams
+      responses:
+        "200":
+          description: Upstreams
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Upstream"
+
+  /v1/upstreams/{id}:
+    put:
+      tags: [upstreams]
+      summary: Register or update an upstream
+      description: The host must pass `UPSTREAM_ALLOW_HOSTS` when that list is set.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [base_url]
+              properties:
+                base_url:
+                  type: string
+                  format: uri
+                  example: https://billing.internal
+                timeout_ms:
+                  type: integer
+                  default: 10000
+                  minimum: 1
+                  maximum: 300000
+      responses:
+        "204":
+          description: Stored
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /v1/routes:
+    get:
+      tags: [routes]
+      summary: List routes
+      responses:
+        "200":
+          description: Routes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Route"
+
+  /v1/routes/{id}:
+    put:
+      tags: [routes]
+      summary: Register or update a route
+      description: |
+        The matched prefix is stripped before forwarding unless `rewrite_prefix`
+        supplies a replacement. A prefix+method pair may be claimed by only one
+        route.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path_prefix, upstream_id]
+              properties:
+                path_prefix:
+                  type: string
+                  example: /v1/billing
+                methods:
+                  type: array
+                  items:
+                    type: string
+                  example: [GET, POST]
+                upstream_id:
+                  type: string
+                rewrite_prefix:
+                  type: string
+                  example: /billing
+                scopes:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "204":
+          description: Stored
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
+      description: Value of `ADMIN_TOKEN`.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    IssuedKey:
+      type: object
+      required: [key_id, token, scopes]
+      properties:
+        key_id:
+          type: string
+        token:
+          type: string
+          description: Shown once. Format `<key_id>.<secret>`; send as a bearer token.
+        scopes:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: string
+          nullable: true
+    KeySummary:
+      type: object
+      required: [key_id, client_id, scopes, created_at]
+      properties:
+        key_id:
+          type: string
+        client_id:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+        expires_at:
+          type: string
+          nullable: true
+        revoked_at:
+          type: string
+          nullable: true
+    Upstream:
+      type: object
+      required: [id, base_url, timeout_ms]
+      properties:
+        id:
+          type: string
+        base_url:
+          type: string
+        timeout_ms:
+          type: integer
+    Route:
+      type: object
+      required: [id, path_prefix, methods, upstream_id]
+      properties:
+        id:
+          type: string
+        path_prefix:
+          type: string
+        methods:
+          type: array
+          items:
+            type: string
+        upstream_id:
+          type: string
+        rewrite_prefix:
+          type: string
+          nullable: true
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: not_found
+            message:
+              type: string
+            request_id:
+              type: string
+              nullable: true
+
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Unknown resource
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Already exists or not in the required state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

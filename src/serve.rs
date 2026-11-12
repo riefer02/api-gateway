@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use sqlx::PgPool;
-
 use crate::{
     admin,
     admin::cli::ServeArgs,
     app,
-    auth::{KeyVerifier, store::postgres::PostgresApiKeyStore},
+    auth::{
+        KeyVerifier,
+        cache::CachedApiKeyStore,
+        store::{ApiKeyStore, postgres::PostgresApiKeyStore},
+    },
     config::Config,
     db,
     limits::{BreakerRegistry, RateLimits},
@@ -40,7 +42,24 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     db::migrate(&pool).await?;
 
     let verifier = Arc::new(KeyVerifier::new(config.auth.pepper.clone()));
-    seed_development_key(config, &pool, &verifier).await?;
+
+    let store: Arc<dyn ApiKeyStore> = if config.auth.cache_ttl.is_zero() {
+        Arc::new(PostgresApiKeyStore::new(pool.clone()))
+    } else {
+        Arc::new(CachedApiKeyStore::new(
+            Arc::new(PostgresApiKeyStore::new(pool.clone())),
+            config.auth.cache_ttl,
+        ))
+    };
+
+    let admin = Arc::new(admin::AdminService::new(
+        pool.clone(),
+        Arc::clone(&verifier),
+        config.routing.allow_hosts.clone(),
+        Arc::clone(&store),
+    ));
+
+    seed_development_key(config, &admin).await?;
 
     let source = RouteSource::new(pool.clone(), config.routing.allow_hosts.clone());
     let table = source.load().await?;
@@ -56,7 +75,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let metrics = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
 
     let state = AppState {
-        api_key_store: Arc::new(PostgresApiKeyStore::new(pool.clone())),
+        api_key_store: Arc::clone(&store),
         db: pool,
         verifier,
         routes,
@@ -64,6 +83,8 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         metrics,
     };
+
+    let admin_server = start_admin(config, admin).await?;
 
     let app = app::build_app(config, state);
     let address = format!("{}:{}", config.server.host, config.server.port);
@@ -73,24 +94,67 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
 
     let outcome = serve_until_shutdown(listener, app, config).await;
     refresh_task.abort();
+    stop_admin(admin_server).await;
 
     outcome
 }
 
+/// The control plane is optional: it starts only when `ADMIN_TOKEN` is set, and
+/// it always shares the process so cache invalidation is immediate.
+struct AdminServer {
+    task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+async fn start_admin(
+    config: &Config,
+    service: Arc<admin::AdminService>,
+) -> Result<Option<AdminServer>, BoxError> {
+    let Some(token) = config.admin.token.clone() else {
+        return Ok(None);
+    };
+
+    let app = admin::http::router(service, token);
+    let listener = tokio::net::TcpListener::bind(&config.admin.bind).await?;
+
+    tracing::info!(bind = %config.admin.bind, "admin API listening");
+
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let task = tokio::spawn(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .into_future(),
+    );
+
+    Ok(Some(AdminServer { task, shutdown }))
+}
+
+async fn stop_admin(server: Option<AdminServer>) {
+    let Some(server) = server else {
+        return;
+    };
+
+    let _ = server.shutdown.send(());
+
+    if tokio::time::timeout(std::time::Duration::from_secs(5), server.task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("admin API did not drain within 5s");
+    }
+}
+
 async fn seed_development_key(
     config: &Config,
-    pool: &PgPool,
-    verifier: &Arc<KeyVerifier>,
+    service: &admin::AdminService,
 ) -> Result<(), BoxError> {
     let Some(secret) = &config.auth.dev_api_key_secret else {
         return Ok(());
     };
 
-    let service = admin::AdminService::new(
-        pool.clone(),
-        Arc::clone(verifier),
-        config.routing.allow_hosts.clone(),
-    );
     service
         .seed_development_key(secret.expose(), &config.auth.dev_api_key_scopes)
         .await?;

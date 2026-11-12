@@ -5,7 +5,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{
     admin::{AdminService, IssuedKey, KeySummary, RouteSpec},
-    auth::KeyVerifier,
+    auth::{KeyVerifier, store::ApiKeyStore},
     config::Config,
     db, observability,
 };
@@ -182,7 +182,10 @@ async fn dispatch(
     db::migrate(&pool).await?;
 
     let verifier = Arc::new(KeyVerifier::new(config.auth.pepper.clone()));
-    let service = AdminService::new(pool, verifier, config.routing.allow_hosts.clone());
+    let store: Arc<dyn ApiKeyStore> = Arc::new(
+        crate::auth::store::postgres::PostgresApiKeyStore::new(pool.clone()),
+    );
+    let service = AdminService::new(pool, verifier, config.routing.allow_hosts.clone(), store);
 
     match command {
         AdminCommand::Tenant {

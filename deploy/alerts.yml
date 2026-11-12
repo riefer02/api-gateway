@@ -1,0 +1,92 @@
+# Prometheus alert rules for the gateway.
+#
+# Scrape `/metrics` from the monitoring network. Alerts assume a 30s scrape
+# interval and `job="api-gateway"`.
+
+groups:
+  - name: gateway-availability
+    rules:
+      - alert: GatewayDown
+        expr: up{job="api-gateway"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway {{ $labels.instance }} is not being scraped"
+          description: "No metrics for 2 minutes. Check the process and its listener."
+
+      - alert: GatewayNotReady
+        expr: probe_success{job="gateway-ready"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway readiness is failing"
+          description: "The gateway cannot authenticate anyone; check Postgres connectivity."
+
+  - name: gateway-errors
+    rules:
+      - alert: HighServerErrorRate
+        expr: |
+          sum(rate(gateway_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(gateway_requests_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 5% of requests are failing with 5xx"
+
+      - alert: UpstreamFailing
+        expr: |
+          sum by (upstream) (rate(gateway_upstream_requests_total{status=~"5.."}[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Upstream {{ $labels.upstream }} is returning 5xx"
+
+      - alert: CircuitOpen
+        expr: increase(gateway_circuit_open_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker open for {{ $labels.upstream }}"
+          description: "Traffic is being shed instead of sent. Check the upstream."
+
+      - alert: AuthFailureSpike
+        expr: sum(rate(gateway_auth_failures_total[5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated authentication failures"
+          description: "Possible credential stuffing or a broken client deployment."
+
+  - name: gateway-latency
+    rules:
+      - alert: GatewayLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(gateway_request_duration_seconds_bucket[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency is above 50ms"
+          description: "Check upstream latency and Postgres pool saturation."
+
+      - alert: LoadShedding
+        expr: |
+          sum(rate(gateway_requests_total{status="429"}[5m]))
+            /
+          sum(rate(gateway_requests_total[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 20% of requests are rate limited"
+          description: "Either a client is abusive or the limits are too low for real traffic."

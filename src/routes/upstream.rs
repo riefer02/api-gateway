@@ -64,7 +64,7 @@ async fn handle(state: &AppState, mut request: Request) -> Result<Response, AppE
         RouteMatch::MethodNotAllowed(allowed) => {
             return Err(AppError::MethodNotAllowed { allowed });
         }
-        RouteMatch::NotFound => return Err(AppError::NotFound),
+        RouteMatch::NotFound => return Err(AppError::not_found()),
     };
 
     let span = tracing::Span::current();

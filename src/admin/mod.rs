@@ -11,6 +11,7 @@ use crate::auth::{
 use crate::routing;
 
 pub(crate) mod cli;
+pub(crate) mod http;
 
 #[derive(Debug, Error)]
 pub(crate) enum AdminError {
@@ -63,6 +64,13 @@ pub(crate) struct RouteSummary {
     pub(crate) upstream_id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct UpstreamSummary {
+    pub(crate) id: String,
+    pub(crate) base_url: String,
+    pub(crate) timeout_ms: u32,
+}
+
 /// The control plane. One implementation, two adapters (CLI now, HTTP later).
 pub(crate) struct AdminService {
     pool: PgPool,
@@ -72,12 +80,15 @@ pub(crate) struct AdminService {
 }
 
 impl AdminService {
-    pub(crate) fn new(pool: PgPool, verifier: Arc<KeyVerifier>, allow_hosts: Vec<String>) -> Self {
+    pub(crate) fn new(
+        pool: PgPool,
+        verifier: Arc<KeyVerifier>,
+        allow_hosts: Vec<String>,
+        store: Arc<dyn ApiKeyStore>,
+    ) -> Self {
         Self {
-            store: Arc::new(auth::store::postgres::PostgresApiKeyStore::new(
-                pool.clone(),
-            )),
             pool,
+            store,
             verifier,
             allow_hosts,
         }
@@ -413,6 +424,31 @@ impl AdminService {
                     upstream_id: row
                         .try_get("upstream_id")
                         .map_err(AdminError::Store)?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn list_upstreams(&self) -> Result<Vec<UpstreamSummary>, AdminError> {
+        let rows = sqlx::query("SELECT id, base_url, timeout_ms FROM upstreams ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(AdminError::Store)?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(UpstreamSummary {
+                    id: row
+                        .try_get("id")
+                        .map_err(AdminError::Store)?,
+                    base_url: row
+                        .try_get("base_url")
+                        .map_err(AdminError::Store)?,
+                    timeout_ms: u32::try_from(
+                        row.try_get::<i32, _>("timeout_ms")
+                            .map_err(AdminError::Store)?,
+                    )
+                    .map_err(|_| AdminError::Invalid("timeout out of range".to_owned()))?,
                 })
             })
             .collect()

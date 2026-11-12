@@ -9,8 +9,13 @@ and adapted — see [Using this as a template](#using-this-as-a-template).
 
 ## Status
 
-Working data plane and control plane. Not yet built: the HTTP admin adapter, distributed
-rate limiting, credential caching, and Kubernetes manifests. Strong pre-production
+Working data plane and control plane. Authentication with a bounded-staleness credential
+cache, a Postgres-backed route table with live reload, streaming proxy with strict header
+hygiene, per-IP and per-tenant rate limits, per-upstream circuit breakers, Prometheus
+metrics, OpenTelemetry traces, and graceful shutdown. The control plane is available as
+both a CLI and an HTTP API. Ships as a distroless container with a compose stack.
+
+Not built yet: distributed rate limiting, Kubernetes manifests. Strong pre-production
 baseline, not a finished product.
 
 ## Quick start
@@ -65,11 +70,14 @@ allowlisted upstream
 | `src/routes/upstream.rs` | The request pipeline, in one readable function. |
 | `src/routing.rs` | Route table: compile, validate, match, atomically reload. |
 | `src/proxy.rs` | Forwarding, header policy, body streaming, error mapping. |
-| `src/auth/` | Tokens, peppered verifiers, credential store. |
-| `src/admin/` | Control-plane service and its CLI adapter. |
+| `src/auth/` | Tokens, peppered verifiers, credential cache, store. |
+| `src/admin/` | Control-plane service with CLI and HTTP adapters. |
 | `src/limits.rs` | Rate limiters and circuit breaker registry. |
 | `src/config.rs` | Typed configuration with validation and redaction. |
 | `src/error.rs` | `AppError` and the JSON error envelope. |
+| `examples/` | Stub upstream and load generator for `just bench`. |
+| `docs/` | Threat model, runbook, and control-plane OpenAPI. |
+| `deploy/` | Prometheus alert rules. |
 
 Requests never touch Postgres to resolve a route or render a policy: the table is compiled
 to memory at boot and swapped atomically when the version counter changes.
@@ -90,6 +98,8 @@ to memory at boot and swapped atomically when the version counter changes.
 
 ## Control plane
 
+Two adapters over one `AdminService`. The CLI is best for a shell or a deploy script:
+
 ```bash
 api-gateway admin tenant create acme
 api-gateway admin client create acme-app --tenant acme
@@ -103,9 +113,35 @@ api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing -
 api-gateway admin route list
 ```
 
-Tokens are shown exactly once and stored only as HMAC verifiers. Rotation copies the
-remaining lifetime, refuses revoked keys, and rolls back the replacement if the old revoke
-fails.
+The HTTP API serves the same operations on a separate listener. Set `ADMIN_TOKEN` to
+enable it; it is off by default.
+
+```bash
+TOKEN=... ADMIN=http://127.0.0.1:9090
+
+curl -s -X PUT "$ADMIN/v1/upstreams/billing" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"base_url":"https://billing.internal","timeout_ms":5000}'
+
+curl -s -X PUT "$ADMIN/v1/routes/billing-v1" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"path_prefix":"/v1/billing","methods":["GET","POST"],"upstream_id":"billing","scopes":["billing:read"]}'
+
+curl -s -X POST "$ADMIN/v1/keys" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"client_id":"acme-app","scopes":["read"],"expires_in_days":90}'
+```
+
+Full surface in [`docs/openapi.yaml`](docs/openapi.yaml). Tokens are shown exactly once and
+stored only as HMAC verifiers. Rotation copies the remaining lifetime, refuses revoked keys,
+and rolls back the replacement if the old revoke fails.
+
+Because the admin listener shares the process, a revoke invalidates the credential cache
+immediately. A revoke issued from the CLI in another process is bounded by
+`AUTH_CACHE_TTL_SECS`.
 
 ## Protection
 
@@ -164,6 +200,28 @@ never secrets). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export; otherwise logs only
 
 The metrics endpoint shares the public listener — keep it off the edge with network policy.
 
+## Performance
+
+Measured with `just bench` on the development machine over loopback: release build, 50
+concurrent connections, 10 s, warm credential cache, rate limits disabled, `LOG_LEVEL=warn`.
+
+| Path | Throughput | p50 | p99 |
+|---|---:|---:|---:|
+| Direct to the stub upstream | 160k req/s | 0.31 ms | 0.51 ms |
+| Through the gateway (authenticated) | 77k req/s | 0.64 ms | 0.96 ms |
+| **Added by the gateway** | — | **+0.33 ms** | **+0.45 ms** |
+
+Two things the same harness taught us:
+
+- **Logging is the first cost.** The identical run at `LOG_LEVEL=debug` fell to 28k req/s
+  and 1.58 ms p50, because every request formatted a span and a debug event. Run
+  production at `info`.
+- **Limits shed instead of collapsing.** With the default 600/min IP bucket the same load
+  produced `429`s at the configured rate rather than timeouts.
+
+These are loopback numbers: they measure gateway overhead, not your network or upstreams.
+Reproduce with `just bench`.
+
 ## Configuration
 
 Environment variables, loaded from `.env` in development. Production refuses development
@@ -176,10 +234,14 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `LOG_LEVEL` | `info` | `tracing` filter |
 | `DATABASE_URL` | — (required) | Postgres connection string |
 | `AUTH_PEPPER` | dev value | Required in production; rotating it invalidates keys |
+| `AUTH_CACHE_TTL_SECS` | `30` | Credential cache lifetime; `0` disables |
+| `ADMIN_TOKEN` | unset | Enables the HTTP control plane when set |
+| `ADMIN_BIND` | `127.0.0.1:9090` | Control-plane listener |
 | `DEV_API_KEY_SECRET` | — | Seeded key; rejected in production |
 | `DEV_API_KEY_SCOPES` | `read` | Scopes for the seeded key |
 | `UPSTREAM_ALLOW_HOSTS` | — | Comma-separated allowlist; required in production |
 | `ROUTE_REFRESH_INTERVAL_MS` | `2000` | Route table poll interval |
+| `RATE_LIMIT_BACKEND` | `local` | `redis` is rejected until implemented |
 | `RATE_LIMIT_IP_PER_MINUTE` | `600` | `0` disables |
 | `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | `0` disables |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures to open |
@@ -206,21 +268,28 @@ just up              # compose stack (gateway + Postgres)
 
 1. **Rename**: `Cargo.toml` package name, the `name` in `src/admin/cli.rs`, and the
    `ENTRYPOINT` path if you change the binary.
-2. **Pick a license** — none is set yet. Add it to `Cargo.toml` and as `LICENSE`.
+2. **License**: MIT is set in `LICENSE` and `Cargo.toml`; change it if that is wrong for you.
 3. **Set the pepper story**: `AUTH_PEPPER` must come from your secret manager in production.
    Rotating it invalidates every key, so plan the re-issue.
 4. **Replace the demo upstream**: `just demo-route` points at swapi.dev. Delete it and
-   register your own through `admin upstream put` / `admin route put`.
+   register your own through the admin API or CLI.
 5. **Tune the limits** against a load test; the defaults are guesses for a small deployment.
-6. **Decide on revocation staleness** before adding a credential cache — it trades
-   database round trips for a window where a revoked key still works.
+6. **Set `ADMIN_TOKEN`** if you want the HTTP control plane, and keep its listener private.
+7. **Decide on revocation staleness**: `AUTH_CACHE_TTL_SECS` is the window in which a
+   cross-process revocation is not yet visible.
 
 Deliberately generic: no cloud provider, no vendor SDK, no auth provider. The `AuthError`
-and `RateLimiter` seams are where those integrations belong.
+and rate-limiter seams are where those integrations belong.
 
 Known gaps, stated plainly: chunked bodies over the limit get a plain `413` rather than the
-envelope, credentials are read from Postgres on every request (no cache yet), rate limits and
-breakers are per replica, and `/metrics` is unauthenticated.
+envelope, rate limits and breakers are per replica, and `/metrics` is unauthenticated.
+
+## Further reading
+
+- [`docs/threat-model.md`](docs/threat-model.md) — trust boundaries, threats, residual risk
+- [`docs/runbook.md`](docs/runbook.md) — rotation, revocation, outages, deploy checklist
+- [`docs/openapi.yaml`](docs/openapi.yaml) — control-plane API
+- [`deploy/alerts.yml`](deploy/alerts.yml) — Prometheus rules
 
 ## Development
 
@@ -229,6 +298,7 @@ breakers are per replica, and `/metrics` is unauthenticated.
 | `just check` | fmt + clippy + tests + dependency policy (mirrors CI) |
 | `just test` | Tests; Postgres tests run only when `DATABASE_URL` is set |
 | `just deny` | Licenses, advisories, duplicates, wildcards |
+| `just bench` | Measures gateway overhead against a local stub upstream |
 | `just demo-route` | Registers the demo upstream and route |
 | `just db-up` / `just db-down` / `just db-logs` | Local Postgres |
 

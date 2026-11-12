@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::LimitsConfig;
+use crate::config::{LimitsConfig, RateLimitBackend};
 
 /// Outcome of one rate-limit decision, rendered into response headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,10 +131,17 @@ pub(crate) struct RateLimits {
 
 impl RateLimits {
     pub(crate) fn new(config: &LimitsConfig) -> Self {
+        // One place to add a distributed backend later: the config already
+        // rejects anything but `local`, so this match stays exhaustive.
+        let limiter = |per_minute: u32| -> Option<RateLimiter> {
+            match config.backend {
+                RateLimitBackend::Local => (per_minute > 0).then(|| RateLimiter::new(per_minute)),
+            }
+        };
+
         Self {
-            ip: (config.ip_per_minute > 0).then(|| RateLimiter::new(config.ip_per_minute)),
-            tenant: (config.tenant_per_minute > 0)
-                .then(|| RateLimiter::new(config.tenant_per_minute)),
+            ip: limiter(config.ip_per_minute),
+            tenant: limiter(config.tenant_per_minute),
         }
     }
 }
@@ -261,6 +268,7 @@ mod tests {
             tenant_per_minute: 600,
             circuit_failure_threshold: 2,
             circuit_cooldown: Duration::from_millis(50),
+            backend: crate::config::RateLimitBackend::Local,
         }
     }
 

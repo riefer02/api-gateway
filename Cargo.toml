@@ -3,6 +3,8 @@ name = "api-gateway"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
+description = "A production-shaped HTTP API gateway: API-key auth, Postgres-backed routing, streaming proxy, limits, metrics."
 
 [dependencies]
 arc-swap = "1.9.5"

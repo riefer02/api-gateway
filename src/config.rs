@@ -49,6 +49,7 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub telemetry: TelemetryConfig,
     pub auth: AuthConfig,
+    pub admin: AdminConfig,
     pub routing: RoutingConfig,
     pub limits: LimitsConfig,
 }
@@ -83,6 +84,16 @@ pub struct AuthConfig {
     pub pepper: SecretString,
     pub dev_api_key_secret: Option<SecretString>,
     pub dev_api_key_scopes: Vec<String>,
+    /// How long a credential may be served from cache. Zero disables caching.
+    pub cache_ttl: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdminConfig {
+    /// Bind address for the HTTP control plane. Empty disables it.
+    pub bind: String,
+    /// Bearer token for the control plane. `None` disables the listener.
+    pub token: Option<SecretString>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +112,13 @@ pub struct LimitsConfig {
     /// Consecutive upstream failures before the circuit opens.
     pub circuit_failure_threshold: u32,
     pub circuit_cooldown: Duration,
+    /// Only `local` is implemented; `redis` is rejected at startup.
+    pub backend: RateLimitBackend,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateLimitBackend {
+    Local,
 }
 
 /// Anything that can supply environment-style key/value pairs.
@@ -199,6 +217,27 @@ impl Config {
             pepper: SecretString::new(auth_pepper.unwrap_or_else(|| DEVELOPMENT_PEPPER.to_owned())),
             dev_api_key_secret: non_empty(source.get("DEV_API_KEY_SECRET")).map(SecretString::new),
             dev_api_key_scopes: dev_scopes(source.get("DEV_API_KEY_SCOPES")),
+            cache_ttl: seconds_or(source, "AUTH_CACHE_TTL_SECS", 30, &mut problems),
+        };
+
+        let admin = AdminConfig {
+            bind: string_or(source, "ADMIN_BIND", "127.0.0.1:9090"),
+            token: non_empty(source.get("ADMIN_TOKEN")).map(SecretString::new),
+        };
+
+        let rate_limit_backend = match source
+            .get("RATE_LIMIT_BACKEND")
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("local") => RateLimitBackend::Local,
+            Some(other) => {
+                problems.push(format!(
+                    "RATE_LIMIT_BACKEND must be `local` (got `{other}`); \
+                     a Redis backend is not implemented yet"
+                ));
+                RateLimitBackend::Local
+            }
         };
 
         let routing = RoutingConfig {
@@ -226,44 +265,39 @@ impl Config {
                 &mut problems,
             ),
             circuit_cooldown: seconds_or(source, "CIRCUIT_COOLDOWN_SECS", 30, &mut problems),
+            backend: rate_limit_backend,
         };
 
-        validate(
-            &server,
-            &database,
-            &auth,
-            &environment,
-            &routing,
-            &limits,
-            &mut problems,
-        );
-        validate_log_filter(&telemetry.log_level, &mut problems);
-
-        if !problems.is_empty() {
-            return Err(ConfigError { problems });
-        }
-
-        Ok(Self {
+        let config = Self {
             environment,
             server,
             database,
             telemetry,
             auth,
+            admin,
             routing,
             limits,
-        })
+        };
+
+        validate(&config, &mut problems);
+
+        if !problems.is_empty() {
+            return Err(ConfigError { problems });
+        }
+
+        Ok(config)
     }
 }
 
-fn validate(
-    server: &ServerConfig,
-    database: &DatabaseConfig,
-    auth: &AuthConfig,
-    environment: &AppEnvironment,
-    routing: &RoutingConfig,
-    limits: &LimitsConfig,
-    problems: &mut Vec<String>,
-) {
+fn validate(config: &Config, problems: &mut Vec<String>) {
+    let server = &config.server;
+    let database = &config.database;
+    let auth = &config.auth;
+    let admin = &config.admin;
+    let environment = &config.environment;
+    let routing = &config.routing;
+    let limits = &config.limits;
+
     if server.port == 0 {
         problems.push("PORT must be between 1 and 65535".to_owned());
     }
@@ -298,6 +332,14 @@ fn validate(
     if limits.circuit_cooldown.is_zero() {
         problems.push("CIRCUIT_COOLDOWN_SECS must be greater than zero".to_owned());
     }
+    if admin.token.is_some()
+        && admin
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+    {
+        problems.push("ADMIN_BIND must be a socket address like 127.0.0.1:9090".to_owned());
+    }
 
     if environment.is_production() {
         if auth.dev_api_key_secret.is_some() {
@@ -309,11 +351,12 @@ fn validate(
                 .push("UPSTREAM_ALLOW_HOSTS must list at least one host in production".to_owned());
         }
     }
-}
 
-fn validate_log_filter(filter: &str, problems: &mut Vec<String>) {
-    if tracing_subscriber::EnvFilter::try_new(filter).is_err() {
-        problems.push(format!("LOG_LEVEL is not a valid filter: `{filter}`"));
+    if tracing_subscriber::EnvFilter::try_new(&config.telemetry.log_level).is_err() {
+        problems.push(format!(
+            "LOG_LEVEL is not a valid filter: `{}`",
+            config.telemetry.log_level
+        ));
     }
 }
 

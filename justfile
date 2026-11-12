@@ -45,6 +45,10 @@ demo-route:
 docker:
     docker build -t api-gateway:dev .
 
+# Measures gateway overhead against a local stub upstream
+bench:
+    ./scripts/bench.sh
+
 up:
     docker compose up -d --build
 
