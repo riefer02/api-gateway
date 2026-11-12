@@ -30,8 +30,9 @@ Delete anything a linter, test, or type already enforces. No repo tours.
 - `unwrap`/`expect` are allowed only in bootstrap and tests.
 - All environment access lives in `src/config.rs`. A new setting needs a validation
   rule and a test in the same change.
-- Caller identity comes from `ConnectInfo` inserted in `run_server`; never infer a client
-  address from a header until a trusted-proxy model exists.
+- Caller identity comes from `ConnectInfo` inserted in `run_server`. Forwarding headers are
+  believed only when the peer is in `TRUSTED_PROXIES` (`src/net.rs`); never read them
+  directly.
 - Reject paths with `routing::is_unsafe_path` before matching. Anything that normalizes
   differently in `url` than in our matcher is an authorization bypass.
 - Postgres is the source of truth for credentials and routes, but never on the request

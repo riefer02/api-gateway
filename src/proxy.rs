@@ -242,6 +242,15 @@ fn outbound_headers(parts: &Parts) -> HeaderMap {
         headers.insert("x-request-id", value);
     }
 
+    // Replace whatever the caller sent with the address we actually resolved.
+    if let Some(client) = parts
+        .extensions
+        .get::<crate::net::ClientIp>()
+        && let Ok(value) = HeaderValue::from_str(&client.0.to_string())
+    {
+        headers.insert("x-forwarded-for", value);
+    }
+
     headers
 }
 

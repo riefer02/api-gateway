@@ -18,6 +18,7 @@ hex = "0.4.3"
 hmac = "0.13.0"
 hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["server-auto", "tokio", "service", "http1", "http2"] }
+ipnet = "2.12.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry = "0.33.1"

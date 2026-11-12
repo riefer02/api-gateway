@@ -136,6 +136,8 @@ pub struct ServerConfig {
     pub header_read_timeout: Duration,
     /// Hard cap on concurrent TCP connections.
     pub max_connections: usize,
+    /// Peers allowed to speak for the client via forwarding headers.
+    pub trusted_proxies: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -305,6 +307,7 @@ impl Config {
             shutdown_drain: seconds_or(source, "SHUTDOWN_DRAIN_SECS", 25, &mut problems),
             header_read_timeout: seconds_or(source, "HEADER_READ_TIMEOUT_SECS", 10, &mut problems),
             max_connections: number_or(source, "MAX_CONNECTIONS", 1_024_usize, &mut problems),
+            trusted_proxies: csv(source.get("TRUSTED_PROXIES")),
         };
 
         let database = DatabaseConfig {
@@ -443,6 +446,10 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     }
     if server.max_connections == 0 {
         problems.push("MAX_CONNECTIONS must be at least 1".to_owned());
+    }
+
+    if let Err(problem) = crate::net::TrustedProxies::parse(&server.trusted_proxies) {
+        problems.push(format!("TRUSTED_PROXIES: {problem}"));
     }
     if database.max_connections == 0 {
         problems.push("DB_MAX_CONNECTIONS must be at least 1".to_owned());
@@ -928,6 +935,20 @@ mod tests {
                 .scopes
                 .contains("*"),
             "no scopes means full admin"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_trusted_proxies() {
+        let mut values = valid_development();
+        values.insert("TRUSTED_PROXIES".to_owned(), "not-a-cidr".to_owned());
+
+        let error = Config::from_source(&values).expect_err("invalid proxy list");
+
+        assert!(
+            error
+                .to_string()
+                .contains("TRUSTED_PROXIES")
         );
     }
 

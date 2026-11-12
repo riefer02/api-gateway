@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod error;
 mod limits;
+mod net;
 mod observability;
 mod proxy;
 mod request_context;

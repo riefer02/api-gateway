@@ -8,6 +8,7 @@ use sqlx::PgPool;
 
 use crate::auth::{KeyVerifier, store::ApiKeyStore};
 use crate::limits::{BreakerRegistry, RateLimits};
+use crate::net::TrustedProxies;
 use crate::retry::RetryPolicy;
 use crate::routing::RouteTableHandle;
 
@@ -56,4 +57,5 @@ pub(crate) struct AppState {
     pub(crate) metrics_token: Option<crate::config::SecretString>,
     pub(crate) metrics: PrometheusHandle,
     pub(crate) readiness: Arc<Readiness>,
+    pub(crate) trusted_proxies: Arc<TrustedProxies>,
 }

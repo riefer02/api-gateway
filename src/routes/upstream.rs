@@ -3,12 +3,13 @@ use axum::{
     http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::{
     auth,
     error::AppError,
     limits::{Decision, RateLimiter},
+    net::{ClientIp, TrustedProxies},
     proxy, routing,
     routing::RouteMatch,
     state::AppState,
@@ -54,12 +55,13 @@ async fn handle(
         ));
     }
 
+    let client = client_ip(&state.trusted_proxies, &request);
+    request
+        .extensions_mut()
+        .insert(ClientIp(client));
+
     if let Some(limiter) = state.limits.ip.as_ref() {
-        check_limit(
-            limiter,
-            &format!("ip:{}", client_ip(&request)),
-            rate_headers,
-        )?;
+        check_limit(limiter, &format!("ip:{client}"), rate_headers)?;
     }
 
     let identity = auth::authenticate(state, request.headers()).await?;
@@ -166,12 +168,18 @@ fn header_value<T: ToString>(value: &T) -> HeaderValue {
     HeaderValue::from_str(&value.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0"))
 }
 
-/// Peer address, when the server was started with connect info. Forwarded
-/// headers are ignored until the trusted-proxy model lands.
-fn client_ip(request: &Request) -> String {
-    request
+/// The caller as best we can know it: the peer, or a forwarded address when
+/// the peer is a trusted proxy. Never a header from an untrusted peer.
+fn client_ip(trusted: &TrustedProxies, request: &Request) -> IpAddr {
+    let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|connect| connect.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .map(|connect| connect.0.ip());
+
+    match peer {
+        Some(peer) => trusted.client_ip(peer, request.headers()),
+        // No connect info (tests, unix sockets): a reserved address keeps the
+        // bucket isolated instead of merging everyone into one.
+        None => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    }
 }

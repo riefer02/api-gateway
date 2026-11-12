@@ -84,6 +84,10 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let refresh_task = tokio::spawn(refresh.run());
 
     let metrics = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    let trusted_proxies = Arc::new(
+        crate::net::TrustedProxies::parse(&config.server.trusted_proxies)
+            .map_err(|problem| format!("TRUSTED_PROXIES: {problem}"))?,
+    );
 
     let state = AppState {
         api_key_store: Arc::clone(&store),
@@ -99,9 +103,10 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
         )),
+        trusted_proxies: Arc::new(crate::net::TrustedProxies::default()),
     };
 
-    let admin_server = start_admin(config, Arc::clone(&admin)).await?;
+    let admin_server = start_admin(config, Arc::clone(&admin), trusted_proxies).await?;
     let audit_task = spawn_audit_pruning(config, Arc::clone(&admin));
 
     let app = app::build_app(config, state);
@@ -149,6 +154,7 @@ fn log_startup(config: &Config, routes: &RouteTableHandle) {
         ip_limit_per_min = config.limits.ip_per_minute,
         tenant_limit_per_min = config.limits.tenant_per_minute,
         retry_attempts = config.retry.max_attempts,
+        trusted_proxies = config.server.trusted_proxies.len(),
         "gateway ready"
     );
 
@@ -163,6 +169,7 @@ struct AdminServer {
 async fn start_admin(
     config: &Config,
     service: Arc<admin::AdminService>,
+    trusted_proxies: Arc<crate::net::TrustedProxies>,
 ) -> Result<Option<AdminServer>, BoxError> {
     if config.admin.tokens.is_empty() {
         return Ok(None);
@@ -172,6 +179,7 @@ async fn start_admin(
         service,
         Arc::new(config.admin.tokens.clone()),
         config.admin.timeout,
+        trusted_proxies,
     );
     let listener = tokio::net::TcpListener::bind(&config.admin.bind).await?;
 

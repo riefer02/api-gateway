@@ -14,12 +14,14 @@ use time::{Duration, OffsetDateTime};
 use super::{Actor, AdminError, AdminScope, AdminService, RouteSpec};
 use crate::config::AdminToken;
 use crate::error::AppError;
+use crate::net::TrustedProxies;
 
 #[derive(Clone)]
 struct AdminState {
     service: Arc<AdminService>,
     accounts: Arc<Vec<AdminToken>>,
     timeout: std::time::Duration,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 /// HTTP adapter over [`AdminService`]. Separate listener, bearer token, and
@@ -28,11 +30,13 @@ pub(crate) fn router(
     service: Arc<AdminService>,
     accounts: Arc<Vec<AdminToken>>,
     timeout: std::time::Duration,
+    trusted_proxies: Arc<TrustedProxies>,
 ) -> Router {
     let state = AdminState {
         service,
         accounts,
         timeout,
+        trusted_proxies,
     };
 
     Router::new()
@@ -81,7 +85,12 @@ async fn require_admin(
     let source_ip = request
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|connect| connect.0.ip().to_string());
+        .map(|connect| {
+            state
+                .trusted_proxies
+                .client_ip(connect.0.ip(), request.headers())
+                .to_string()
+        });
 
     // Compare against every account so the number of configured tokens is not
     // observable through response timing.
@@ -571,6 +580,7 @@ mod tests {
             )),
             Arc::new(accounts),
             std::time::Duration::from_secs(5),
+            Arc::new(TrustedProxies::default()),
         )
     }
 
@@ -725,6 +735,7 @@ mod scope_tests {
             )),
             Arc::new(accounts),
             std::time::Duration::from_secs(5),
+            Arc::new(TrustedProxies::default()),
         )
     }
 

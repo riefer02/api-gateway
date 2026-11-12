@@ -33,6 +33,7 @@ identity provider (there is none yet).
 | Secret leakage to logs | No secret is logged; upstream errors logged by kind, not `Display`; request ids sanitized | URL paths may still contain caller-chosen secrets if callers put them there |
 | Resource exhaustion | Body limits, whole-request deadline, header-read timeout, connection cap, per-IP and per-tenant rate limits, cached readiness probe | In-process limits are per replica |
 | Amplification via retries | Idempotent, body-less retries only, gated by a token-bucket retry budget | Retried requests still reach the upstream twice |
+| Spoofed client identity | Forwarding headers are believed only from `TRUSTED_PROXIES`; the chain is walked right to left, skipping trusted hops | A misconfigured trusted CIDR lets a caller spoof its address |
 | Tenant isolation failure | Tenant/client status checked per request; scopes per route | A single cache entry serves one key; no cross-tenant sharing |
 | Revocation lag | In-process revoke invalidates immediately; cross-process bounded by `AUTH_CACHE_TTL_SECS` | Set the TTL to your revocation SLA |
 | Metrics endpoint disclosure | `METRICS_TOKEN` gates `/metrics`; unset is documented and surfaced at boot | An unset token leaves it open to anyone who can reach the port |
@@ -49,7 +50,6 @@ identity provider (there is none yet).
 ## Open work
 
 - mTLS or OIDC for the admin listener, replacing static tokens.
-- Trusted-proxy configuration so `X-Forwarded-For` can be believed behind a known edge.
 - Distributed rate limiting so limits hold across replicas.
 - Audit rows are append-only but not tamper-evident: someone with database write access
   can delete or rewrite them. Hash-chaining or shipping to an append-only sink is the

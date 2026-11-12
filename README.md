@@ -1,8 +1,15 @@
 # api-gateway
 
+[![ci](https://github.com/riefer02/api-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/riefer02/api-gateway/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![rust](https://img.shields.io/badge/rust-1.99-orange.svg)](rust-toolchain.toml)
+
 A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves routes from
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
+
+**At a glance:** ~9k lines of Rust, 104 tests, one binary, a distroless image with no
+shell, and a measured +0.32 ms p50 over a direct call at 78k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
 and adapted — see [Using this as a template](#using-this-as-a-template).
@@ -206,6 +213,11 @@ whose listener is disconnected.
   `Forwarded`/`X-Forwarded-*`, `Host`, `Authorization`, and `Cookie` are stripped before
   forwarding. `Server` and `Set-Cookie` are stripped on the way back. Redirects are never
   followed.
+- **Client identity**: the direct peer is the caller unless it appears in
+  `TRUSTED_PROXIES`. Only then is `X-Forwarded-For`/`X-Real-IP` believed, walking the chain
+  right to left and skipping trusted hops. The resolved address drives the per-IP limiter,
+  the audit trail, and the `X-Forwarded-For` sent upstream — a spoofed header from an
+  untrusted peer changes nothing.
 
 ## Edge cases handled
 
@@ -314,6 +326,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `REQUEST_TIMEOUT_SECS` | `15` | Whole-request deadline |
 | `HEADER_READ_TIMEOUT_SECS` | `10` | Bound on receiving a complete request head |
 | `MAX_CONNECTIONS` | `1024` | Concurrent socket cap |
+| `TRUSTED_PROXIES` | — | CIDRs allowed to set the client address; empty trusts nobody |
 | `ADMIN_TIMEOUT_SECS` | `10` | Control-plane request deadline |
 | `AUDIT_RETENTION_DAYS` | `90` | Audit pruning window; `0` keeps forever |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Inbound body limit |
@@ -335,7 +348,9 @@ that runs `api-gateway healthcheck`, so no shell or curl is needed.
 
 Kubernetes manifests live in [`deploy/k8s`](deploy/k8s): a non-root, read-only deployment
 with probes, HPA, PDB, and a default-deny NetworkPolicy. [`deploy/Caddyfile`](deploy/Caddyfile)
-is the reference edge that terminates TLS and keeps `/metrics` and `/ready` private.
+is the reference edge that terminates TLS and keeps `/metrics` and `/ready` private. Set
+`TRUSTED_PROXIES` to that proxy's address (the Caddy example runs on loopback) or every
+caller shares the proxy's bucket.
 
 ## Using this as a template
 

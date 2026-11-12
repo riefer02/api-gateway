@@ -89,6 +89,7 @@ dependencies = [
  "hmac",
  "hyper",
  "hyper-util",
+ "ipnet",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
