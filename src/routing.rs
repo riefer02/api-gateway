@@ -230,13 +230,40 @@ pub(crate) fn has_dot_segments(path: &str) -> bool {
         return path.split('/').any(is_dot_segment);
     }
 
-    let decoded = path
-        .replace("%2e", ".")
-        .replace("%2E", ".")
-        .replace("%2f", "/")
-        .replace("%2F", "/");
+    // Decode only the escapes that matter, in one pass, into a byte buffer.
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
 
-    decoded.split('/').any(is_dot_segment)
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let escape = (
+                bytes[index + 1].to_ascii_lowercase(),
+                bytes[index + 2].to_ascii_lowercase(),
+            );
+
+            match escape {
+                (b'2', b'e') => {
+                    decoded.push(b'.');
+                    index += 3;
+                    continue;
+                }
+                (b'2', b'f') => {
+                    decoded.push(b'/');
+                    index += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    decoded
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..")
 }
 
 fn is_dot_segment(segment: &str) -> bool {
@@ -591,16 +618,16 @@ impl RouteRefresh {
     pub(crate) async fn refresh_once(&self) -> Result<bool, RouteTableError> {
         let version = self.source.version().await?;
 
-        // A successful version read proves the table source is reachable, even
-        // when nothing changed.
-        self.handle.mark_refreshed();
-
         if version == self.handle.snapshot().version() {
+            self.handle.mark_refreshed();
             return Ok(false);
         }
 
+        // Only a table that actually compiled counts as a healthy refresh: a
+        // rejected configuration must not look ready.
         let table = self.source.load().await?;
         let installed = self.handle.replace_if_newer(table);
+        self.handle.mark_refreshed();
 
         Ok(installed)
     }

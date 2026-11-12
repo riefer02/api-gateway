@@ -2,17 +2,16 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json, Router,
-    extract::{ConnectInfo, Path, Query, Request, State},
-    http::{StatusCode, header},
+    extract::{ConnectInfo, FromRequest, FromRequestParts, Path, Query, Request, State},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
 
-use super::{Actor, AdminError, AdminService, RouteSpec};
+use super::{Actor, AdminError, AdminScope, AdminService, RouteSpec};
 use crate::config::AdminToken;
 use crate::error::AppError;
 
@@ -61,28 +60,12 @@ async fn require_admin(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned);
-
     // Compare against every account so the number of configured tokens is not
     // observable through response timing.
     let mut matched: Option<&AdminToken> = None;
 
     for account in state.accounts.iter() {
-        let equal: bool = presented
-            .as_deref()
-            .is_some_and(|presented| {
-                presented
-                    .as_bytes()
-                    .ct_eq(account.token.expose().as_bytes())
-                    .into()
-            });
-
-        if equal {
+        if crate::auth::bearer_matches(request.headers(), &account.token) {
             matched = Some(account);
         }
     }
@@ -98,9 +81,55 @@ async fn require_admin(
 
     request
         .extensions_mut()
-        .insert(Actor::new(account.name.clone()).with_source_ip(source_ip));
+        .insert(Actor::new(account.name.clone(), account.scopes.clone()).with_source_ip(source_ip));
 
     next.run(request).await
+}
+
+/// JSON body extraction that fails with the gateway's envelope instead of
+/// axum's plain-text rejection.
+struct ApiJson<T>(T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(AppError::bad_request(format!(
+                "invalid request body: {}",
+                rejection.body_text()
+            ))),
+        }
+    }
+}
+
+/// Query extraction with the same envelope contract.
+struct ApiQuery<T>(T);
+
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(AppError::bad_request(format!(
+                "invalid query string: {}",
+                rejection.body_text()
+            ))),
+        }
+    }
 }
 
 async fn healthz() -> StatusCode {
@@ -115,8 +144,10 @@ struct CreateTenant {
 async fn create_tenant(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
-    Json(body): Json<CreateTenant>,
+    ApiJson(body): ApiJson<CreateTenant>,
 ) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::TenantsWrite)?;
+
     state
         .service
         .create_tenant(&actor, &body.id)
@@ -134,8 +165,10 @@ struct CreateClient {
 async fn create_client(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
-    Json(body): Json<CreateClient>,
+    ApiJson(body): ApiJson<CreateClient>,
 ) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::TenantsWrite)?;
+
     state
         .service
         .create_client(&actor, &body.id, &body.tenant_id)
@@ -174,8 +207,10 @@ struct KeySummaryView {
 async fn create_key(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
-    Json(body): Json<CreateKey>,
+    ApiJson(body): ApiJson<CreateKey>,
 ) -> Result<(StatusCode, Json<KeyView>), AppError> {
+    actor.require(AdminScope::KeysWrite)?;
+
     let expires_at = match body.expires_in_days {
         Some(days) => Some(
             OffsetDateTime::now_utc()
@@ -208,6 +243,8 @@ async fn rotate_key(
     Extension(actor): Extension<Actor>,
     Path(key_id): Path<String>,
 ) -> Result<Json<KeyView>, AppError> {
+    actor.require(AdminScope::KeysWrite)?;
+
     let issued = state
         .service
         .rotate_key(&actor, &key_id)
@@ -228,6 +265,8 @@ async fn revoke_key(
     Extension(actor): Extension<Actor>,
     Path(key_id): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::KeysWrite)?;
+
     state
         .service
         .revoke_key(&actor, &key_id)
@@ -243,8 +282,11 @@ struct ListKeysQuery {
 
 async fn list_keys(
     State(state): State<AdminState>,
-    Query(query): Query<ListKeysQuery>,
+    Extension(actor): Extension<Actor>,
+    ApiQuery(query): ApiQuery<ListKeysQuery>,
 ) -> Result<Json<Vec<KeySummaryView>>, AppError> {
+    actor.require(AdminScope::KeysRead)?;
+
     let keys = state
         .service
         .list_keys(&query.client_id)
@@ -277,7 +319,10 @@ struct UpstreamView {
 
 async fn list_upstreams(
     State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<UpstreamView>>, AppError> {
+    actor.require(AdminScope::ConfigRead)?;
+
     let upstreams = state.service.list_upstreams().await?;
 
     Ok(Json(
@@ -302,8 +347,10 @@ async fn put_upstream(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
     Path(id): Path<String>,
-    Json(body): Json<PutUpstream>,
+    ApiJson(body): ApiJson<PutUpstream>,
 ) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::ConfigWrite)?;
+
     state
         .service
         .put_upstream(
@@ -324,9 +371,15 @@ struct RouteView {
     methods: Vec<String>,
     upstream_id: String,
     rewrite_prefix: Option<String>,
+    enabled: bool,
 }
 
-async fn list_routes(State(state): State<AdminState>) -> Result<Json<Vec<RouteView>>, AppError> {
+async fn list_routes(
+    State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<RouteView>>, AppError> {
+    actor.require(AdminScope::ConfigRead)?;
+
     let routes = state.service.list_routes().await?;
 
     Ok(Json(
@@ -338,6 +391,7 @@ async fn list_routes(State(state): State<AdminState>) -> Result<Json<Vec<RouteVi
                 methods: route.methods,
                 upstream_id: route.upstream_id,
                 rewrite_prefix: route.rewrite_prefix,
+                enabled: route.enabled,
             })
             .collect(),
     ))
@@ -358,8 +412,10 @@ async fn put_route(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
     Path(id): Path<String>,
-    Json(body): Json<PutRoute>,
+    ApiJson(body): ApiJson<PutRoute>,
 ) -> Result<StatusCode, AppError> {
+    actor.require(AdminScope::ConfigWrite)?;
+
     state
         .service
         .put_route(
@@ -402,7 +458,7 @@ mod tests {
 
     use crate::config::SecretString;
 
-    fn router_with_token(token: &str) -> Router {
+    fn router_with_accounts(accounts: Vec<AdminToken>) -> Router {
         router(
             Arc::new(AdminService::new(
                 sqlx::postgres::PgPoolOptions::new()
@@ -412,11 +468,20 @@ mod tests {
                 Vec::new(),
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
             )),
-            Arc::new(vec![AdminToken {
-                name: "tester".to_owned(),
-                token: SecretString::new(token),
-            }]),
+            Arc::new(accounts),
         )
+    }
+
+    fn account(name: &str, token: &str) -> AdminToken {
+        AdminToken {
+            name: name.to_owned(),
+            token: SecretString::new(token),
+            scopes: ["*".to_owned()].into_iter().collect(),
+        }
+    }
+
+    fn router_with_token(token: &str) -> Router {
+        router_with_accounts(vec![account("tester", token)])
     }
 
     #[tokio::test]
@@ -501,8 +566,11 @@ struct AuditView {
 
 async fn list_audit(
     State(state): State<AdminState>,
-    Query(query): Query<AuditQuery>,
+    Extension(actor): Extension<Actor>,
+    ApiQuery(query): ApiQuery<AuditQuery>,
 ) -> Result<Json<Vec<AuditView>>, AppError> {
+    actor.require(AdminScope::AuditRead)?;
+
     let entries = state
         .service
         .list_audit(query.limit.unwrap_or(100))
@@ -521,4 +589,96 @@ async fn list_audit(
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::config::{AdminToken, SecretString};
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    fn scoped_router(accounts: &[(&str, &str, &[&str])]) -> Router {
+        let accounts = accounts
+            .iter()
+            .map(|(name, token, scopes)| AdminToken {
+                name: (*name).to_owned(),
+                token: SecretString::new(*token),
+                scopes: scopes
+                    .iter()
+                    .map(|scope| (*scope).to_owned())
+                    .collect(),
+            })
+            .collect();
+
+        router(
+            Arc::new(AdminService::new(
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
+                    .expect("lazy pool"),
+                Arc::new(crate::auth::KeyVerifier::new(SecretString::new("pepper"))),
+                Vec::new(),
+                Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
+            )),
+            Arc::new(accounts),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_cannot_issue_keys() {
+        let app = scoped_router(&[("auditor", "auditor-token-0123", &["config:read"])]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/keys")
+                    .header("authorization", "Bearer auditor-token-0123")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"client_id":"acme"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_cannot_read_audit() {
+        let app = scoped_router(&[("operator", "operator-token-0123", &["keys:write"])]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/audit")
+                    .header("authorization", "Bearer operator-token-0123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_reaches_an_allowed_route() {
+        // Allowed by scope, then fails on the missing database: a 5xx proves
+        // the scope check passed.
+        let app = scoped_router(&[("auditor", "auditor-token-0123", &["config:read"])]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/routes")
+                    .header("authorization", "Bearer auditor-token-0123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

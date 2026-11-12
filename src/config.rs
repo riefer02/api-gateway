@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt, str::FromStr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppEnvironment {
@@ -155,12 +160,24 @@ pub struct AdminConfig {
     pub tokens: Vec<AdminToken>,
 }
 
-/// One operator credential. The name is what the audit log records.
+/// One operator credential. The name is what the audit log records; the scopes
+/// decide what the token may do. `*` grants every scope.
 #[derive(Clone, Debug)]
 pub struct AdminToken {
     pub name: String,
     pub token: SecretString,
+    pub scopes: HashSet<String>,
 }
+
+/// Every privilege a control-plane token can hold.
+pub const ADMIN_SCOPES: &[&str] = &[
+    "tenants:write",
+    "keys:read",
+    "keys:write",
+    "config:read",
+    "config:write",
+    "audit:read",
+];
 
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
@@ -447,6 +464,15 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
             problems.push("DEV_API_KEY_SECRET must not be set in production".to_owned());
         }
 
+        let pepper = auth.pepper.expose();
+
+        if pepper == DEVELOPMENT_PEPPER {
+            problems
+                .push("AUTH_PEPPER must not be the development default in production".to_owned());
+        } else if pepper.len() < 32 {
+            problems.push("AUTH_PEPPER must be at least 32 characters in production".to_owned());
+        }
+
         if routing.allow_hosts.is_empty() {
             problems
                 .push("UPSTREAM_ALLOW_HOSTS must list at least one host in production".to_owned());
@@ -549,23 +575,28 @@ fn dev_scopes(value: Option<String>) -> Vec<String> {
     }
 }
 
-/// `ADMIN_TOKENS=alice:token,bob:token` for named operators; `ADMIN_TOKEN=x`
-/// remains supported and maps to the actor `admin`.
+/// `ADMIN_TOKENS=alice:token[:scope+scope],bob:token` for named operators.
+/// `ADMIN_TOKEN=x` remains supported and maps to the actor `admin`.
 fn admin_tokens(source: &dyn EnvSource, problems: &mut Vec<String>) -> Vec<AdminToken> {
     let mut tokens: Vec<AdminToken> = Vec::new();
 
     if let Some(list) = non_empty(source.get("ADMIN_TOKENS")) {
         for entry in list.split(',') {
-            let Some((name, token)) = entry.split_once(':') else {
-                problems.push("ADMIN_TOKENS entries must look like `name:token`".to_owned());
-                continue;
-            };
-
-            let (name, token) = (name.trim(), token.trim());
+            let mut parts = entry.splitn(3, ':');
+            let name = parts
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let token = parts
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let scopes_part = parts.next();
 
             if name.is_empty() || token.is_empty() {
-                problems
-                    .push("ADMIN_TOKENS entries must have a non-empty name and token".to_owned());
+                problems.push("ADMIN_TOKENS entries must look like `name:token`".to_owned());
                 continue;
             }
 
@@ -584,9 +615,14 @@ fn admin_tokens(source: &dyn EnvSource, problems: &mut Vec<String>) -> Vec<Admin
                 continue;
             }
 
+            let Some(scopes) = parse_admin_scopes(&name, scopes_part, problems) else {
+                continue;
+            };
+
             tokens.push(AdminToken {
-                name: name.to_owned(),
+                name,
                 token: SecretString::new(token),
+                scopes,
             });
         }
     }
@@ -601,11 +637,53 @@ fn admin_tokens(source: &dyn EnvSource, problems: &mut Vec<String>) -> Vec<Admin
             tokens.push(AdminToken {
                 name: "admin".to_owned(),
                 token: SecretString::new(legacy),
+                scopes: HashSet::from(["*".to_owned()]),
             });
         }
     }
 
     tokens
+}
+
+/// A missing scope list means full admin, so `name:token` keeps working.
+fn parse_admin_scopes(
+    name: &str,
+    scopes: Option<&str>,
+    problems: &mut Vec<String>,
+) -> Option<HashSet<String>> {
+    let Some(list) = scopes
+        .map(str::trim)
+        .filter(|list| !list.is_empty())
+    else {
+        return Some(HashSet::from(["*".to_owned()]));
+    };
+
+    let mut granted = HashSet::new();
+
+    for scope in list
+        .split('+')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+    {
+        if scope != "*" && !ADMIN_SCOPES.contains(&scope) {
+            problems.push(format!(
+                "ADMIN_TOKENS scope `{scope}` for `{name}` is unknown; valid scopes are {}",
+                ADMIN_SCOPES.join(", ")
+            ));
+            continue;
+        }
+
+        granted.insert(scope.to_owned());
+    }
+
+    if granted.is_empty() {
+        problems.push(format!(
+            "ADMIN_TOKENS entry for `{name}` has no valid scopes"
+        ));
+        return None;
+    }
+
+    Some(granted)
 }
 
 #[cfg(test)]
@@ -772,7 +850,7 @@ mod tests {
                 "DATABASE_URL",
                 "postgres://gateway:secret@127.0.0.1:5432/gateway",
             ),
-            ("AUTH_PEPPER", "a-long-production-pepper"),
+            ("AUTH_PEPPER", "a-long-production-pepper-with-32-chars"),
             ("UPSTREAM_ALLOW_HOSTS", "swapi.dev"),
             ("ADMIN_TOKEN", "admin-token-0123456789"),
             ("METRICS_TOKEN", "metrics-token-0123456789"),
@@ -796,6 +874,47 @@ mod tests {
         assert_eq!(config.admin.tokens.len(), 2);
         assert_eq!(config.admin.tokens[0].name, "alice");
         assert_eq!(config.admin.tokens[1].name, "bob");
+    }
+
+    #[test]
+    fn parses_scoped_admin_tokens() {
+        let mut values = valid_development();
+        values.insert(
+            "ADMIN_TOKENS".to_owned(),
+            "alice:alice-token-0123456:config:read+keys:read,bob:bob-token-01234567".to_owned(),
+        );
+
+        let config = Config::from_source(&values).expect("valid config");
+
+        let alice = &config.admin.tokens[0];
+        assert!(alice.scopes.contains("config:read"));
+        assert!(alice.scopes.contains("keys:read"));
+        assert!(!alice.scopes.contains("*"));
+
+        assert!(
+            config.admin.tokens[1]
+                .scopes
+                .contains("*"),
+            "no scopes means full admin"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_admin_scopes() {
+        let mut values = valid_development();
+        values.insert(
+            "ADMIN_TOKENS".to_owned(),
+            "alice:alice-token-0123456:config:destroy".to_owned(),
+        );
+
+        let error = Config::from_source(&values).expect_err("unknown scope");
+
+        assert!(error.to_string().contains("unknown"));
+        assert!(
+            error
+                .to_string()
+                .contains("config:read")
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Runbook
 
-Operational procedures for the gateway. Every command assumes `DATABASE_URL` and
-`ADMIN_TOKEN` are exported.
+Operational procedures for the gateway. Every command assumes `DATABASE_URL` is exported;
+the CLI talks to Postgres directly and does not read admin tokens.
 
 ## Health
 
@@ -71,8 +71,8 @@ curl -s "$ADMIN/v1/audit?limit=50" -H "Authorization: Bearer $TOKEN"
 ```
 
 Rows carry the actor bound to the admin token, the action, the subject, the source IP, and
-the request id from the response. There is one role today: every configured token is a full
-administrator, so `actor` answers *who*, not *what they were allowed to do*.
+the request id from the response. Tokens can be scoped (`config:read`, `keys:write`, …), so
+`actor` answers *who* and the token's scopes bound *what they could do*.
 
 ## Database outage
 

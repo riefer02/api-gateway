@@ -117,8 +117,15 @@ The HTTP API serves the same operations on a separate listener. Configure named 
 to enable it; each name becomes the audit identity for everything that token does.
 
 ```bash
+# no scope list = full admin
 ADMIN_TOKENS="alice:$ALICE_TOKEN,bob:$BOB_TOKEN"
+# scoped: readable config, but no writes and no key access
+ADMIN_TOKENS="auditor:$AUDITOR_TOKEN:config:read+audit:read"
 ```
+
+Scopes: `tenants:write`, `keys:read`, `keys:write`, `config:read`, `config:write`,
+`audit:read`. A token with no scope list gets `*`. A request outside its scopes returns
+`403` before touching the database.
 
 `ADMIN_TOKEN=...` still works for a single shared credential and maps to the actor
 `admin`. Tokens must be at least 16 characters; the listener stays off when neither is set.
@@ -277,7 +284,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `AUTH_CACHE_TTL_SECS` | `30` | Credential cache lifetime; `0` disables |
 | `METRICS_TOKEN` | unset | Requires a bearer token on `/metrics` when set |
 | `ADMIN_TOKEN` | unset | Single shared token, actor `admin` |
-| `ADMIN_TOKENS` | unset | `name:token` pairs; enables the control plane and names the actor |
+| `ADMIN_TOKENS` | unset | `name:token[:scope+scope]`; enables the control plane and names the actor |
 | `ADMIN_BIND` | `127.0.0.1:9090` | Control-plane listener |
 | `DEV_API_KEY_SECRET` | — | Seeded key; rejected in production |
 | `DEV_API_KEY_SCOPES` | `read` | Scopes for the seeded key |

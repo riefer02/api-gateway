@@ -62,6 +62,7 @@ pub(crate) struct RouteSummary {
     pub(crate) path_prefix: String,
     pub(crate) rewrite_prefix: Option<String>,
     pub(crate) upstream_id: String,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Debug)]
@@ -71,25 +72,77 @@ pub(crate) struct UpstreamSummary {
     pub(crate) timeout_ms: u32,
 }
 
-/// Who performed a mutation. The name is bound to an admin token; there are no
-/// roles yet, so every actor is a full administrator.
+/// Every control-plane privilege. The string form is what `ADMIN_TOKENS` grants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminScope {
+    TenantsWrite,
+    KeysRead,
+    KeysWrite,
+    ConfigRead,
+    ConfigWrite,
+    AuditRead,
+}
+
+impl AdminScope {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 6] = [
+        Self::TenantsWrite,
+        Self::KeysRead,
+        Self::KeysWrite,
+        Self::ConfigRead,
+        Self::ConfigWrite,
+        Self::AuditRead,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TenantsWrite => "tenants:write",
+            Self::KeysRead => "keys:read",
+            Self::KeysWrite => "keys:write",
+            Self::ConfigRead => "config:read",
+            Self::ConfigWrite => "config:write",
+            Self::AuditRead => "audit:read",
+        }
+    }
+}
+
+/// Who performed a mutation, and what their credential allows.
 #[derive(Clone, Debug)]
 pub(crate) struct Actor {
     pub(crate) name: String,
     pub(crate) source_ip: Option<String>,
+    scopes: std::collections::HashSet<String>,
 }
 
 impl Actor {
-    pub(crate) fn new(name: impl Into<String>) -> Self {
+    /// Trusted local operator (CLI) or bootstrap work: full admin.
+    pub(crate) fn local(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             source_ip: None,
+            scopes: std::collections::HashSet::from(["*".to_owned()]),
+        }
+    }
+
+    pub(crate) fn new(name: impl Into<String>, scopes: std::collections::HashSet<String>) -> Self {
+        Self {
+            name: name.into(),
+            source_ip: None,
+            scopes,
         }
     }
 
     pub(crate) fn with_source_ip(mut self, source_ip: Option<String>) -> Self {
         self.source_ip = source_ip;
         self
+    }
+
+    pub(crate) fn require(&self, scope: AdminScope) -> Result<(), crate::error::AppError> {
+        if self.scopes.contains("*") || self.scopes.contains(scope.as_str()) {
+            Ok(())
+        } else {
+            Err(crate::error::AppError::Forbidden)
+        }
     }
 }
 
@@ -328,6 +381,14 @@ impl AdminService {
             });
         }
 
+        self.audit_best_effort(
+            actor,
+            "key.rotate",
+            key_id,
+            serde_json::json!({ "replacement": issued.key_id }),
+        )
+        .await;
+
         Ok(issued)
     }
 
@@ -411,6 +472,12 @@ impl AdminService {
     ) -> Result<(), AdminError> {
         routing::validate_upstream_url(base_url, &self.allow_hosts).map_err(AdminError::Invalid)?;
 
+        if !(1..=300_000).contains(&timeout_ms) {
+            return Err(AdminError::Invalid(
+                "timeout_ms must be between 1 and 300000".to_owned(),
+            ));
+        }
+
         let mut transaction = self
             .pool
             .begin()
@@ -464,13 +531,10 @@ impl AdminService {
             None => None,
         };
 
-        let methods: Vec<String> = spec
-            .methods
-            .iter()
-            .map(|method| method.trim().to_ascii_uppercase())
-            .collect();
+        let methods = normalize_methods(&spec.methods);
 
-        self.ensure_claim_is_free(&spec).await?;
+        self.ensure_claim_is_free(&spec.id, &spec.path_prefix, &methods)
+            .await?;
 
         let mut transaction = self
             .pool
@@ -489,6 +553,7 @@ impl AdminService {
                    methods = EXCLUDED.methods,
                    rewrite_prefix = EXCLUDED.rewrite_prefix,
                    scopes = EXCLUDED.scopes,
+                   enabled = true,
                    updated_at = now()
             "#,
         )
@@ -534,7 +599,7 @@ impl AdminService {
 
     pub(crate) async fn list_routes(&self) -> Result<Vec<RouteSummary>, AdminError> {
         let rows = sqlx::query(
-            "SELECT id, methods, path_prefix, rewrite_prefix, upstream_id
+            "SELECT id, methods, path_prefix, rewrite_prefix, upstream_id, enabled
              FROM routes ORDER BY path_prefix",
         )
         .fetch_all(&self.pool)
@@ -558,6 +623,9 @@ impl AdminService {
                         .map_err(AdminError::Store)?,
                     upstream_id: row
                         .try_get("upstream_id")
+                        .map_err(AdminError::Store)?,
+                    enabled: row
+                        .try_get("enabled")
                         .map_err(AdminError::Store)?,
                 })
             })
@@ -654,7 +722,7 @@ impl AdminService {
             .map_err(AdminError::Store)?;
 
         self.audit_best_effort(
-            &Actor::new("system"),
+            &Actor::local("system"),
             "key.seed",
             "dev-local",
             serde_json::json!({ "scopes": scopes }),
@@ -734,21 +802,20 @@ impl AdminService {
         }
     }
 
-    async fn ensure_claim_is_free(&self, spec: &RouteSpec) -> Result<(), AdminError> {
-        let methods: Vec<String> = spec
-            .methods
-            .iter()
-            .map(|method| method.trim().to_ascii_uppercase())
-            .collect();
-
+    async fn ensure_claim_is_free(
+        &self,
+        id: &str,
+        path_prefix: &str,
+        methods: &[String],
+    ) -> Result<(), AdminError> {
         let claimed: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM routes
              WHERE path_prefix = $1 AND methods && $2::text[] AND id <> $3
              LIMIT 1",
         )
-        .bind(&spec.path_prefix)
-        .bind(&methods)
-        .bind(&spec.id)
+        .bind(path_prefix)
+        .bind(methods)
+        .bind(id)
         .fetch_optional(&self.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -757,7 +824,7 @@ impl AdminService {
             return Err(AdminError::Invalid(format!(
                 "{} on `{}` is already claimed by another route",
                 methods.join(","),
-                spec.path_prefix
+                path_prefix
             )));
         }
 
@@ -788,6 +855,13 @@ where
     .execute(executor)
     .await
     .map(|_| ())
+}
+
+fn normalize_methods(methods: &[String]) -> Vec<String> {
+    methods
+        .iter()
+        .map(|method| method.trim().to_ascii_uppercase())
+        .collect()
 }
 
 fn normalize_scopes(scopes: &[String]) -> Result<Vec<String>, AdminError> {
@@ -843,6 +917,20 @@ mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
 
+    #[test]
+    fn scope_vocabulary_matches_configuration() {
+        let declared: Vec<&str> = AdminScope::ALL
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect();
+
+        assert_eq!(
+            declared,
+            crate::config::ADMIN_SCOPES.to_vec(),
+            "AdminScope and ADMIN_SCOPES must list the same privileges"
+        );
+    }
+
     async fn pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;
         let pool = PgPoolOptions::new()
@@ -885,7 +973,7 @@ mod tests {
         );
 
         let tenant = unique("audit-tenant");
-        let actor = Actor::new("alice").with_source_ip(Some("10.0.0.7".to_owned()));
+        let actor = Actor::local("alice").with_source_ip(Some("10.0.0.7".to_owned()));
 
         service
             .create_tenant(&actor, &tenant)

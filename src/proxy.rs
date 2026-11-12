@@ -6,7 +6,10 @@ use axum::{
 use reqwest::Url;
 
 use crate::{
-    error::AppError, limits::BreakerRegistry, request_context, retry::RetryPolicy,
+    error::AppError,
+    limits::{BreakerGuard, BreakerRegistry},
+    request_context,
+    retry::RetryPolicy,
     routing::CompiledRoute,
 };
 
@@ -76,6 +79,7 @@ pub(crate) async fn forward(
     let path = route.upstream_path(parts.uri.path());
     let url = upstream_url(&route.upstream.base_url, &path, parts.uri.query())?;
     let mut headers = Some(outbound_headers(&parts));
+    let mut breaker = BreakerGuard::new(breakers, upstream_id);
 
     retry.deposit();
 
@@ -127,9 +131,9 @@ pub(crate) async fn forward(
 
                 // A 5xx means the upstream is unhealthy; a 4xx is a valid answer.
                 if status.is_server_error() {
-                    breakers.record_failure(upstream_id);
+                    breaker.record_failure();
                 } else {
-                    breakers.record_success(upstream_id);
+                    breaker.record_success();
                 }
 
                 metrics::counter!(
@@ -151,7 +155,7 @@ pub(crate) async fn forward(
                     continue;
                 }
 
-                breakers.record_failure(upstream_id);
+                breaker.record_failure();
 
                 return Err(upstream_error(error));
             }
@@ -189,15 +193,20 @@ fn record_retry(upstream: &str, reason: &'static str, attempt: u32) {
 
 fn upstream_url(base: &Url, path: &str, query: Option<&str>) -> Result<Url, AppError> {
     // Concatenate instead of pushing path segments: `path` is already
-    // percent-encoded, and pushing would double-encode every escape.
+    // percent-encoded, and pushing would double-encode every escape. One
+    // preallocated buffer keeps this to a single string allocation.
     let base = base.as_str().trim_end_matches('/');
-    let path = if path.starts_with('/') {
-        path.to_owned()
-    } else {
-        format!("/{path}")
-    };
+    let mut raw = String::with_capacity(base.len() + path.len() + 2);
 
-    let mut url = Url::parse(&format!("{base}{path}"))
+    raw.push_str(base);
+
+    if !path.starts_with('/') {
+        raw.push('/');
+    }
+
+    raw.push_str(path);
+
+    let mut url = Url::parse(&raw)
         .map_err(|error| AppError::internal(format!("could not build upstream URL: {error}")))?;
 
     url.set_query(query);
@@ -423,6 +432,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"upstream down");
+    }
+
+    #[tokio::test]
+    async fn forwards_request_bodies_intact() {
+        use wiremock::matchers::body_string;
+
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(body_string("hello upstream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&upstream)
+            .await;
+
+        let (app, token) = testing::app(&upstream.uri(), Duration::from_secs(2));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swapi/echo")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-length", "14")
+                    .body(Body::from("hello upstream"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

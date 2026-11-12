@@ -189,6 +189,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_are_gated_by_the_configured_token() {
+        let config = testing::config_with(&[("METRICS_TOKEN", "metrics-token-0123456789")]);
+        let app = crate::app::build_app(&config, testing::empty_state_with(&config));
+
+        let open = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(open.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", "Bearer metrics-token-0123456789")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn hostile_request_ids_are_replaced() {
         let app = crate::app::build_app(&testing::config(), testing::empty_state());
 

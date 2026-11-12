@@ -113,8 +113,10 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
 
 /// A state with no routes: everything 404s.
 pub(crate) fn empty_state() -> AppState {
-    let config = config();
+    empty_state_with(&config())
+}
 
+pub(crate) fn empty_state_with(config: &Config) -> AppState {
     AppState {
         db: lazy_pool(),
         api_key_store: Arc::new(InMemoryApiKeyStore::default()),

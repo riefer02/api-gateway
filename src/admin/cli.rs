@@ -200,7 +200,7 @@ async fn dispatch(
     );
     let service = AdminService::new(pool, verifier, config.routing.allow_hosts.clone(), store);
 
-    let actor = Actor::new("cli");
+    let actor = Actor::local("cli");
 
     match command {
         AdminCommand::Tenant {
@@ -378,7 +378,7 @@ async fn run_route_command(
 
             for route in routes {
                 println!(
-                    "{:<20} {:<24} {:<10} -> {}  {}",
+                    "{:<20} {:<24} {:<10} -> {}  {}{}",
                     route.id,
                     route.path_prefix,
                     route.methods.join(","),
@@ -386,7 +386,8 @@ async fn run_route_command(
                     match &route.rewrite_prefix {
                         Some(rewrite) => format!("rewrite {rewrite}"),
                         None => "strip prefix".to_owned(),
-                    }
+                    },
+                    if route.enabled { "" } else { "  (disabled)" }
                 );
             }
         }

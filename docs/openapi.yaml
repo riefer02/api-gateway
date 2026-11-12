@@ -26,7 +26,7 @@ paths:
   /healthz:
     get:
       summary: Liveness of the control-plane listener
-      security: []
+      description: Requires an admin token like every other path on this listener.
       responses:
         "200":
           description: Listening
@@ -293,8 +293,9 @@ components:
       type: http
       scheme: bearer
       description: |
-        One of the `ADMIN_TOKENS` values (`name:token`). The name is recorded as
-        the actor for every mutation. `ADMIN_TOKEN` also works and maps to `admin`.
+        One of the `ADMIN_TOKENS` values (`name:token[:scope+scope]`). The name is
+        recorded as the actor for every mutation; the scopes decide what the token may
+        do. `ADMIN_TOKEN` also works, maps to `admin`, and grants every scope.
 
   parameters:
     Id:

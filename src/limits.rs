@@ -25,10 +25,14 @@ pub(crate) enum Decision {
 /// paced. Per replica: N replicas enforce N times the configured rate, which
 /// is documented in the README.
 pub(crate) struct RateLimiter {
-    shards: Vec<Mutex<HashMap<String, Bucket>>>,
+    shards: Vec<Mutex<Shard>>,
     capacity: f64,
     refill_per_second: f64,
-    max_entries_per_shard: usize,
+}
+
+struct Shard {
+    buckets: HashMap<String, Bucket>,
+    last_swept: Instant,
 }
 
 struct Bucket {
@@ -44,26 +48,34 @@ impl RateLimiter {
 
         Self {
             shards: (0..SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| {
+                    Mutex::new(Shard {
+                        buckets: HashMap::new(),
+                        last_swept: Instant::now(),
+                    })
+                })
                 .collect(),
             capacity,
             refill_per_second: capacity / 60.0,
-            max_entries_per_shard: 4_096,
         }
     }
 
     pub(crate) fn check(&self, key: &str) -> Decision {
         let now = Instant::now();
-        let shard = self.shard(key);
-        let mut shard = shard
+        let mut shard = self
+            .shard(key)
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if shard.len() >= self.max_entries_per_shard {
-            evict_idle(&mut shard, now);
+        // Sweep on time, never on occupancy: a full shard of live buckets must
+        // not turn every request into a full scan.
+        if now.saturating_duration_since(shard.last_swept) > Duration::from_secs(30) {
+            evict_idle(&mut shard.buckets, now);
+            shard.last_swept = now;
         }
 
         let bucket = shard
+            .buckets
             .entry(key.to_owned())
             .or_insert(Bucket {
                 tokens: self.capacity,
@@ -104,7 +116,7 @@ impl RateLimiter {
         Duration::from_secs_f64(missing / self.refill_per_second).max(Duration::from_secs(1))
     }
 
-    fn shard(&self, key: &str) -> &Mutex<HashMap<String, Bucket>> {
+    fn shard(&self, key: &str) -> &Mutex<Shard> {
         // FNV-1a: stable and cheap; shard choice only needs to be uniform.
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
 
@@ -221,22 +233,35 @@ impl BreakerRegistry {
 
     pub(crate) fn record_success(&self, upstream: &str) {
         let mut breakers = self.lock();
-        let breaker = breakers
-            .entry(upstream.to_owned())
-            .or_insert_with(|| Breaker {
-                state: State::Closed { failures: 0 },
-            });
 
-        breaker.state = State::Closed { failures: 0 };
+        if let Some(breaker) = breakers.get_mut(upstream) {
+            breaker.state = State::Closed { failures: 0 };
+            return;
+        }
+
+        breakers.insert(
+            upstream.to_owned(),
+            Breaker {
+                state: State::Closed { failures: 0 },
+            },
+        );
     }
 
     pub(crate) fn record_failure(&self, upstream: &str) {
         let mut breakers = self.lock();
+
+        if !breakers.contains_key(upstream) {
+            breakers.insert(
+                upstream.to_owned(),
+                Breaker {
+                    state: State::Closed { failures: 0 },
+                },
+            );
+        }
+
         let breaker = breakers
-            .entry(upstream.to_owned())
-            .or_insert_with(|| Breaker {
-                state: State::Closed { failures: 0 },
-            });
+            .get_mut(upstream)
+            .expect("breaker was just inserted");
 
         breaker.state = match breaker.state {
             State::Closed { failures } if failures + 1 >= self.failure_threshold => State::Open {
@@ -255,6 +280,47 @@ impl BreakerRegistry {
         self.breakers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Records the eventual outcome of one request against the breaker, and fails
+/// the breaker if the request is cancelled before it can report. Without this,
+/// a probe killed by a deadline or a client disconnect would leave the circuit
+/// half-open forever.
+pub(crate) struct BreakerGuard<'a> {
+    registry: &'a BreakerRegistry,
+    upstream: &'a str,
+    armed: bool,
+}
+
+impl<'a> BreakerGuard<'a> {
+    pub(crate) fn new(registry: &'a BreakerRegistry, upstream: &'a str) -> Self {
+        Self {
+            registry,
+            upstream,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn record_success(&mut self) {
+        self.registry
+            .record_success(self.upstream);
+        self.armed = false;
+    }
+
+    pub(crate) fn record_failure(&mut self) {
+        self.registry
+            .record_failure(self.upstream);
+        self.armed = false;
+    }
+}
+
+impl Drop for BreakerGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .record_failure(self.upstream);
+        }
     }
 }
 
