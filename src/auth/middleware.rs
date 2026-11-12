@@ -1,25 +1,15 @@
 use axum::{
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::header,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 
 use crate::{
-    auth::{ApiKeyId, AuthError, ClientIdentity, verify_api_key},
+    auth::{ApiKeyId, AuthError, ClientIdentity, scopes, verify_api_key},
+    error::AppError,
     state::AppState,
 };
-
-use crate::auth::scopes;
-
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        "invalid or missing bearer credentials",
-    )
-        .into_response()
-}
 
 pub(crate) async fn require_api_key(
     State(state): State<AppState>,
@@ -31,23 +21,23 @@ pub(crate) async fn require_api_key(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
     else {
-        return unauthorized();
+        return AppError::Unauthorized.into_response();
     };
 
     let Some((scheme, token)) = value.split_once(' ') else {
-        return unauthorized();
+        return AppError::Unauthorized.into_response();
     };
 
     if !scheme.eq_ignore_ascii_case("Bearer") {
-        return unauthorized();
+        return AppError::Unauthorized.into_response();
     }
 
     let Some((key_id, secret)) = token.split_once('.') else {
-        return unauthorized();
+        return AppError::Unauthorized.into_response();
     };
 
     if key_id.is_empty() || secret.is_empty() {
-        return unauthorized();
+        return AppError::Unauthorized.into_response();
     }
 
     let key_id = ApiKeyId(key_id.to_owned());
@@ -64,9 +54,9 @@ pub(crate) async fn require_api_key(
                 .insert(identity);
             next.run(request).await
         }
-        Err(AuthError::InvalidCredentials) => unauthorized(),
-        Err(AuthError::Forbidden) => StatusCode::FORBIDDEN.into_response(),
-        Err(AuthError::StoreUnavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(AuthError::InvalidCredentials) => AppError::Unauthorized.into_response(),
+        Err(AuthError::Forbidden) => AppError::Forbidden.into_response(),
+        Err(AuthError::StoreUnavailable) => AppError::ServiceUnavailable.into_response(),
     }
 }
 
@@ -75,14 +65,14 @@ pub(crate) async fn require_people_read(request: Request, next: Next) -> Respons
         .extensions()
         .get::<ClientIdentity>()
     else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return AppError::Unauthorized.into_response();
     };
 
     if !identity
         .scopes
         .contains(scopes::PEOPLE_READ)
     {
-        return StatusCode::FORBIDDEN.into_response();
+        return AppError::Forbidden.into_response();
     }
 
     next.run(request).await

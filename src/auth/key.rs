@@ -1,3 +1,7 @@
+// TODO(W3): the issue/rotate/revoke flow in the admin service is the first
+// consumer; remove this allow when it lands.
+#![allow(dead_code)]
+
 use super::ApiKeyId;
 
 use std::collections::HashSet;

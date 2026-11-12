@@ -1,19 +1,31 @@
-use axum::{Router, body::Body, http::Request};
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode},
+};
 use opentelemetry::{global, trace::TraceContextExt};
-use tower_http::limit::RequestBodyLimitLayer;
-
-use opentelemetry_http::HeaderExtractor;
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
+use tower::ServiceBuilder;
+use tower_http::{
+    catch_panic::CatchPanicLayer,
+    limit::RequestBodyLimitLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::config::Config;
-use crate::state;
+use crate::{request_context, state};
 
-pub fn build_app(config: Config, state: state::AppState) -> Router {
+/// Builds the gateway with the canonical layer order.
+///
+/// Outermost first. The order is a contract, not an accident:
+/// the request id must exist before anything logs, the deadline must cover
+/// body reads, and panics must become responses instead of dropped sockets.
+pub fn build_app(config: &Config, state: state::AppState) -> Router {
     let trace_layer = TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
         let parent_context = global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeaderExtractor(request.headers()))
+            propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
         });
 
         let request_id = request
@@ -38,18 +50,40 @@ pub fn build_app(config: Config, state: state::AppState) -> Router {
             .span_context()
             .is_valid();
 
-        if has_parent {
-            if let Err(error) = span.set_parent(parent_context) {
-                tracing::warn!(%error, "could not attach incoming trace context");
-            }
+        if has_parent && let Err(error) = span.set_parent(parent_context) {
+            tracing::warn!(%error, "could not attach incoming trace context");
         }
 
         span
     });
 
-    crate::routes::router(state)
-        .layer(RequestBodyLimitLayer::new(config.max_request_body_bytes))
-        .layer(trace_layer)
+    let layers = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(axum::middleware::from_fn(record_request_id))
+        .layer(trace_layer)
+        .layer(CatchPanicLayer::new())
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            config.server.request_timeout,
+        ))
+        .layer(RequestBodyLimitLayer::new(
+            config.server.request_body_limit_bytes,
+        ));
+
+    crate::routes::router(state).layer(layers)
+}
+
+async fn record_request_id(
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    request_context::scope(request_id, next.run(request)).await
 }

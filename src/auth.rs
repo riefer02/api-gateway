@@ -22,6 +22,27 @@ pub(crate) enum AccountStatus {
     Active,
     Suspended,
 }
+
+impl AccountStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "suspended" => Some(Self::Suspended),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) const DEV_TENANT_ID: &str = "tenant-local";
+pub(crate) const DEV_CLIENT_ID: &str = "client-local";
+pub(crate) const DEV_KEY_ID: &str = "dev-local";
 #[derive(Clone)]
 pub(crate) struct Tenant {
     pub(crate) id: TenantId,
@@ -47,6 +68,7 @@ pub(crate) struct ApiKeyRecord {
     pub(crate) verifier: SecretVerifier,
     pub(crate) verifier_version: u8,
     pub(crate) scopes: HashSet<String>,
+    #[allow(dead_code)] // TODO(W9): surfaced as key metadata once the admin plane reads it.
     pub(crate) created_at: OffsetDateTime,
     pub(crate) expires_at: Option<OffsetDateTime>,
     pub(crate) revoked_at: Option<OffsetDateTime>,
@@ -143,9 +165,9 @@ pub(crate) async fn seed_dev_credential(
     store: &dyn store::ApiKeyStore,
     secret: &str,
 ) -> Result<(), store::StoreError> {
-    let tenant_id = TenantId("tenant-local".to_owned());
-    let client_id = ClientId("client-local".to_owned());
-    let key_id = ApiKeyId("dev-local".to_owned());
+    let tenant_id = TenantId(DEV_TENANT_ID.to_owned());
+    let client_id = ClientId(DEV_CLIENT_ID.to_owned());
+    let key_id = ApiKeyId(DEV_KEY_ID.to_owned());
 
     store
         .insert_credential(CredentialContext {

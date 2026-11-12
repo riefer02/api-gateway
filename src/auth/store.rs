@@ -4,15 +4,18 @@ use std::{
 };
 
 use async_trait::async_trait;
+use thiserror::Error;
 use time::OffsetDateTime;
 
 use super::{ApiKeyId, CredentialContext};
 
-mod postgres;
+pub(crate) mod postgres;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub(crate) enum StoreError {
+    #[error("credential store is unavailable")]
     Unavailable,
+    #[error("api key already exists")]
     DuplicateKey,
 }
 
@@ -23,6 +26,7 @@ pub(crate) trait ApiKeyStore: Send + Sync {
         key_id: &ApiKeyId,
     ) -> Result<Option<CredentialContext>, StoreError>;
 
+    #[allow(dead_code)] // TODO(W3): used by the rotation/revocation flow.
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError>;
     async fn insert_credential(&self, credential: CredentialContext) -> Result<(), StoreError>;
 }
