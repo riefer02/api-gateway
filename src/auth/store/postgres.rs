@@ -116,14 +116,36 @@ impl ApiKeyStore for PostgresApiKeyStore {
     }
 
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(unavailable)?;
+
         let result = sqlx::query(
             "UPDATE api_keys SET revoked_at = now()
              WHERE key_id = $1 AND revoked_at IS NULL",
         )
         .bind(key_id.as_str())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(unavailable)?;
+
+        if result.rows_affected() > 0 {
+            // Transactional: the notification commits with the revoke, so no
+            // replica can see one without the other.
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(crate::auth::cache::REVOCATION_CHANNEL)
+                .bind(key_id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(unavailable)?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(unavailable)?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -322,6 +344,54 @@ mod tests {
             .expect("lookup")
             .expect("credential exists");
         assert!(revoked.key.revoked_at.is_some());
+
+        cleanup(&pool, &tenant_id, &client_id).await;
+    }
+
+    #[tokio::test]
+    async fn revocation_notifies_other_replicas() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let (tenant_id, client_id) = provision(&pool).await;
+        let key_id = ApiKeyId(unique("key"));
+        let store = PostgresApiKeyStore::new(pool.clone());
+
+        store
+            .insert_key(NewApiKey {
+                key_id: key_id.clone(),
+                client_id: client_id.clone(),
+                verifier: SecretVerifier([7_u8; 32]),
+                verifier_version: 2,
+                scopes: HashSet::new(),
+                expires_at: None,
+            })
+            .await
+            .expect("insert credential");
+
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+            .await
+            .expect("listener");
+        listener
+            .listen(crate::auth::cache::REVOCATION_CHANNEL)
+            .await
+            .expect("subscribe");
+
+        assert!(
+            store
+                .revoke_by_key_id(&key_id)
+                .await
+                .expect("revoke")
+        );
+
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
+            .await
+            .expect("notification within 2s")
+            .expect("notification");
+
+        assert_eq!(notification.payload(), key_id.as_str());
 
         cleanup(&pool, &tenant_id, &client_id).await;
     }

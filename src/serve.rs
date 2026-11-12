@@ -43,14 +43,22 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     db::migrate(&pool).await?;
 
     let verifier = Arc::new(KeyVerifier::new(config.auth.pepper.clone()));
+    let mut revocation_task = None;
 
     let store: Arc<dyn ApiKeyStore> = if config.auth.cache_ttl.is_zero() {
         Arc::new(PostgresApiKeyStore::new(pool.clone()))
     } else {
-        Arc::new(CachedApiKeyStore::new(
+        let cached = Arc::new(CachedApiKeyStore::new(
             Arc::new(PostgresApiKeyStore::new(pool.clone())),
             config.auth.cache_ttl,
-        ))
+        ));
+
+        revocation_task = Some(tokio::spawn(crate::auth::cache::listen_for_revocations(
+            pool.clone(),
+            Arc::clone(&cached),
+        )));
+
+        cached
     };
 
     let admin = Arc::new(admin::AdminService::new(
@@ -69,7 +77,8 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         tracing::warn!("no routes configured: every request will return 404");
     }
 
-    let routes = RouteTableHandle::new(table);
+    let routes = RouteTableHandle::new(table)
+        .with_stale_after(config.routing.refresh_interval * 3 + std::time::Duration::from_secs(5));
     let refresh = RouteRefresh::new(source, routes.clone(), config.routing.refresh_interval);
     let refresh_task = tokio::spawn(refresh.run());
 
@@ -79,11 +88,12 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         api_key_store: Arc::clone(&store),
         db: pool,
         verifier,
-        routes,
+        routes: routes.clone(),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(RetryPolicy::new(&config.retry)),
         body_limit: config.server.request_body_limit_bytes,
+        metrics_token: config.telemetry.metrics_token.clone(),
         metrics,
     };
 
@@ -93,22 +103,50 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
 
-    tracing::info!(%address, "gateway listening");
+    log_startup(config, &routes);
 
     let outcome = serve_until_shutdown(listener, app, config).await;
     refresh_task.abort();
+    if let Some(task) = revocation_task {
+        task.abort();
+    }
     stop_admin(admin_server).await;
 
     outcome
 }
 
-/// The control plane is optional: it starts only when `ADMIN_TOKEN` is set, and
-/// it always shares the process so cache invalidation is immediate.
+/// One structured line that answers "what did this process just come up as?",
+/// plus an advisory for every valid-but-risky setting.
+fn log_startup(config: &Config, routes: &RouteTableHandle) {
+    let table = routes.snapshot();
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        environment = config.environment.as_str(),
+        listen = %format!("{}:{}", config.server.host, config.server.port),
+        admin = config
+            .admin
+            .token
+            .as_ref()
+            .map(|_| config.admin.bind.as_str())
+            .unwrap_or("disabled"),
+        routes = table.len(),
+        table_version = table.version(),
+        credential_cache_secs = config.auth.cache_ttl.as_secs(),
+        ip_limit_per_min = config.limits.ip_per_minute,
+        tenant_limit_per_min = config.limits.tenant_per_minute,
+        retry_attempts = config.retry.max_attempts,
+        "gateway ready"
+    );
+
+    for note in config.advisories() {
+        tracing::warn!("{note}");
+    }
+}
 struct AdminServer {
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
-
 async fn start_admin(
     config: &Config,
     service: Arc<admin::AdminService>,

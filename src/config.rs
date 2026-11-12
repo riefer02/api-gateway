@@ -19,6 +19,62 @@ impl AppEnvironment {
     }
 }
 
+impl Config {
+    /// Settings that are valid but worth saying out loud at boot.
+    pub fn advisories(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+
+        if self.auth.cache_ttl.is_zero() {
+            notes.push(
+                "AUTH_CACHE_TTL_SECS=0: every request reads credentials from Postgres".to_owned(),
+            );
+        }
+        if self.limits.ip_per_minute == 0 {
+            notes.push("RATE_LIMIT_IP_PER_MINUTE=0: per-IP rate limiting is disabled".to_owned());
+        }
+        if self.limits.tenant_per_minute == 0 {
+            notes.push(
+                "RATE_LIMIT_TENANT_PER_MINUTE=0: per-tenant rate limiting is disabled".to_owned(),
+            );
+        }
+        if self.retry.max_attempts <= 1 {
+            notes.push("RETRY_MAX_ATTEMPTS=1: upstream retries are disabled".to_owned());
+        }
+        if self.admin.token.is_none() {
+            notes.push("ADMIN_TOKEN is unset: the HTTP control plane is disabled".to_owned());
+        }
+        if self.telemetry.metrics_token.is_none() {
+            notes.push(
+                "METRICS_TOKEN is unset: /metrics is readable by anyone who can reach the port"
+                    .to_owned(),
+            );
+        }
+        if self.environment.is_production()
+            && (self
+                .telemetry
+                .log_level
+                .contains("debug")
+                || self
+                    .telemetry
+                    .log_level
+                    .contains("trace"))
+        {
+            notes.push(
+                "LOG_LEVEL is debug/trace in production: benchmark shows ~2.7x throughput cost"
+                    .to_owned(),
+            );
+        }
+        if !self.environment.is_production() && self.routing.allow_hosts.is_empty() {
+            notes.push(
+                "UPSTREAM_ALLOW_HOSTS is empty: any upstream host is allowed (development only)"
+                    .to_owned(),
+            );
+        }
+
+        notes
+    }
+}
+
 /// Development-only pepper. Production must set `AUTH_PEPPER`.
 pub const DEVELOPMENT_PEPPER: &str = "development-only-pepper";
 
@@ -76,6 +132,8 @@ pub struct DatabaseConfig {
 pub struct TelemetryConfig {
     pub log_level: String,
     pub otlp_endpoint: Option<String>,
+    /// When set, `/metrics` requires this bearer token.
+    pub metrics_token: Option<SecretString>,
 }
 
 #[derive(Clone, Debug)]
@@ -216,6 +274,7 @@ impl Config {
         let telemetry = TelemetryConfig {
             log_level: string_or(source, "LOG_LEVEL", "info"),
             otlp_endpoint: non_empty(source.get("OTEL_EXPORTER_OTLP_ENDPOINT")),
+            metrics_token: non_empty(source.get("METRICS_TOKEN")).map(SecretString::new),
         };
 
         let auth_pepper = non_empty(source.get("AUTH_PEPPER"));
@@ -615,6 +674,47 @@ mod tests {
                 .to_string()
                 .contains("postgres://")
         );
+    }
+
+    #[test]
+    fn development_advisories_name_the_unset_safeguards() {
+        let config = Config::from_source(&valid_development()).expect("valid config");
+        let notes = config.advisories();
+
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("ADMIN_TOKEN"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("METRICS_TOKEN"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("UPSTREAM_ALLOW_HOSTS"))
+        );
+    }
+
+    #[test]
+    fn a_complete_production_config_has_no_advisories() {
+        let values = source(&[
+            ("APP_ENV", "production"),
+            (
+                "DATABASE_URL",
+                "postgres://gateway:secret@127.0.0.1:5432/gateway",
+            ),
+            ("AUTH_PEPPER", "a-long-production-pepper"),
+            ("UPSTREAM_ALLOW_HOSTS", "swapi.dev"),
+            ("ADMIN_TOKEN", "admin-token"),
+            ("METRICS_TOKEN", "metrics-token"),
+        ]);
+
+        let config = Config::from_source(&values).expect("valid config");
+
+        assert!(config.advisories().is_empty(), "{:?}", config.advisories());
     }
 
     #[test]

@@ -237,6 +237,18 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.contains(' ')).then_some(token)
 }
 
+/// Constant-time bearer check, shared by the admin listener and `/metrics`.
+pub(crate) fn bearer_matches(headers: &HeaderMap, expected: &crate::config::SecretString) -> bool {
+    use subtle::ConstantTimeEq;
+
+    bearer_token(headers).is_some_and(|presented| {
+        presented
+            .as_bytes()
+            .ct_eq(expected.expose().as_bytes())
+            .into()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -104,6 +104,7 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
         body_limit: config.server.request_body_limit_bytes,
+        metrics_token: config.telemetry.metrics_token.clone(),
         metrics: metrics_handle(),
     };
 
@@ -123,6 +124,7 @@ pub(crate) fn empty_state() -> AppState {
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
         body_limit: config.server.request_body_limit_bytes,
+        metrics_token: config.telemetry.metrics_token.clone(),
         metrics: metrics_handle(),
     }
 }

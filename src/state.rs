@@ -19,5 +19,6 @@ pub(crate) struct AppState {
     pub(crate) breakers: Arc<BreakerRegistry>,
     pub(crate) retry: Arc<RetryPolicy>,
     pub(crate) body_limit: usize,
+    pub(crate) metrics_token: Option<crate::config::SecretString>,
     pub(crate) metrics: PrometheusHandle,
 }

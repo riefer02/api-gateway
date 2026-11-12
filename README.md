@@ -140,8 +140,9 @@ stored only as HMAC verifiers. Rotation copies the remaining lifetime, refuses r
 and rolls back the replacement if the old revoke fails.
 
 Because the admin listener shares the process, a revoke invalidates the credential cache
-immediately. A revoke issued from the CLI in another process is bounded by
-`AUTH_CACHE_TTL_SECS`.
+immediately. Revocations are also broadcast on a Postgres channel, so every replica drops
+the entry at the same moment; `AUTH_CACHE_TTL_SECS` is only the fallback for a replica
+whose listener is disconnected.
 
 ## Protection
 
@@ -195,7 +196,7 @@ This table is the specification.
 
 ## Observability
 
-`GET /metrics` renders Prometheus text:
+`GET /metrics` renders Prometheus text. Set `METRICS_TOKEN` to require a bearer token.
 
 | Metric | Labels |
 |---|---|
@@ -248,6 +249,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `DATABASE_URL` | — (required) | Postgres connection string |
 | `AUTH_PEPPER` | dev value | Required in production; rotating it invalidates keys |
 | `AUTH_CACHE_TTL_SECS` | `30` | Credential cache lifetime; `0` disables |
+| `METRICS_TOKEN` | unset | Requires a bearer token on `/metrics` when set |
 | `ADMIN_TOKEN` | unset | Enables the HTTP control plane when set |
 | `ADMIN_BIND` | `127.0.0.1:9090` | Control-plane listener |
 | `DEV_API_KEY_SECRET` | — | Seeded key; rejected in production |
@@ -291,15 +293,14 @@ just up              # compose stack (gateway + Postgres)
    register your own through the admin API or CLI.
 5. **Tune the limits** against a load test; the defaults are guesses for a small deployment.
 6. **Set `ADMIN_TOKEN`** if you want the HTTP control plane, and keep its listener private.
-7. **Decide on revocation staleness**: `AUTH_CACHE_TTL_SECS` is the window in which a
-   cross-process revocation is not yet visible.
+7. **Decide on revocation staleness**: cross-replica revocation is immediate over Postgres
+   `LISTEN/NOTIFY`; `AUTH_CACHE_TTL_SECS` is the fallback window if a listener drops.
 
 Deliberately generic: no cloud provider, no vendor SDK, no auth provider. The `AuthError`
 and rate-limiter seams are where those integrations belong.
 
 Known gaps, stated plainly: rate limits, retry budgets, and breakers are per replica;
-unknown-length request bodies are buffered up to the limit instead of streamed; and
-`/metrics` is unauthenticated.
+unknown-length request bodies are buffered up to the limit instead of streamed.
 
 ## Further reading
 

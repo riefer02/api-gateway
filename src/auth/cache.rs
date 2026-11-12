@@ -87,6 +87,9 @@ where
 use crate::auth::store::{ApiKeyStore, NewApiKey, StoreError};
 use crate::auth::{ApiKeyId, Credential};
 
+/// Postgres channel used to tell every replica that a key was revoked.
+pub(crate) const REVOCATION_CHANNEL: &str = "api_key_revoked";
+
 /// Wraps a credential store with a short-lived read cache.
 ///
 /// The cache bounds how long a revocation can go unnoticed *across processes*.
@@ -103,6 +106,50 @@ impl CachedApiKeyStore {
             inner,
             cache: TtlCache::new(ttl),
         }
+    }
+
+    /// Drops one entry. Called locally on revoke and remotely via `LISTEN`.
+    pub(crate) fn invalidate(&self, key_id: &ApiKeyId) {
+        self.cache.invalidate(key_id);
+    }
+}
+
+/// Keeps every replica's cache honest: a revoke anywhere is broadcast on a
+/// Postgres channel, so no replica serves a revoked key past the write.
+pub(crate) async fn listen_for_revocations(pool: sqlx::PgPool, store: Arc<CachedApiKeyStore>) {
+    loop {
+        let Ok(mut listener) = sqlx::postgres::PgListener::connect_with(&pool).await else {
+            tracing::warn!("could not connect the revocation listener; retrying");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+
+        if listener
+            .listen(REVOCATION_CHANNEL)
+            .await
+            .is_err()
+        {
+            tracing::warn!("could not subscribe to revocation events; retrying");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        tracing::info!("listening for cross-replica revocation events");
+
+        loop {
+            match listener.recv().await {
+                Ok(notification) => {
+                    store.invalidate(&ApiKeyId(notification.payload().to_owned()));
+                    tracing::debug!(key_id = notification.payload(), "cache invalidated");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "revocation listener disconnected; reconnecting");
+                    break;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

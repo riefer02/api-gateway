@@ -54,6 +54,10 @@ impl RouteTable {
         self.routes.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.routes.len()
+    }
+
     /// Longest matching prefix wins, then the higher priority. Routes are
     /// pre-sorted, so this is a scan over a usually tiny vector.
     pub(crate) fn resolve(&self, method: &Method, path: &str) -> RouteMatch<'_> {
@@ -509,17 +513,41 @@ impl RouteSource {
 #[derive(Clone)]
 pub(crate) struct RouteTableHandle {
     current: Arc<ArcSwap<RouteTable>>,
+    refreshed_at: Arc<std::sync::atomic::AtomicU64>,
+    stale_after: Duration,
 }
 
 impl RouteTableHandle {
     pub(crate) fn new(table: RouteTable) -> Self {
         Self {
             current: Arc::new(ArcSwap::from_pointee(table)),
+            refreshed_at: Arc::new(std::sync::atomic::AtomicU64::new(now_millis())),
+            stale_after: Duration::from_secs(30),
         }
+    }
+
+    /// Readiness fails once the table has not been confirmed for this long.
+    pub(crate) fn with_stale_after(mut self, stale_after: Duration) -> Self {
+        self.stale_after = stale_after;
+        self
     }
 
     pub(crate) fn snapshot(&self) -> Arc<RouteTable> {
         self.current.load_full()
+    }
+
+    pub(crate) fn mark_refreshed(&self) {
+        self.refreshed_at
+            .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        let last = self
+            .refreshed_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let age = now_millis().saturating_sub(last);
+
+        age > self.stale_after.as_millis() as u64
     }
 
     /// Installs `table` only if it is newer than the current snapshot, so a
@@ -535,6 +563,13 @@ impl RouteTableHandle {
 
         true
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Polls the version counter and swaps the snapshot when it changes.
@@ -555,6 +590,10 @@ impl RouteRefresh {
 
     pub(crate) async fn refresh_once(&self) -> Result<bool, RouteTableError> {
         let version = self.source.version().await?;
+
+        // A successful version read proves the table source is reachable, even
+        // when nothing changed.
+        self.handle.mark_refreshed();
 
         if version == self.handle.snapshot().version() {
             return Ok(false);
