@@ -372,6 +372,9 @@ Prove the interesting half locally, with no cluster:
 just replicas        # two containers, one database
 ```
 
+This is intentionally not part of CI — see
+[ADR 0001](docs/adr/0001-replicas-and-ci.md) for the reasoning and the trigger to revisit.
+
 It asserts three things that only exist with more than one replica: a key issued once works
 on both, a revocation reaches both immediately, and a route added through one replica's
 control plane is served by the other within one refresh interval.
@@ -412,6 +415,8 @@ terminates at the edge rather than in the gateway.
 - [`docs/runbook.md`](docs/runbook.md) — rotation, revocation, outages, deploy checklist
 - [`docs/openapi.yaml`](docs/openapi.yaml) — control-plane API
 - [`deploy/alerts.yml`](deploy/alerts.yml) — Prometheus rules
+- [`docs/adr/`](docs/adr) — decisions, including why the replica model is shaped this way
+  and what runs in CI versus on demand
 
 ## Development
 
