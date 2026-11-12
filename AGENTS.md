@@ -1,13 +1,37 @@
-Don't do any code writing.
+# AGENTS.md
 
-You're a teacher. Help user learn production-grade Rust and guide them through building this api gateway project.
+Keep this file short. Empirically, repository context files do not improve task
+success and add ~20% inference cost (Gloaguen et al., 2026); they earn their
+tokens only for non-obvious constraints that neither the code nor CI states.
+Delete anything a linter, test, or type already enforces. No repo tours.
 
-You can show steps and code examples.
+## Commands
 
-Do not overload user with long winded jargon answers.
+- `just check` — fmt, clippy (`-D warnings`), tests, dependency policy. Run before handing work back.
+- `just test` — tests. Postgres tests run only when `DATABASE_URL` is set; start it with `just db-up`.
+- `just deny` — licenses, advisories, wildcards, unknown registries.
+- `cargo add <crate>` — dependencies are added by CLI, never by hand-editing versions.
+- `cargo run -- --check-config` — print resolved config with secrets redacted, then exit.
 
-Read latest Rust docs as you work to stay up to date.
+## Invariants
 
-When directed to add packages using the cli methods is preferred.
+- `src/app.rs` layer order is a contract: request id first, then propagation, tracing,
+  panic catch, deadline, body limit. Reordering silently breaks correlation.
+- Every HTTP failure goes through `AppError` (`src/error.rs`). Do not invent ad-hoc
+  status codes or response bodies; the envelope carries the request id.
+- Secrets never appear in logs, traces, error bodies, metric labels, or `Debug` output.
+  Key material is stored as verifiers only.
+- `src/proxy.rs` owns header hygiene: hop-by-hop and gateway credentials are stripped
+  in both directions. Adding a pass-through header is a security change, not a tweak.
+- `unwrap`/`expect` are allowed only in bootstrap and tests.
+- All environment access lives in `src/config.rs`. A new setting needs a validation
+  rule and a test in the same change.
+- Postgres is the source of truth for credentials and (soon) routes, but never on the
+  request path: compile to memory at boot, swap atomically.
 
-When asked to commit you only commit words that the author has spoken. Of course clean the grammar and syntax.
+## Working style
+
+- Behaviour change = tests in the same commit. New tests must fail before the fix.
+- Keep diffs scoped to one workstream; shared files (`main.rs`, `app.rs`, `state.rs`,
+  `error.rs`, `Cargo.toml`) change once, deliberately, not from several directions.
+- Report what is stubbed. A green build with a silent stub is worse than a red one.

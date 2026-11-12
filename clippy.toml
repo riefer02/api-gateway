@@ -1,0 +1,4 @@
+# Clippy configuration. Lint selection lives in Cargo.toml `[lints]` and CI
+# flags; this file only holds tool-wide settings.
+
+msrv = "1.99"

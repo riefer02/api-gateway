@@ -2,3 +2,7 @@
 .env*
 !.env.example
 .vscode
+
+# local plans and notes (never committed)
+*.local.md
+.local/
