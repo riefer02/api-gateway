@@ -43,6 +43,8 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
             tenant_id = tracing::field::Empty,
             client_id = tracing::field::Empty,
             key_id = tracing::field::Empty,
+            route = tracing::field::Empty,
+            upstream = tracing::field::Empty,
         );
 
         let has_parent = parent_context

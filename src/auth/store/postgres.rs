@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use crate::auth::{
-    AccountStatus, ApiKeyId, ApiKeyRecord, Client, ClientId, CredentialContext, SecretVerifier,
-    Tenant, TenantId,
+    AccountStatus, ApiKeyId, ApiKeyRecord, Client, ClientId, Credential, SecretVerifier, Tenant,
+    TenantId,
 };
 
-use super::{ApiKeyStore, StoreError};
+use super::{ApiKeyStore, NewApiKey, StoreError};
 
 pub(crate) struct PostgresApiKeyStore {
     pool: PgPool,
@@ -18,54 +18,11 @@ impl PostgresApiKeyStore {
     pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-
-    /// Development seeding: creates the tenant and client rows that a
-    /// credential insert depends on, and clears the previous dev key so the
-    /// secret in `.env` always wins. Never called in production.
-    pub(crate) async fn prepare_development_seed(&self) -> Result<(), StoreError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(unavailable)?;
-
-        sqlx::query("INSERT INTO tenants (id, status) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
-            .bind(crate::auth::DEV_TENANT_ID)
-            .bind(AccountStatus::Active.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(unavailable)?;
-
-        sqlx::query(
-            "INSERT INTO clients (id, tenant_id, status) VALUES ($1, $2, $3)
-             ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(crate::auth::DEV_CLIENT_ID)
-        .bind(crate::auth::DEV_TENANT_ID)
-        .bind(AccountStatus::Active.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(unavailable)?;
-
-        sqlx::query("DELETE FROM api_keys WHERE key_id = $1")
-            .bind(crate::auth::DEV_KEY_ID)
-            .execute(&mut *transaction)
-            .await
-            .map_err(unavailable)?;
-
-        transaction
-            .commit()
-            .await
-            .map_err(unavailable)
-    }
 }
 
 #[async_trait]
 impl ApiKeyStore for PostgresApiKeyStore {
-    async fn find_by_key_id(
-        &self,
-        key_id: &ApiKeyId,
-    ) -> Result<Option<CredentialContext>, StoreError> {
+    async fn find_by_key_id(&self, key_id: &ApiKeyId) -> Result<Option<Credential>, StoreError> {
         let row = sqlx::query(
             r#"
             SELECT
@@ -73,7 +30,6 @@ impl ApiKeyStore for PostgresApiKeyStore {
                 k.client_id,
                 k.verifier,
                 k.verifier_version,
-                k.created_at,
                 k.expires_at,
                 k.revoked_at,
                 c.tenant_id,
@@ -91,7 +47,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
             GROUP BY k.key_id, c.id, t.id
             "#,
         )
-        .bind(&key_id.0)
+        .bind(key_id.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(unavailable)?;
@@ -122,22 +78,24 @@ impl ApiKeyStore for PostgresApiKeyStore {
             .map_err(decode)?;
 
         let scopes: Vec<String> = row.try_get("scopes").map_err(decode)?;
+        let tenant_id = TenantId(
+            row.try_get("tenant_id")
+                .map_err(decode)?,
+        );
+        let client_id = ClientId(
+            row.try_get("client_id")
+                .map_err(decode)?,
+        );
 
-        Ok(Some(CredentialContext {
+        Ok(Some(Credential {
             key: ApiKeyRecord {
                 key_id: ApiKeyId(row.try_get("key_id").map_err(decode)?),
-                client_id: ClientId(
-                    row.try_get("client_id")
-                        .map_err(decode)?,
-                ),
+                client_id: client_id.clone(),
                 verifier: SecretVerifier(verifier),
                 verifier_version,
                 scopes: scopes
                     .into_iter()
                     .collect::<HashSet<_>>(),
-                created_at: row
-                    .try_get("created_at")
-                    .map_err(decode)?,
                 expires_at: row
                     .try_get("expires_at")
                     .map_err(decode)?,
@@ -146,21 +104,12 @@ impl ApiKeyStore for PostgresApiKeyStore {
                     .map_err(decode)?,
             },
             client: Client {
-                id: ClientId(
-                    row.try_get("client_id")
-                        .map_err(decode)?,
-                ),
-                tenant_id: TenantId(
-                    row.try_get("tenant_id")
-                        .map_err(decode)?,
-                ),
+                id: client_id,
+                tenant_id: tenant_id.clone(),
                 status: parse_status(&client_status)?,
             },
             tenant: Tenant {
-                id: TenantId(
-                    row.try_get("tenant_id")
-                        .map_err(decode)?,
-                ),
+                id: tenant_id,
                 status: parse_status(&tenant_status)?,
             },
         }))
@@ -168,9 +117,10 @@ impl ApiKeyStore for PostgresApiKeyStore {
 
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError> {
         let result = sqlx::query(
-            "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, now()) WHERE key_id = $1",
+            "UPDATE api_keys SET revoked_at = now()
+             WHERE key_id = $1 AND revoked_at IS NULL",
         )
-        .bind(&key_id.0)
+        .bind(key_id.as_str())
         .execute(&self.pool)
         .await
         .map_err(unavailable)?;
@@ -178,8 +128,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn insert_credential(&self, credential: CredentialContext) -> Result<(), StoreError> {
-        let key = &credential.key;
+    async fn insert_key(&self, key: NewApiKey) -> Result<(), StoreError> {
         let mut transaction = self
             .pool
             .begin()
@@ -189,28 +138,26 @@ impl ApiKeyStore for PostgresApiKeyStore {
         sqlx::query(
             r#"
             INSERT INTO api_keys
-                (key_id, client_id, verifier, verifier_version, created_at, expires_at, revoked_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (key_id, client_id, verifier, verifier_version, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
-        .bind(&key.key_id.0)
-        .bind(&key.client_id.0)
+        .bind(key.key_id.as_str())
+        .bind(key.client_id.as_str())
         .bind(key.verifier.0.to_vec())
         .bind(i16::from(key.verifier_version))
-        .bind(key.created_at)
         .bind(key.expires_at)
-        .bind(key.revoked_at)
         .execute(&mut *transaction)
         .await
         .map_err(insert_error)?;
 
-        let scopes: Vec<String> = key.scopes.iter().cloned().collect();
+        let scopes: Vec<String> = key.scopes.into_iter().collect();
 
         sqlx::query(
             "INSERT INTO api_key_scopes (key_id, scope)
              SELECT $1, unnest($2::text[])",
         )
-        .bind(&key.key_id.0)
+        .bind(key.key_id.as_str())
         .bind(&scopes)
         .execute(&mut *transaction)
         .await
@@ -238,20 +185,23 @@ fn unavailable(error: sqlx::Error) -> StoreError {
 }
 
 fn insert_error(error: sqlx::Error) -> StoreError {
-    if let sqlx::Error::Database(database) = &error
-        && database.code().as_deref() == Some("23505")
-    {
+    if is_unique_violation(&error) {
         return StoreError::DuplicateKey;
     }
 
     unavailable(error)
 }
 
+pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some("23505"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
     use std::collections::HashSet;
+
+    use sqlx::postgres::PgPoolOptions;
 
     /// Runs against a real Postgres. Skipped when DATABASE_URL is unset so the
     /// default `cargo test` stays hermetic.
@@ -279,47 +229,38 @@ mod tests {
         format!("{prefix}-{}-{nanos}", std::process::id())
     }
 
-    fn credential(
-        tenant_id: &TenantId,
-        client_id: &ClientId,
-        key_id: &ApiKeyId,
-    ) -> CredentialContext {
-        CredentialContext {
-            key: ApiKeyRecord {
-                key_id: key_id.clone(),
-                client_id: client_id.clone(),
-                verifier: SecretVerifier([7_u8; 32]),
-                verifier_version: 1,
-                scopes: HashSet::from(["people:read".to_owned()]),
-                created_at: time::OffsetDateTime::now_utc(),
-                expires_at: None,
-                revoked_at: None,
-            },
-            client: Client {
-                id: client_id.clone(),
-                tenant_id: tenant_id.clone(),
-                status: AccountStatus::Active,
-            },
-            tenant: Tenant {
-                id: tenant_id.clone(),
-                status: AccountStatus::Active,
-            },
-        }
+    async fn provision(pool: &PgPool) -> (TenantId, ClientId) {
+        let tenant_id = TenantId(unique("tenant"));
+        let client_id = ClientId(unique("client"));
+
+        sqlx::query("INSERT INTO tenants (id, status) VALUES ($1, 'active')")
+            .bind(tenant_id.as_str())
+            .execute(pool)
+            .await
+            .expect("insert tenant");
+        sqlx::query("INSERT INTO clients (id, tenant_id, status) VALUES ($1, $2, 'active')")
+            .bind(client_id.as_str())
+            .bind(tenant_id.as_str())
+            .execute(pool)
+            .await
+            .expect("insert client");
+
+        (tenant_id, client_id)
     }
 
     async fn cleanup(pool: &PgPool, tenant_id: &TenantId, client_id: &ClientId) {
         sqlx::query("DELETE FROM api_keys WHERE client_id = $1")
-            .bind(&client_id.0)
+            .bind(client_id.as_str())
             .execute(pool)
             .await
             .ok();
         sqlx::query("DELETE FROM clients WHERE id = $1")
-            .bind(&client_id.0)
+            .bind(client_id.as_str())
             .execute(pool)
             .await
             .ok();
         sqlx::query("DELETE FROM tenants WHERE id = $1")
-            .bind(&tenant_id.0)
+            .bind(tenant_id.as_str())
             .execute(pool)
             .await
             .ok();
@@ -332,27 +273,21 @@ mod tests {
             return;
         };
 
-        let tenant_id = TenantId(unique("tenant"));
-        let client_id = ClientId(unique("client"));
+        let (tenant_id, client_id) = provision(&pool).await;
         let key_id = ApiKeyId(unique("key"));
 
-        sqlx::query("INSERT INTO tenants (id, status) VALUES ($1, 'active')")
-            .bind(&tenant_id.0)
-            .execute(&pool)
-            .await
-            .expect("insert tenant");
-        sqlx::query("INSERT INTO clients (id, tenant_id, status) VALUES ($1, $2, 'active')")
-            .bind(&client_id.0)
-            .bind(&tenant_id.0)
-            .execute(&pool)
-            .await
-            .expect("insert client");
-
         let store = PostgresApiKeyStore::new(pool.clone());
-        let credential = credential(&tenant_id, &client_id, &key_id);
+        let key = NewApiKey {
+            key_id: key_id.clone(),
+            client_id: client_id.clone(),
+            verifier: SecretVerifier([7_u8; 32]),
+            verifier_version: 2,
+            scopes: HashSet::from(["read".to_owned()]),
+            expires_at: None,
+        };
 
         store
-            .insert_credential(credential.clone())
+            .insert_key(key.clone())
             .await
             .expect("insert credential");
 
@@ -366,13 +301,11 @@ mod tests {
         assert_eq!(found.client.id, client_id);
         assert_eq!(found.tenant.id, tenant_id);
         assert_eq!(found.key.verifier.0, [7_u8; 32]);
-        assert_eq!(found.key.scopes, credential.key.scopes);
+        assert_eq!(found.key.scopes, key.scopes);
         assert!(found.key.revoked_at.is_none());
 
         assert!(matches!(
-            store
-                .insert_credential(credential)
-                .await,
+            store.insert_key(key).await,
             Err(StoreError::DuplicateKey)
         ));
 

@@ -36,3 +36,8 @@ db-down:
 
 db-logs:
     docker compose logs -f db
+
+# Register the demo upstream and route (idempotent)
+demo-route:
+    cargo run --quiet -- admin upstream put swapi --base-url https://swapi.dev/api
+    cargo run --quiet -- admin route put swapi-people --prefix /swapi --upstream swapi --scope read

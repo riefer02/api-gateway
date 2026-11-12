@@ -1,13 +1,13 @@
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderValue, request::Parts},
+    http::{HeaderMap, HeaderValue, header, request::Parts},
     response::{IntoResponse, Response},
 };
 use reqwest::Url;
 
-use crate::{error::AppError, request_context, state::AppState};
+use crate::{error::AppError, request_context, routing::CompiledRoute};
 
-/// Headers that are meaningful only for a single hop and must not be forwarded.
+/// Meaningful only for a single hop; must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -20,49 +20,69 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-/// Gateway-owned credentials and framing headers: never forwarded upstream.
-const GATEWAY_OWNED_REQUEST: &[&str] = &["host", "content-length", "authorization", "cookie"];
+/// Gateway credentials and framing headers: never forwarded upstream.
+const GATEWAY_OWNED_REQUEST: &[&str] = &["host", "authorization", "cookie"];
+
+/// Client-supplied forwarding headers are dropped until the trusted-proxy
+/// model lands; otherwise any caller can spoof its origin.
+const FORWARDED_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
 
 /// Upstream identity headers: never forwarded to clients.
 const GATEWAY_OWNED_RESPONSE: &[&str] = &["server", "set-cookie"];
 
 pub(crate) async fn forward(
-    state: &AppState,
     request: axum::extract::Request,
-    path: &str,
+    route: &CompiledRoute,
 ) -> Result<Response, AppError> {
     let (parts, body) = request.into_parts();
-    let url = upstream_url(&state.upstream_base_url, path, parts.uri.query())?;
+    let path = route.upstream_path(parts.uri.path());
+    let url = upstream_url(&route.upstream.base_url, &path, parts.uri.query())?;
     let headers = outbound_headers(&parts);
 
-    let upstream = state
+    let send = route
+        .upstream
         .client
         .request(parts.method, url)
         .headers(headers)
         .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-        .send()
-        .await
-        .map_err(upstream_error)?;
+        .send();
+
+    // Only the wait for response headers is bounded. Once headers arrive the
+    // body streams under the inbound deadline instead of being truncated by
+    // the upstream timeout.
+    let upstream = match tokio::time::timeout(route.upstream.timeout, send).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return Err(upstream_error(error)),
+        Err(_) => {
+            tracing::warn!(
+                upstream = route.upstream.id.as_str(),
+                "upstream did not return headers in time"
+            );
+            return Err(AppError::UpstreamTimeout);
+        }
+    };
 
     Ok(into_gateway_response(upstream))
 }
 
 fn upstream_url(base: &Url, path: &str, query: Option<&str>) -> Result<Url, AppError> {
-    let mut url = base.clone();
+    // Concatenate instead of pushing path segments: `path` is already
+    // percent-encoded, and pushing would double-encode every escape.
+    let base = base.as_str().trim_end_matches('/');
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
 
-    {
-        let mut segments = url.path_segments_mut().map_err(|_| {
-            AppError::internal("configured upstream URL cannot accept path segments")
-        })?;
-
-        segments.pop_if_empty();
-        for segment in path.split('/') {
-            if segment.is_empty() || segment == "." || segment == ".." {
-                continue;
-            }
-            segments.push(segment);
-        }
-    }
+    let mut url = Url::parse(&format!("{base}{path}"))
+        .map_err(|error| AppError::internal(format!("could not build upstream URL: {error}")))?;
 
     url.set_query(query);
 
@@ -70,16 +90,17 @@ fn upstream_url(base: &Url, path: &str, query: Option<&str>) -> Result<Url, AppE
 }
 
 fn outbound_headers(parts: &Parts) -> HeaderMap {
+    let connection_tokens = connection_tokens(&parts.headers);
     let mut headers = HeaderMap::new();
 
     for (name, value) in &parts.headers {
         let name_str = name.as_str();
 
-        if HOP_BY_HOP.contains(&name_str) || GATEWAY_OWNED_REQUEST.contains(&name_str) {
+        if is_dropped_request_header(name_str, &connection_tokens) {
             continue;
         }
 
-        headers.insert(name.clone(), value.clone());
+        headers.append(name.clone(), value.clone());
     }
 
     if let Some(request_id) = request_context::current()
@@ -91,6 +112,27 @@ fn outbound_headers(parts: &Parts) -> HeaderMap {
     headers
 }
 
+fn is_dropped_request_header(name: &str, connection_tokens: &[String]) -> bool {
+    HOP_BY_HOP.contains(&name)
+        || GATEWAY_OWNED_REQUEST.contains(&name)
+        || FORWARDED_HEADERS.contains(&name)
+        || connection_tokens
+            .iter()
+            .any(|token| token == name)
+}
+
+/// RFC 7230: headers named by `Connection` are hop-by-hop too.
+fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
 fn into_gateway_response(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let headers = inbound_headers(upstream.headers());
@@ -100,16 +142,22 @@ fn into_gateway_response(upstream: reqwest::Response) -> Response {
 }
 
 fn inbound_headers(headers: &HeaderMap) -> HeaderMap {
+    let connection_tokens = connection_tokens(headers);
     let mut forwarded = HeaderMap::new();
 
     for (name, value) in headers {
         let name_str = name.as_str();
 
-        if HOP_BY_HOP.contains(&name_str) || GATEWAY_OWNED_RESPONSE.contains(&name_str) {
+        if HOP_BY_HOP.contains(&name_str)
+            || GATEWAY_OWNED_RESPONSE.contains(&name_str)
+            || connection_tokens
+                .iter()
+                .any(|token| token == name_str)
+        {
             continue;
         }
 
-        forwarded.insert(name.clone(), value.clone());
+        forwarded.append(name.clone(), value.clone());
     }
 
     forwarded
@@ -128,66 +176,16 @@ fn upstream_error(error: reqwest::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::time::Duration;
 
-    use axum::{
-        body::to_bytes,
-        http::{Request, StatusCode},
-    };
-    use sqlx::postgres::PgPoolOptions;
+    use axum::{body::to_bytes, http::StatusCode};
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
 
-    use crate::{app, auth, auth::store::InMemoryApiKeyStore, config::Config, state::AppState};
-
-    const SECRET: &str = "test-secret";
-
-    fn test_config(upstream_url: &str) -> Config {
-        let source = HashMap::from([
-            ("APP_ENV".to_owned(), "development".to_owned()),
-            (
-                "DATABASE_URL".to_owned(),
-                "postgres://test:test@127.0.0.1:5432/test".to_owned(),
-            ),
-            ("UPSTREAM_BASE_URL".to_owned(), upstream_url.to_owned()),
-            ("UPSTREAM_TIMEOUT_SECS".to_owned(), "1".to_owned()),
-        ]);
-
-        Config::from_source(&source).expect("test configuration")
-    }
-
-    async fn test_app(upstream: &MockServer) -> (axum::Router, Config) {
-        let config = test_config(&upstream.uri());
-        let store = InMemoryApiKeyStore::default();
-        auth::seed_dev_credential(&store, SECRET)
-            .await
-            .expect("seed credential");
-
-        let state = AppState {
-            db: PgPoolOptions::new()
-                .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
-                .expect("lazy pool"),
-            client: reqwest::Client::builder()
-                .timeout(config.upstream.timeout)
-                .build()
-                .expect("client"),
-            upstream_base_url: config.upstream.base_url.clone(),
-            api_key_store: Arc::new(store),
-        };
-
-        (app::build_app(&config, state), config)
-    }
-
-    fn authorized(uri: &str) -> Request<Body> {
-        Request::builder()
-            .uri(uri)
-            .header("authorization", format!("Bearer dev-local.{SECRET}"))
-            .body(Body::empty())
-            .expect("request")
-    }
+    use crate::testing;
 
     #[tokio::test]
     async fn proxies_status_headers_and_body() {
@@ -204,9 +202,9 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let (app, _config) = test_app(&upstream).await;
+        let (app, token) = testing::app(&upstream.uri(), Duration::from_secs(2));
         let response = app
-            .oneshot(authorized("/swapi/people/1"))
+            .oneshot(testing::authorized("/swapi/people/1", &token))
             .await
             .unwrap();
 
@@ -247,8 +245,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let (app, _config) = test_app(&upstream).await;
-        app.oneshot(authorized("/swapi/people/1"))
+        let (app, token) = testing::app(&upstream.uri(), Duration::from_secs(2));
+        app.oneshot(testing::authorized("/swapi/people/1", &token))
             .await
             .unwrap();
 
@@ -279,9 +277,9 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let (app, _config) = test_app(&upstream).await;
+        let (app, token) = testing::app(&upstream.uri(), Duration::from_secs(2));
         let response = app
-            .oneshot(authorized("/swapi/people/1"))
+            .oneshot(testing::authorized("/swapi/people/1", &token))
             .await
             .unwrap();
 
@@ -302,9 +300,9 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let (app, _config) = test_app(&upstream).await;
+        let (app, token) = testing::app(&upstream.uri(), Duration::from_millis(200));
         let response = app
-            .oneshot(authorized("/swapi/people/1"))
+            .oneshot(testing::authorized("/swapi/people/1", &token))
             .await
             .unwrap();
 
@@ -315,17 +313,17 @@ mod tests {
     fn joins_base_path_and_segments() {
         let base = Url::parse("https://swapi.dev/api").unwrap();
 
-        let url = upstream_url(&base, "people/1", Some("page=2")).unwrap();
+        let url = upstream_url(&base, "/people/1", Some("page=2")).unwrap();
 
         assert_eq!(url.as_str(), "https://swapi.dev/api/people/1?page=2");
     }
 
     #[test]
-    fn drops_traversal_segments() {
+    fn preserves_percent_encoding() {
         let base = Url::parse("https://swapi.dev/api").unwrap();
 
-        let url = upstream_url(&base, "../../admin", None).unwrap();
+        let url = upstream_url(&base, "/people/a%20b", None).unwrap();
 
-        assert_eq!(url.as_str(), "https://swapi.dev/api/admin");
+        assert_eq!(url.as_str(), "https://swapi.dev/api/people/a%20b");
     }
 }

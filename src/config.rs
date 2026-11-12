@@ -1,7 +1,5 @@
 use std::{collections::HashMap, fmt, str::FromStr, time::Duration};
 
-use reqwest::Url;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppEnvironment {
     Development,
@@ -12,7 +10,17 @@ impl AppEnvironment {
     pub fn is_production(self) -> bool {
         matches!(self, Self::Production)
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Production => "production",
+        }
+    }
 }
+
+/// Development-only pepper. Production must set `AUTH_PEPPER`.
+pub const DEVELOPMENT_PEPPER: &str = "development-only-pepper";
 
 /// A string that is safe to `Debug` but must be explicitly exposed.
 #[derive(Clone)]
@@ -41,7 +49,7 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub telemetry: TelemetryConfig,
     pub auth: AuthConfig,
-    pub upstream: UpstreamConfig,
+    pub routing: RoutingConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -69,14 +77,18 @@ pub struct TelemetryConfig {
 
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
+    /// Server-side pepper mixed into every key verifier. Rotating it
+    /// invalidates all keys derived with the previous value.
+    pub pepper: SecretString,
     pub dev_api_key_secret: Option<SecretString>,
+    pub dev_api_key_scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-pub struct UpstreamConfig {
-    pub base_url: Url,
-    pub timeout: Duration,
+pub struct RoutingConfig {
+    /// Empty means "allow any host"; production requires a non-empty list.
     pub allow_hosts: Vec<String>,
+    pub refresh_interval: Duration,
 }
 
 /// Anything that can supply environment-style key/value pairs.
@@ -166,25 +178,25 @@ impl Config {
             otlp_endpoint: non_empty(source.get("OTEL_EXPORTER_OTLP_ENDPOINT")),
         };
 
+        let auth_pepper = non_empty(source.get("AUTH_PEPPER"));
+        if environment.is_production() && auth_pepper.is_none() {
+            problems.push("AUTH_PEPPER is required in production".to_owned());
+        }
+
         let auth = AuthConfig {
+            pepper: SecretString::new(auth_pepper.unwrap_or_else(|| DEVELOPMENT_PEPPER.to_owned())),
             dev_api_key_secret: non_empty(source.get("DEV_API_KEY_SECRET")).map(SecretString::new),
+            dev_api_key_scopes: dev_scopes(source.get("DEV_API_KEY_SCOPES")),
         };
 
-        let base_url_raw = non_empty(source.get("UPSTREAM_BASE_URL"))
-            .or_else(|| non_empty(source.get("SWAPI_BASE_URL")))
-            .unwrap_or_else(|| "https://swapi.dev/api".to_owned());
-        let base_url = match Url::parse(&base_url_raw) {
-            Ok(url) => Some(url),
-            Err(error) => {
-                problems.push(format!("UPSTREAM_BASE_URL is not a valid URL: {error}"));
-                None
-            }
-        };
-
-        let upstream = UpstreamConfig {
-            base_url: base_url.unwrap_or_else(placeholder_url),
-            timeout: seconds_or(source, "UPSTREAM_TIMEOUT_SECS", 10, &mut problems),
+        let routing = RoutingConfig {
             allow_hosts: csv(source.get("UPSTREAM_ALLOW_HOSTS")),
+            refresh_interval: Duration::from_millis(number_or(
+                source,
+                "ROUTE_REFRESH_INTERVAL_MS",
+                2_000_u64,
+                &mut problems,
+            )),
         };
 
         validate(
@@ -192,7 +204,7 @@ impl Config {
             &database,
             &auth,
             &environment,
-            &upstream,
+            &routing,
             &mut problems,
         );
         validate_log_filter(&telemetry.log_level, &mut problems);
@@ -207,7 +219,7 @@ impl Config {
             database,
             telemetry,
             auth,
-            upstream,
+            routing,
         })
     }
 }
@@ -217,7 +229,7 @@ fn validate(
     database: &DatabaseConfig,
     auth: &AuthConfig,
     environment: &AppEnvironment,
-    upstream: &UpstreamConfig,
+    routing: &RoutingConfig,
     problems: &mut Vec<String>,
 ) {
     if server.port == 0 {
@@ -245,15 +257,8 @@ fn validate(
         problems.push("DATABASE_URL must start with postgres:// or postgresql://".to_owned());
     }
 
-    let scheme = upstream.base_url.scheme();
-    if scheme != "http" && scheme != "https" {
-        problems.push("UPSTREAM_BASE_URL must use http or https".to_owned());
-    }
-    if !upstream.base_url.username().is_empty() || upstream.base_url.password().is_some() {
-        problems.push("UPSTREAM_BASE_URL must not contain credentials".to_owned());
-    }
-    if upstream.timeout.is_zero() {
-        problems.push("UPSTREAM_TIMEOUT_SECS must be greater than zero".to_owned());
+    if routing.refresh_interval.is_zero() {
+        problems.push("ROUTE_REFRESH_INTERVAL_MS must be greater than zero".to_owned());
     }
 
     if environment.is_production() {
@@ -261,21 +266,7 @@ fn validate(
             problems.push("DEV_API_KEY_SECRET must not be set in production".to_owned());
         }
 
-        if !upstream.allow_hosts.is_empty() {
-            let host = upstream
-                .base_url
-                .host_str()
-                .unwrap_or_default();
-            if !upstream
-                .allow_hosts
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(host))
-            {
-                problems.push(format!(
-                    "UPSTREAM_BASE_URL host `{host}` is not listed in UPSTREAM_ALLOW_HOSTS"
-                ));
-            }
-        } else {
+        if routing.allow_hosts.is_empty() {
             problems
                 .push("UPSTREAM_ALLOW_HOSTS must list at least one host in production".to_owned());
         }
@@ -290,13 +281,6 @@ fn validate_log_filter(filter: &str, problems: &mut Vec<String>) {
 
 fn has_postgres_scheme(url: &str) -> bool {
     url.starts_with("postgres://") || url.starts_with("postgresql://")
-}
-
-/// Never returned to callers: construction only succeeds when parsing did.
-fn placeholder_url() -> Url {
-    "http://invalid.local"
-        .parse()
-        .expect("static URL is valid")
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -359,6 +343,16 @@ fn csv(value: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn dev_scopes(value: Option<String>) -> Vec<String> {
+    let scopes = csv(value);
+
+    if scopes.is_empty() {
+        vec!["read".to_owned()]
+    } else {
+        scopes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,7 +381,8 @@ mod tests {
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.request_timeout, Duration::from_secs(15));
         assert!(config.auth.dev_api_key_secret.is_none());
-        assert!(config.upstream.allow_hosts.is_empty());
+        assert!(config.routing.allow_hosts.is_empty());
+        assert_eq!(config.auth.pepper.expose(), DEVELOPMENT_PEPPER);
     }
 
     #[test]
@@ -442,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn production_rejects_unlisted_upstream_host() {
+    fn production_requires_a_pepper() {
         let config = source(&[
             ("APP_ENV", "production"),
             (
@@ -457,8 +452,23 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("not listed in UPSTREAM_ALLOW_HOSTS")
+                .contains("AUTH_PEPPER")
         );
+    }
+
+    #[test]
+    fn parses_allowlist_and_development_scopes() {
+        let mut values = valid_development();
+        values.insert(
+            "UPSTREAM_ALLOW_HOSTS".to_owned(),
+            "Example.com, api.test".to_owned(),
+        );
+        values.insert("DEV_API_KEY_SCOPES".to_owned(), "read, write".to_owned());
+
+        let config = Config::from_source(&values).expect("valid config");
+
+        assert_eq!(config.routing.allow_hosts, vec!["example.com", "api.test"]);
+        assert_eq!(config.auth.dev_api_key_scopes, vec!["read", "write"]);
     }
 
     #[test]

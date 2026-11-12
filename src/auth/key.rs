@@ -1,93 +1,97 @@
-// TODO(W3): the issue/rotate/revoke flow in the admin service is the first
-// consumer; remove this allow when it lands.
-#![allow(dead_code)]
-
-use super::ApiKeyId;
-
 use std::collections::HashSet;
+
 use time::OffsetDateTime;
 
-use super::{
-    AccountStatus, ApiKeyRecord, Client, CredentialContext, Tenant, hash_secret,
-    store::{InMemoryApiKeyStore, StoreError},
-};
+use super::store::NewApiKey;
+use super::verifier::VERIFIER_VERSION;
+use super::{ApiKeyId, ClientId, KeyVerifier};
 
-pub(crate) fn generate_key_id() -> Result<ApiKeyId, getrandom::Error> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes)?;
+const KEY_ID_BYTES: usize = 16;
+const SECRET_BYTES: usize = 32;
 
-    Ok(ApiKeyId(hex::encode(bytes)))
-}
-
-pub(crate) fn generate_secret() -> Result<String, getrandom::Error> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)?;
-
-    Ok(hex::encode(bytes))
-}
-
-pub(crate) fn generate_key_and_secret() -> Result<(ApiKeyId, String), getrandom::Error> {
-    let key_id = generate_key_id()?;
-    let secret = generate_secret()?;
-
-    Ok((key_id, secret))
-}
-
-#[derive(Debug)]
-pub(crate) enum IssueKeyError {
-    Random(getrandom::Error),
-    Store(StoreError),
-    TenantMismatch,
-    InactiveAccount,
-    KeyIdCollision,
-    InvalidExpiration,
-}
-
-pub(crate) fn issue_api_key(
-    store: &InMemoryApiKeyStore,
-    client: &Client,
-    tenant: &Tenant,
+/// Generates a key id and a high-entropy secret, returning the write model
+/// and the plaintext secret. The secret is shown exactly once.
+pub(crate) fn generate(
+    verifier: &KeyVerifier,
+    client_id: ClientId,
     scopes: HashSet<String>,
     expires_at: Option<OffsetDateTime>,
-) -> Result<String, IssueKeyError> {
-    let now = OffsetDateTime::now_utc();
+) -> Result<(NewApiKey, String), getrandom::Error> {
+    let mut id_bytes = [0_u8; KEY_ID_BYTES];
+    getrandom::fill(&mut id_bytes)?;
 
-    if client.tenant_id != tenant.id {
-        return Err(IssueKeyError::TenantMismatch);
+    let mut secret_bytes = [0_u8; SECRET_BYTES];
+    getrandom::fill(&mut secret_bytes)?;
+
+    let key_id = ApiKeyId(hex::encode(id_bytes));
+    let secret = hex::encode(secret_bytes);
+
+    let key = NewApiKey {
+        key_id,
+        client_id,
+        verifier: verifier.verifier_for(&secret),
+        verifier_version: VERIFIER_VERSION,
+        scopes,
+        expires_at,
+    };
+
+    Ok((key, secret))
+}
+
+/// Wire format: `<key_id>.<secret>`. The id is public, the secret is not.
+pub(crate) fn token(key_id: &ApiKeyId, secret: &str) -> String {
+    format!("{key_id}.{secret}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SecretString;
+
+    fn verifier() -> KeyVerifier {
+        KeyVerifier::new(SecretString::new("test-pepper"))
     }
 
-    if client.status != AccountStatus::Active || tenant.status != AccountStatus::Active {
-        return Err(IssueKeyError::InactiveAccount);
+    #[test]
+    fn generates_distinct_keys() {
+        let (first, first_secret) = generate(
+            &verifier(),
+            ClientId("client".to_owned()),
+            HashSet::from(["read".to_owned()]),
+            None,
+        )
+        .expect("generate");
+
+        let (second, second_secret) = generate(
+            &verifier(),
+            ClientId("client".to_owned()),
+            HashSet::from(["read".to_owned()]),
+            None,
+        )
+        .expect("generate");
+
+        assert_ne!(first.key_id, second.key_id);
+        assert_ne!(first_secret, second_secret);
+        assert_eq!(first_secret.len(), SECRET_BYTES * 2);
+        assert_eq!(first.key_id.0.len(), KEY_ID_BYTES * 2);
     }
 
-    if expires_at.is_some_and(|expiry| expiry <= now) {
-        return Err(IssueKeyError::InvalidExpiration);
+    #[test]
+    fn token_round_trips_through_the_wire_format() {
+        let (key, secret) = generate(
+            &verifier(),
+            ClientId("client".to_owned()),
+            HashSet::new(),
+            None,
+        )
+        .expect("generate");
+
+        let token = token(&key.key_id, &secret);
+        let (key_id, parsed_secret) = token
+            .split_once('.')
+            .expect("wire format");
+
+        assert_eq!(key_id, key.key_id.as_str());
+        assert_eq!(parsed_secret, secret);
     }
-
-    for _ in 0..3 {
-        let (key_id, secret) = generate_key_and_secret().map_err(IssueKeyError::Random)?;
-
-        let credential = CredentialContext {
-            key: ApiKeyRecord {
-                key_id: key_id.clone(),
-                client_id: client.id.clone(),
-                verifier: hash_secret(&secret),
-                verifier_version: 1,
-                scopes: scopes.clone(),
-                created_at: now,
-                expires_at,
-                revoked_at: None,
-            },
-            client: client.clone(),
-            tenant: tenant.clone(),
-        };
-
-        match store.insert(credential) {
-            Ok(()) => return Ok(format!("{}.{}", key_id.0, secret)),
-            Err(StoreError::DuplicateKey) => continue,
-            Err(error) => return Err(IssueKeyError::Store(error)),
-        }
-    }
-
-    Err(IssueKeyError::KeyIdCollision)
 }

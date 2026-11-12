@@ -1,21 +1,41 @@
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use subtle::ConstantTimeEq;
+use std::fmt;
+
+use axum::http::{HeaderMap, header};
 use time::OffsetDateTime;
 
+use crate::error::AppError;
+use crate::state::AppState;
+
 pub(crate) mod key;
-pub(crate) mod middleware;
-pub(crate) mod scopes;
 pub(crate) mod store;
+pub(crate) mod verifier;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct TenantId(pub(crate) String);
+pub(crate) use verifier::KeyVerifier;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ClientId(pub(crate) String);
+/// Newtype identifiers: no accidental mixing of a tenant id with a key id.
+macro_rules! identifier {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+        pub(crate) struct $name(pub(crate) String);
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ApiKeyId(pub(crate) String);
+        impl $name {
+            pub(crate) fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+identifier!(TenantId);
+identifier!(ClientId);
+identifier!(ApiKeyId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AccountStatus {
@@ -24,13 +44,6 @@ pub(crate) enum AccountStatus {
 }
 
 impl AccountStatus {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Suspended => "suspended",
-        }
-    }
-
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "active" => Some(Self::Active),
@@ -40,9 +53,6 @@ impl AccountStatus {
     }
 }
 
-pub(crate) const DEV_TENANT_ID: &str = "tenant-local";
-pub(crate) const DEV_CLIENT_ID: &str = "client-local";
-pub(crate) const DEV_KEY_ID: &str = "dev-local";
 #[derive(Clone)]
 pub(crate) struct Tenant {
     pub(crate) id: TenantId,
@@ -56,8 +66,7 @@ pub(crate) struct Client {
     pub(crate) status: AccountStatus,
 }
 
-// Holds a 32-byte verifier, never the raw API key.
-// We’ll implement how it’s calculated in a later step.
+/// A 32-byte verifier, never the raw API key.
 #[derive(Clone)]
 pub(crate) struct SecretVerifier(pub(crate) [u8; 32]);
 
@@ -68,26 +77,25 @@ pub(crate) struct ApiKeyRecord {
     pub(crate) verifier: SecretVerifier,
     pub(crate) verifier_version: u8,
     pub(crate) scopes: HashSet<String>,
-    #[allow(dead_code)] // TODO(W9): surfaced as key metadata once the admin plane reads it.
-    pub(crate) created_at: OffsetDateTime,
     pub(crate) expires_at: Option<OffsetDateTime>,
     pub(crate) revoked_at: Option<OffsetDateTime>,
 }
 
-// Constructed after successful authentication; safe to pass to handlers.
+/// Read model for one authentication attempt.
+#[derive(Clone)]
+pub(crate) struct Credential {
+    pub(crate) key: ApiKeyRecord,
+    pub(crate) client: Client,
+    pub(crate) tenant: Tenant,
+}
+
+/// Constructed after successful authentication; safe to pass to handlers.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {
     pub(crate) tenant_id: TenantId,
     pub(crate) client_id: ClientId,
     pub(crate) key_id: ApiKeyId,
     pub(crate) scopes: HashSet<String>,
-}
-
-#[derive(Clone)]
-pub(crate) struct CredentialContext {
-    pub(crate) key: ApiKeyRecord,
-    pub(crate) client: Client,
-    pub(crate) tenant: Tenant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -97,15 +105,23 @@ pub(crate) enum AuthError {
     StoreUnavailable,
 }
 
-fn hash_secret(secret: &str) -> SecretVerifier {
-    let digest = Sha256::digest(secret.as_bytes());
-    let mut bytes = [0_u8; 32];
-    bytes.copy_from_slice(&digest);
-    SecretVerifier(bytes)
+impl AuthError {
+    fn into_app_error(self) -> AppError {
+        match self {
+            Self::InvalidCredentials => AppError::Unauthorized,
+            Self::Forbidden => AppError::Forbidden,
+            Self::StoreUnavailable => AppError::ServiceUnavailable,
+        }
+    }
 }
 
+/// Authenticates a bearer token against the credential store.
+///
+/// Every failure is indistinguishable to the client except forbidden-vs-
+/// unauthenticated, so key material cannot be probed.
 pub(crate) async fn verify_api_key(
     store: &dyn store::ApiKeyStore,
+    verifier: &KeyVerifier,
     key_id: &ApiKeyId,
     secret: &str,
 ) -> Result<ClientIdentity, AuthError> {
@@ -115,29 +131,11 @@ pub(crate) async fn verify_api_key(
         .map_err(|_| AuthError::StoreUnavailable)?
         .ok_or(AuthError::InvalidCredentials)?;
 
-    if credential.key.verifier_version != 1 {
+    if !verifier.matches(&credential.key, secret) {
         return Err(AuthError::InvalidCredentials);
     }
 
-    let candidate = hash_secret(secret);
-    let matches = bool::from(
-        candidate
-            .0
-            .ct_eq(&credential.key.verifier.0),
-    );
-
-    if !matches {
-        return Err(AuthError::InvalidCredentials);
-    }
-
-    let now = OffsetDateTime::now_utc();
-
-    if credential.key.revoked_at.is_some()
-        || credential
-            .key
-            .expires_at
-            .is_some_and(|expires| expires <= now)
-    {
+    if credential.key.revoked_at.is_some() || is_expired(&credential.key) {
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -161,99 +159,230 @@ pub(crate) async fn verify_api_key(
     })
 }
 
-pub(crate) async fn seed_dev_credential(
-    store: &dyn store::ApiKeyStore,
-    secret: &str,
-) -> Result<(), store::StoreError> {
-    let tenant_id = TenantId(DEV_TENANT_ID.to_owned());
-    let client_id = ClientId(DEV_CLIENT_ID.to_owned());
-    let key_id = ApiKeyId(DEV_KEY_ID.to_owned());
+fn is_expired(key: &ApiKeyRecord) -> bool {
+    key.expires_at
+        .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
+}
 
-    store
-        .insert_credential(CredentialContext {
-            key: ApiKeyRecord {
-                key_id,
-                client_id: client_id.clone(),
-                verifier: hash_secret(secret),
-                verifier_version: 1,
-                scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
-                created_at: OffsetDateTime::now_utc(),
-                expires_at: None,
-                revoked_at: None,
-            },
-            client: Client {
-                id: client_id,
-                tenant_id: tenant_id.clone(),
-                status: AccountStatus::Active,
-            },
-            tenant: Tenant {
-                id: tenant_id,
-                status: AccountStatus::Active,
-            },
-        })
-        .await
+pub(crate) async fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ClientIdentity, AppError> {
+    let token = bearer_token(headers).ok_or(AppError::Unauthorized)?;
+    let (key_id, secret) = token
+        .split_once('.')
+        .ok_or(AppError::Unauthorized)?;
+
+    if key_id.is_empty() || secret.is_empty() {
+        return Err(AppError::Unauthorized);
+    }
+
+    let identity = verify_api_key(
+        state.api_key_store.as_ref(),
+        &state.verifier,
+        &ApiKeyId(key_id.to_owned()),
+        secret,
+    )
+    .await
+    .map_err(AuthError::into_app_error)?;
+
+    let span = tracing::Span::current();
+    span.record("tenant_id", identity.tenant_id.as_str());
+    span.record("client_id", identity.client_id.as_str());
+    span.record("key_id", identity.key_id.as_str());
+
+    Ok(identity)
+}
+
+/// Routes declare the scopes they require; all of them must be present.
+pub(crate) fn authorize(
+    identity: &ClientIdentity,
+    required: &HashSet<String>,
+) -> Result<(), AppError> {
+    if required.is_empty()
+        || required
+            .iter()
+            .all(|scope| identity.scopes.contains(scope))
+    {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+
+    (scheme.eq_ignore_ascii_case("bearer") && !token.contains(' ')).then_some(token)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-    use time::OffsetDateTime;
+    use crate::auth::store::{ApiKeyStore, InMemoryApiKeyStore, NewApiKey};
+    use crate::config::SecretString;
 
-    use store::InMemoryApiKeyStore;
+    const SECRET: &str = "test-only-secret";
+    const KEY_ID: &str = "key-test";
 
-    const TEST_SECRET: &str = "test-only-secret";
+    fn verifier() -> KeyVerifier {
+        KeyVerifier::new(SecretString::new("test-pepper"))
+    }
 
-    fn test_store() -> (InMemoryApiKeyStore, ApiKeyId) {
-        let tenant_id = TenantId("tenant-test".to_owned());
-        let client_id = ClientId("client-test".to_owned());
-        let key_id = ApiKeyId("key-test".to_owned());
-
+    fn store_with_scopes(scopes: &[&str]) -> InMemoryApiKeyStore {
         let store = InMemoryApiKeyStore::default();
+        let key = NewApiKey {
+            key_id: ApiKeyId(KEY_ID.to_owned()),
+            client_id: ClientId("client-test".to_owned()),
+            verifier: verifier().verifier_for(SECRET),
+            verifier_version: verifier::VERIFIER_VERSION,
+            scopes: scopes
+                .iter()
+                .map(|scope| (*scope).to_owned())
+                .collect(),
+            expires_at: None,
+        };
+
         store
-            .insert(CredentialContext {
-                key: ApiKeyRecord {
-                    key_id: key_id.clone(),
-                    client_id: client_id.clone(),
-                    verifier: hash_secret(TEST_SECRET),
-                    verifier_version: 1,
-                    scopes: HashSet::from([scopes::PEOPLE_READ.to_owned()]),
-                    created_at: OffsetDateTime::now_utc(),
-                    expires_at: None,
-                    revoked_at: None,
-                },
-                client: Client {
-                    id: client_id,
-                    tenant_id: tenant_id.clone(),
-                    status: AccountStatus::Active,
-                },
-                tenant: Tenant {
-                    id: tenant_id,
-                    status: AccountStatus::Active,
-                },
-            })
+            .insert_active(key)
             .expect("insert test credential");
 
-        (store, key_id)
+        store
     }
 
     #[tokio::test]
     async fn accepts_valid_secret() {
-        let (store, key_id) = test_store();
-
-        let identity = verify_api_key(&store, &key_id, TEST_SECRET)
-            .await
-            .expect("valid key");
+        let identity = verify_api_key(
+            &store_with_scopes(&["read"]),
+            &verifier(),
+            &ApiKeyId(KEY_ID.to_owned()),
+            SECRET,
+        )
+        .await
+        .expect("valid key");
 
         assert_eq!(identity.client_id, ClientId("client-test".to_owned()));
     }
 
     #[tokio::test]
     async fn rejects_wrong_secret() {
-        let (store, key_id) = test_store();
-
-        let result = verify_api_key(&store, &key_id, "wrong-secret").await;
+        let result = verify_api_key(
+            &store_with_scopes(&["read"]),
+            &verifier(),
+            &ApiKeyId(KEY_ID.to_owned()),
+            "wrong-secret",
+        )
+        .await;
 
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_key_id() {
+        let result = verify_api_key(
+            &store_with_scopes(&["read"]),
+            &verifier(),
+            &ApiKeyId("absent".to_owned()),
+            SECRET,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn rejects_revoked_key() {
+        let store = store_with_scopes(&["read"]);
+        store
+            .revoke_by_key_id(&ApiKeyId(KEY_ID.to_owned()))
+            .await
+            .expect("revoke");
+
+        let result =
+            verify_api_key(&store, &verifier(), &ApiKeyId(KEY_ID.to_owned()), SECRET).await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn rejects_suspended_client() {
+        let store = InMemoryApiKeyStore::default();
+        store
+            .insert_with_status(
+                NewApiKey {
+                    key_id: ApiKeyId(KEY_ID.to_owned()),
+                    client_id: ClientId("client-test".to_owned()),
+                    verifier: verifier().verifier_for(SECRET),
+                    verifier_version: verifier::VERIFIER_VERSION,
+                    scopes: HashSet::new(),
+                    expires_at: None,
+                },
+                AccountStatus::Suspended,
+                AccountStatus::Active,
+            )
+            .expect("insert");
+
+        let result =
+            verify_api_key(&store, &verifier(), &ApiKeyId(KEY_ID.to_owned()), SECRET).await;
+
+        assert!(matches!(result, Err(AuthError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_key() {
+        let store = InMemoryApiKeyStore::default();
+        store
+            .insert_active(NewApiKey {
+                key_id: ApiKeyId(KEY_ID.to_owned()),
+                client_id: ClientId("client-test".to_owned()),
+                verifier: verifier().verifier_for(SECRET),
+                verifier_version: verifier::VERIFIER_VERSION,
+                scopes: HashSet::new(),
+                expires_at: Some(OffsetDateTime::now_utc() - time::Duration::hours(1)),
+            })
+            .expect("insert");
+
+        let result =
+            verify_api_key(&store, &verifier(), &ApiKeyId(KEY_ID.to_owned()), SECRET).await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[test]
+    fn authorize_requires_every_declared_scope() {
+        let identity = ClientIdentity {
+            tenant_id: TenantId("tenant".to_owned()),
+            client_id: ClientId("client".to_owned()),
+            key_id: ApiKeyId("key".to_owned()),
+            scopes: HashSet::from(["read".to_owned()]),
+        };
+
+        assert!(authorize(&identity, &HashSet::new()).is_ok());
+        assert!(authorize(&identity, &HashSet::from(["read".to_owned()])).is_ok());
+        assert!(
+            authorize(
+                &identity,
+                &HashSet::from(["read".to_owned(), "write".to_owned()])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bearer_parsing_is_strict() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer abc.def".parse().unwrap());
+
+        assert_eq!(bearer_token(&headers), Some("abc.def"));
+
+        headers.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(header::AUTHORIZATION, "Bearer two tokens".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
     }
 }

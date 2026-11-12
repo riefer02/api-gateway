@@ -11,7 +11,7 @@ Delete anything a linter, test, or type already enforces. No repo tours.
 - `just test` — tests. Postgres tests run only when `DATABASE_URL` is set; start it with `just db-up`.
 - `just deny` — licenses, advisories, wildcards, unknown registries.
 - `cargo add <crate>` — dependencies are added by CLI, never by hand-editing versions.
-- `cargo run -- --check-config` — print resolved config with secrets redacted, then exit.
+- `cargo run -- serve --check-config` — print resolved config with secrets redacted, then exit.
 
 ## Invariants
 
@@ -23,11 +23,15 @@ Delete anything a linter, test, or type already enforces. No repo tours.
   Key material is stored as verifiers only.
 - `src/proxy.rs` owns header hygiene: hop-by-hop and gateway credentials are stripped
   in both directions. Adding a pass-through header is a security change, not a tweak.
+- `src/routes/upstream.rs` is the whole request pipeline: reject dot segments,
+  authenticate, resolve route, authorize, proxy. Keep it readable; hidden layers are
+  how policy gets skipped.
 - `unwrap`/`expect` are allowed only in bootstrap and tests.
 - All environment access lives in `src/config.rs`. A new setting needs a validation
   rule and a test in the same change.
-- Postgres is the source of truth for credentials and (soon) routes, but never on the
-  request path: compile to memory at boot, swap atomically.
+- Postgres is the source of truth for credentials and routes, but never on the request
+  path: compile to memory at boot, swap atomically on version bump.
+- Admin mutations go through `src/admin`; the CLI is one adapter over that service.
 
 ## Working style
 
