@@ -119,7 +119,7 @@ Shedding is the intended behaviour. Check whether the cause is traffic (raise
 
 `SIGTERM` stops accepting connections and drains for `SHUTDOWN_DRAIN_SECS` (25 s default).
 Orchestrators must allow a matching grace period; the compose file uses 30 s. A drain
-timeout logs `drain timed out; exiting with requests in flight` and exits successfully.
+timeout logs `drain timed out; exiting with connections still open` and exits 0.
 
 ## Deploy checklist
 

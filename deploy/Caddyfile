@@ -12,8 +12,10 @@ gateway.example.com {
 	encode zstd gzip
 
 	# Never expose the scrape endpoint or the control plane publicly.
+	# Scrape and readiness endpoints are internal. The control plane is on its
+	# own listener and is never proxied here.
 	@internal {
-		path /metrics /v1/* /healthz
+		path /metrics /ready
 	}
 	respond @internal 404
 

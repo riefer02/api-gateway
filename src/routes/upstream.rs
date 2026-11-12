@@ -15,10 +15,24 @@ use crate::{
 };
 
 pub(crate) async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
-    match handle(&state, request).await {
+    let mut rate_headers = HeaderMap::new();
+
+    let mut response = match handle(&state, request, &mut rate_headers).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
+    };
+
+    // Rate-limit headers belong on failures too, but never overwrite the ones a
+    // 429 already set for the limiter that denied the request.
+    for (name, value) in rate_headers {
+        let Some(name) = name else { continue };
+        response
+            .headers_mut()
+            .entry(name)
+            .or_insert(value);
     }
+
+    response
 }
 
 /// The request pipeline, in one readable place:
@@ -27,22 +41,24 @@ pub(crate) async fn dispatch(State(state): State<AppState>, request: Request) ->
 ///
 /// Authentication comes before resolution so an unauthenticated caller cannot
 /// probe which prefixes exist by comparing 401 with 404.
-async fn handle(state: &AppState, mut request: Request) -> Result<Response, AppError> {
+async fn handle(
+    state: &AppState,
+    mut request: Request,
+    rate_headers: &mut HeaderMap,
+) -> Result<Response, AppError> {
     let path = request.uri().path().to_owned();
 
-    if routing::has_dot_segments(&path) {
+    if routing::is_unsafe_path(&path) {
         return Err(AppError::bad_request(
             "path must not contain `.` or `..` segments",
         ));
     }
 
-    let mut rate_headers = HeaderMap::new();
-
     if let Some(limiter) = state.limits.ip.as_ref() {
         check_limit(
             limiter,
             &format!("ip:{}", client_ip(&request)),
-            &mut rate_headers,
+            rate_headers,
         )?;
     }
 
@@ -52,7 +68,7 @@ async fn handle(state: &AppState, mut request: Request) -> Result<Response, AppE
         check_limit(
             limiter,
             &format!("tenant:{}", identity.tenant_id),
-            &mut rate_headers,
+            rate_headers,
         )?;
     }
 
@@ -78,12 +94,7 @@ async fn handle(state: &AppState, mut request: Request) -> Result<Response, AppE
 
     let request = limit_undeclared_body(request, state.body_limit).await?;
 
-    let mut response = proxy::forward(request, route, &state.breakers, &state.retry).await?;
-    response
-        .headers_mut()
-        .extend(rate_headers);
-
-    Ok(response)
+    proxy::forward(request, route, &state.breakers, &state.retry).await
 }
 
 /// Bodies with a `Content-Length` are framed by hyper and streamed. Bodies
@@ -97,10 +108,19 @@ async fn limit_undeclared_body(request: Request, limit: usize) -> Result<Request
         return Ok(request);
     }
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let collected = axum::body::to_bytes(body, limit)
         .await
         .map_err(|_| AppError::PayloadTooLarge)?;
+
+    // Publish the measured size. The proxy uses Content-Length to decide
+    // whether a request can be replayed, and the upstream gets a framed body
+    // instead of chunked.
+    if let Ok(length) = axum::http::HeaderValue::from_str(&collected.len().to_string()) {
+        parts
+            .headers
+            .insert(axum::http::header::CONTENT_LENGTH, length);
+    }
 
     Ok(Request::from_parts(
         parts,
@@ -115,13 +135,13 @@ fn check_limit(limiter: &RateLimiter, key: &str, headers: &mut HeaderMap) -> Res
             remaining,
             reset_after,
         } => {
-            // Two limits may apply; report the tighter one so the headers
-            // never advertise more headroom than the caller actually has.
+            // Two limits may apply; report whichever leaves less headroom, so
+            // the headers never promise more than the caller actually has.
             let tighter = headers
-                .get("ratelimit-limit")
+                .get("ratelimit-remaining")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u32>().ok())
-                .is_none_or(|current| limiter.limit() < current);
+                .is_none_or(|current| remaining < current);
 
             if tighter {
                 headers.insert("ratelimit-limit", header_value(&limiter.limit()));

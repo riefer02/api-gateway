@@ -31,10 +31,11 @@ spec:
         - name: gateway
           image: ghcr.io/example/api-gateway:0.1.0
           imagePullPolicy: IfNotPresent
-          args: ["serve"]
           ports:
             - name: http
               containerPort: 8080
+            - name: admin
+              containerPort: 9090
           envFrom:
             - configMapRef:
                 name: api-gateway

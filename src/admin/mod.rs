@@ -165,6 +165,7 @@ pub(crate) struct AdminService {
     store: Arc<dyn ApiKeyStore>,
     verifier: Arc<KeyVerifier>,
     allow_hosts: Vec<String>,
+    request_timeout: std::time::Duration,
 }
 
 impl AdminService {
@@ -173,12 +174,14 @@ impl AdminService {
         verifier: Arc<KeyVerifier>,
         allow_hosts: Vec<String>,
         store: Arc<dyn ApiKeyStore>,
+        request_timeout: std::time::Duration,
     ) -> Self {
         Self {
             pool,
             store,
             verifier,
             allow_hosts,
+            request_timeout,
         }
     }
 
@@ -479,6 +482,15 @@ impl AdminService {
             ));
         }
 
+        // A per-upstream timeout longer than the whole-request deadline can
+        // never fire: the request is cancelled first and counts as a failure.
+        if u128::from(timeout_ms) > self.request_timeout.as_millis() {
+            return Err(AdminError::Invalid(format!(
+                "timeout_ms must not exceed the request deadline ({} ms)",
+                self.request_timeout.as_millis()
+            )));
+        }
+
         let mut transaction = self
             .pool
             .begin()
@@ -540,14 +552,21 @@ impl AdminService {
 
         let methods = normalize_methods(&spec.methods);
 
-        self.ensure_claim_is_free(&spec.id, &spec.path_prefix, &methods)
-            .await?;
-
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(AdminError::Store)?;
+
+        // Serialise competing writers on the single version row so two admins
+        // cannot both pass the claim check and poison the table.
+        sqlx::query("SELECT 1 FROM route_table_state WHERE only_one FOR UPDATE")
+            .execute(&mut *transaction)
+            .await
+            .map_err(AdminError::Store)?;
+
+        self.ensure_claim_is_free(&mut transaction, &spec.id, &spec.path_prefix, &methods)
+            .await?;
 
         sqlx::query(
             r#"
@@ -933,6 +952,7 @@ impl AdminService {
 
     async fn ensure_claim_is_free(
         &self,
+        transaction: &mut sqlx::PgConnection,
         id: &str,
         path_prefix: &str,
         methods: &[String],
@@ -945,7 +965,7 @@ impl AdminService {
         .bind(path_prefix)
         .bind(methods)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(AdminError::Store)?;
 
@@ -1067,6 +1087,7 @@ mod tests {
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
             Vec::new(),
             store,
+            std::time::Duration::from_secs(15),
         );
 
         let actor = Actor::local("test");
@@ -1155,6 +1176,7 @@ mod tests {
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
             Vec::new(),
             store,
+            std::time::Duration::from_secs(15),
         );
 
         let tenant = unique("audit-tenant");

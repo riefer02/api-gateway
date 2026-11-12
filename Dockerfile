@@ -18,4 +18,7 @@ COPY --from=builder /app/target/release/api-gateway /usr/local/bin/api-gateway
 USER nonroot:nonroot
 EXPOSE 8080
 
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/api-gateway", "healthcheck"]
+
 ENTRYPOINT ["/usr/local/bin/api-gateway", "serve"]

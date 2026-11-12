@@ -24,6 +24,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # Forward every documented setting; the explicit entries below win.
+    env_file:
+      - .env
     environment:
       APP_ENV: ${APP_ENV:-development}
       HOST: 0.0.0.0
@@ -38,6 +41,8 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
       - "127.0.0.1:8080:8080"
+      # Only useful when ADMIN_TOKENS is set; harmless otherwise.
+      - "127.0.0.1:9090:9090"
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "/usr/local/bin/api-gateway", "healthcheck"]

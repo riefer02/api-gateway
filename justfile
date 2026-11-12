@@ -25,7 +25,7 @@ check: fmt-check clippy test deny
     @echo "all checks passed"
 
 run:
-    cargo run
+    cargo run -- serve
 
 # Local Postgres from compose.yml
 db-up:

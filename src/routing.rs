@@ -61,13 +61,24 @@ impl RouteTable {
     /// Longest matching prefix wins, then the higher priority. Routes are
     /// pre-sorted, so this is a scan over a usually tiny vector.
     pub(crate) fn resolve(&self, method: &Method, path: &str) -> RouteMatch<'_> {
+        // Only the longest matching prefix participates. Falling through to a
+        // shorter prefix would proxy a request under scopes it never earned.
+        let Some(prefix) = self
+            .routes
+            .iter()
+            .find(|route| path_is_within(path, &route.path_prefix))
+            .map(|route| route.path_prefix.clone())
+        else {
+            return RouteMatch::NotFound;
+        };
+
         let mut allowed: Vec<Method> = Vec::new();
 
-        for route in &self.routes {
-            if !path_is_within(path, &route.path_prefix) {
-                continue;
-            }
-
+        for route in self
+            .routes
+            .iter()
+            .filter(|route| route.path_prefix == prefix)
+        {
             if route.allows(method) {
                 return RouteMatch::Found(route);
             }
@@ -227,7 +238,9 @@ fn path_is_within(path: &str, prefix: &str) -> bool {
 /// commonly decode `%2e%2e` after routing.
 pub(crate) fn has_dot_segments(path: &str) -> bool {
     if !path.contains('%') {
-        return path.split('/').any(is_dot_segment);
+        return path
+            .split(['/', '\\'])
+            .any(is_dot_segment);
     }
 
     // Decode only the escapes that matter, in one pass, into a byte buffer.
@@ -253,6 +266,11 @@ pub(crate) fn has_dot_segments(path: &str) -> bool {
                     index += 3;
                     continue;
                 }
+                (b'5', b'c') => {
+                    decoded.push(b'\\');
+                    index += 3;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -262,8 +280,15 @@ pub(crate) fn has_dot_segments(path: &str) -> bool {
     }
 
     decoded
-        .split(|byte| *byte == b'/')
+        .split(|byte| *byte == b'/' || *byte == b'\\')
         .any(|segment| segment == b"." || segment == b"..")
+}
+
+/// A backslash is not a path separator to us, but WHATWG URL parsing treats it
+/// as one for http(s). Reject it outright so the path we authorize is the path
+/// we forward.
+pub(crate) fn is_unsafe_path(path: &str) -> bool {
+    path.contains('\\') || has_dot_segments(path)
 }
 
 fn is_dot_segment(segment: &str) -> bool {
@@ -282,6 +307,10 @@ pub(crate) fn validate_path_prefix(prefix: &str) -> Result<(), String> {
 
     if has_dot_segments(prefix) {
         return Err("path prefix must not contain `.` or `..` segments".to_owned());
+    }
+
+    if prefix.contains('\\') {
+        return Err("path prefix must not contain a backslash".to_owned());
     }
 
     Ok(())
@@ -422,6 +451,10 @@ pub(crate) fn validate_rewrite(prefix: &str) -> Result<(), String> {
 
     if has_dot_segments(prefix) {
         return Err("rewrite prefix must not contain `.` or `..` segments".to_owned());
+    }
+
+    if prefix.contains('\\') {
+        return Err("rewrite prefix must not contain a backslash".to_owned());
     }
 
     Ok(())
@@ -747,6 +780,30 @@ mod tests {
         assert!(!has_dot_segments("/a/b"));
         assert!(!has_dot_segments("/a..b/c"));
         assert!(!has_dot_segments("/a%2Fb"));
+    }
+
+    #[test]
+    fn rejects_backslash_paths() {
+        assert!(is_unsafe_path("/api/x\\..\\..\\admin"));
+        assert!(is_unsafe_path("/a%5c..%5c..%5cadmin"));
+        assert!(!is_unsafe_path("/api/people/1"));
+    }
+
+    #[test]
+    fn a_specific_route_never_falls_through_to_a_shorter_prefix() {
+        let table = table(vec![
+            row("public", "/api", &["GET"]),
+            row("admin", "/api/admin", &["POST"]),
+        ]);
+
+        // GET /api/admin/users matches /api/admin, which only allows POST. It
+        // must not be proxied under /api's scopes.
+        match table.resolve(&HttpMethod::GET, "/api/admin/users") {
+            RouteMatch::MethodNotAllowed(allowed) => {
+                assert_eq!(allowed, vec![HttpMethod::POST]);
+            }
+            _ => panic!("expected method-not-allowed for the longest prefix"),
+        }
     }
 
     #[test]

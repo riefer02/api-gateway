@@ -66,6 +66,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         Arc::clone(&verifier),
         config.routing.allow_hosts.clone(),
         Arc::clone(&store),
+        config.server.request_timeout,
     ));
 
     seed_development_key(config, &admin).await?;
@@ -95,6 +96,9 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics,
+        readiness: Arc::new(crate::state::Readiness::new(
+            std::time::Duration::from_secs(1),
+        )),
     };
 
     let admin_server = start_admin(config, Arc::clone(&admin)).await?;
@@ -105,8 +109,6 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(&address).await?;
 
     log_startup(config, &routes);
-
-    tracing::info!("shutdown requested; draining in-flight connections");
 
     let outcome = run_server(
         listener,
@@ -275,6 +277,9 @@ async fn run_server(
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            // Finished connections must be reaped or the JoinSet grows for the
+            // lifetime of the process.
+            _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
                     Ok(accepted) => accepted,
@@ -301,7 +306,15 @@ async fn run_server(
                             let app = app.clone();
 
                             async move {
-                                app.oneshot(request.map(axum::body::Body::new)).await
+                                let mut request = request.map(axum::body::Body::new);
+
+                                // The per-IP limiter and the audit trail both
+                                // depend on the real peer address.
+                                request
+                                    .extensions_mut()
+                                    .insert(axum::extract::ConnectInfo(peer));
+
+                                app.oneshot(request).await
                             }
                         },
                     ));
@@ -333,6 +346,7 @@ async fn run_server(
         }
     }
 
+    tracing::info!("shutdown requested; draining in-flight connections");
     let _ = stop_tx.send(());
 
     let deadline = tokio::time::sleep(drain);

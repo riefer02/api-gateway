@@ -16,12 +16,14 @@ pub(crate) async fn ready(State(state): State<AppState>) -> StatusCode {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
-    match crate::db::ping(&state.db).await {
-        Ok(()) => StatusCode::OK,
-        Err(error) => {
-            tracing::warn!(%error, "readiness check failed: database unreachable");
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+    let healthy = state.readiness.check(&state.db).await;
+    metrics::gauge!("gateway_ready").set(if healthy { 1.0 } else { 0.0 });
+
+    if healthy {
+        StatusCode::OK
+    } else {
+        tracing::warn!("readiness check failed: database unreachable");
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

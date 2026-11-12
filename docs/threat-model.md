@@ -31,7 +31,7 @@ identity provider (there is none yet).
 | Request smuggling | Hyper rejects ambiguous `Content-Length`/`Transfer-Encoding`; hop-by-hop and `Connection`-named headers stripped | Depends on hyper's parser |
 | Credential leakage to upstreams | `Authorization`, `Cookie`, `Host`, and forwarded headers stripped before forwarding | Upstreams that need caller identity must be given an explicit design decision |
 | Secret leakage to logs | No secret is logged; upstream errors logged by kind, not `Display`; request ids sanitized | URL paths may still contain caller-chosen secrets if callers put them there |
-| Resource exhaustion | Body limits, whole-request deadline, per-IP and per-tenant rate limits, concurrency via upstream pools | In-process limits are per replica |
+| Resource exhaustion | Body limits, whole-request deadline, header-read timeout, connection cap, per-IP and per-tenant rate limits, cached readiness probe | In-process limits are per replica |
 | Amplification via retries | Idempotent, body-less retries only, gated by a token-bucket retry budget | Retried requests still reach the upstream twice |
 | Tenant isolation failure | Tenant/client status checked per request; scopes per route | A single cache entry serves one key; no cross-tenant sharing |
 | Revocation lag | In-process revoke invalidates immediately; cross-process bounded by `AUTH_CACHE_TTL_SECS` | Set the TTL to your revocation SLA |
@@ -51,4 +51,6 @@ identity provider (there is none yet).
 - mTLS or OIDC for the admin listener, replacing static tokens.
 - Trusted-proxy configuration so `X-Forwarded-For` can be believed behind a known edge.
 - Distributed rate limiting so limits hold across replicas.
-- Audit log of admin mutations (currently only the data-plane logs exist).
+- Audit rows are append-only but not tamper-evident: someone with database write access
+  can delete or rewrite them. Hash-chaining or shipping to an append-only sink is the
+  next step if that matters to you.

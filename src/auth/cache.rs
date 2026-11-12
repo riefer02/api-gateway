@@ -23,6 +23,7 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 pub(crate) struct TtlCache<K, V> {
     shards: Vec<Mutex<Shard<K, V>>>,
     ttl: Duration,
+    max_entries_per_shard: usize,
 }
 
 struct Shard<K, V> {
@@ -40,7 +41,9 @@ where
     K: Hash + Eq + Clone,
     V: Clone,
 {
-    pub(crate) fn new(ttl: Duration) -> Self {
+    /// A hard per-shard cap keeps a hostile client from growing the map at
+    /// request rate between sweeps.
+    pub(crate) fn with_capacity(ttl: Duration, max_entries: usize) -> Self {
         const SHARDS: usize = 16;
 
         Self {
@@ -53,6 +56,7 @@ where
                 })
                 .collect(),
             ttl,
+            max_entries_per_shard: (max_entries / SHARDS).max(1),
         }
     }
 
@@ -85,6 +89,13 @@ where
                 .entries
                 .retain(|_, entry| entry.expires_at > now);
             shard.last_swept = now;
+        }
+
+        // Hard cap: a hostile client must not grow the map between sweeps.
+        if shard.entries.len() >= self.max_entries_per_shard
+            && let Some(oldest) = shard.entries.keys().next().cloned()
+        {
+            shard.entries.remove(&oldest);
         }
 
         shard.entries.insert(
@@ -124,14 +135,18 @@ pub(crate) struct CachedApiKeyStore {
     /// Unknown keys are cached briefly so credential scanners cannot turn every
     /// request into a database round trip.
     negative: TtlCache<ApiKeyId, ()>,
+    /// Recently revoked ids. A lookup that raced the revoke must not re-cache
+    /// the pre-revocation row.
+    tombstones: TtlCache<ApiKeyId, ()>,
 }
 
 impl CachedApiKeyStore {
     pub(crate) fn new(inner: Arc<dyn ApiKeyStore>, ttl: Duration) -> Self {
         Self {
             inner,
-            cache: TtlCache::new(ttl),
-            negative: TtlCache::new(NEGATIVE_TTL),
+            cache: TtlCache::with_capacity(ttl, 262_144),
+            negative: TtlCache::with_capacity(NEGATIVE_TTL, 4_096),
+            tombstones: TtlCache::with_capacity(Duration::from_secs(60), 4_096),
         }
     }
 
@@ -139,12 +154,19 @@ impl CachedApiKeyStore {
     pub(crate) fn invalidate(&self, key_id: &ApiKeyId) {
         self.cache.invalidate(key_id);
         self.negative.invalidate(key_id);
+        self.tombstones
+            .insert(key_id.clone(), ());
     }
 }
 
 #[async_trait::async_trait]
 impl ApiKeyStore for CachedApiKeyStore {
     async fn find_by_key_id(&self, key_id: &ApiKeyId) -> Result<Option<Credential>, StoreError> {
+        if self.tombstones.get(key_id).is_some() {
+            metrics::counter!("gateway_auth_cache_total", "result" => "revoked").increment(1);
+            return Ok(None);
+        }
+
         if self.negative.get(key_id).is_some() {
             metrics::counter!("gateway_auth_cache_total", "result" => "negative").increment(1);
             return Ok(None);
@@ -186,6 +208,7 @@ impl ApiKeyStore for CachedApiKeyStore {
         // A negative entry for this id would hide the new key, so publish the
         // invalidation before writing.
         self.negative.invalidate(&key.key_id);
+        self.tombstones.invalidate(&key.key_id);
 
         self.inner.insert_key(key).await
     }
@@ -305,13 +328,14 @@ mod tests {
                 .unwrap()
         );
 
-        let reloaded = store
-            .find_by_key_id(&ApiKeyId("k1".to_owned()))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(reloaded.key.revoked_at.is_some());
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("k1".to_owned()))
+                .await
+                .unwrap()
+                .is_none(),
+            "a revoked key is never served, and the tombstone skips the database"
+        );
     }
 
     #[tokio::test]

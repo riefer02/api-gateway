@@ -247,6 +247,23 @@ impl BreakerRegistry {
         );
     }
 
+    /// The request ended without an outcome (deadline or client disconnect).
+    /// A half-open probe must be released or the circuit sticks, but a healthy
+    /// upstream must not be charged for a caller that walked away.
+    pub(crate) fn record_abandoned(&self, upstream: &str) {
+        let mut breakers = self.lock();
+
+        let Some(breaker) = breakers.get_mut(upstream) else {
+            return;
+        };
+
+        if let State::HalfOpen { probing: true } = breaker.state {
+            breaker.state = State::Open {
+                until: Instant::now() + self.cooldown,
+            };
+        }
+    }
+
     pub(crate) fn record_failure(&self, upstream: &str) {
         let mut breakers = self.lock();
 
@@ -318,8 +335,10 @@ impl<'a> BreakerGuard<'a> {
 impl Drop for BreakerGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
+            // The request ended without an outcome: release a half-open probe
+            // without charging a healthy upstream for a caller that walked away.
             self.registry
-                .record_failure(self.upstream);
+                .record_abandoned(self.upstream);
         }
     }
 }

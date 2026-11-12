@@ -214,7 +214,13 @@ async fn dispatch(
     let store: Arc<dyn ApiKeyStore> = Arc::new(
         crate::auth::store::postgres::PostgresApiKeyStore::new(pool.clone()),
     );
-    let service = AdminService::new(pool, verifier, config.routing.allow_hosts.clone(), store);
+    let service = AdminService::new(
+        pool,
+        verifier,
+        config.routing.allow_hosts.clone(),
+        store,
+        config.server.request_timeout,
+    );
 
     let actor = Actor::local("cli");
 

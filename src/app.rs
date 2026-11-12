@@ -118,7 +118,18 @@ async fn record_metrics(
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let method = request.method().as_str().to_owned();
+    // Bound the label set: arbitrary request methods must not become
+    // unbounded Prometheus series.
+    let method = match *request.method() {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
+    };
     let started = Instant::now();
 
     let response = next.run(request).await;

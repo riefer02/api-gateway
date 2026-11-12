@@ -15,8 +15,9 @@ hygiene, per-IP and per-tenant rate limits, per-upstream circuit breakers, Prome
 metrics, OpenTelemetry traces, and graceful shutdown. The control plane is available as
 both a CLI and an HTTP API. Ships as a distroless container with a compose stack.
 
-Not built yet: distributed rate limiting, Kubernetes manifests. Strong pre-production
-baseline, not a finished product.
+Ships with a distroless image, a compose stack, Kubernetes manifests, and a Caddy
+edge-TLS example. Not built: distributed rate limiting (needs more than one replica for
+it to mean anything).
 
 ## Quick start
 
@@ -250,6 +251,9 @@ This table is the specification.
 | `gateway_upstream_retries_total` | `upstream`, `reason` |
 | `gateway_retry_budget_exhausted_total` | `upstream` |
 | `gateway_auth_cache_total` | `result` |
+| `gateway_admin_auth_failures_total` | — |
+| `gateway_connections_rejected_total` | — |
+| `gateway_ready` | — (0/1, set by `/ready`) |
 
 Spans carry `route`, `upstream`, `tenant_id`, `client_id`, and `key_id` (identifiers only,
 never secrets). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export; otherwise logs only.
@@ -326,8 +330,12 @@ just docker          # build
 just up              # compose stack (gateway + Postgres)
 ```
 
-`stop_grace_period` is 30 s against a 25 s drain budget. The container healthcheck is
-`api-gateway healthcheck`, so no shell or curl is required in the image.
+`stop_grace_period` is 30 s against a 25 s drain budget. The image ships a `HEALTHCHECK`
+that runs `api-gateway healthcheck`, so no shell or curl is needed.
+
+Kubernetes manifests live in [`deploy/k8s`](deploy/k8s): a non-root, read-only deployment
+with probes, HPA, PDB, and a default-deny NetworkPolicy. [`deploy/Caddyfile`](deploy/Caddyfile)
+is the reference edge that terminates TLS and keeps `/metrics` and `/ready` private.
 
 ## Using this as a template
 
@@ -347,7 +355,8 @@ Deliberately generic: no cloud provider, no vendor SDK, no auth provider. The `A
 and rate-limiter seams are where those integrations belong.
 
 Known gaps, stated plainly: rate limits, retry budgets, and breakers are per replica;
-unknown-length request bodies are buffered up to the limit instead of streamed.
+unknown-length request bodies are buffered up to the limit instead of streamed; TLS
+terminates at the edge rather than in the gateway.
 
 ## Further reading
 

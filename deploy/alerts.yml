@@ -16,7 +16,7 @@ groups:
           description: "No metrics for 2 minutes. Check the process and its listener."
 
       - alert: GatewayNotReady
-        expr: probe_success{job="gateway-ready"} == 0
+        expr: gateway_ready == 0
         for: 3m
         labels:
           severity: critical

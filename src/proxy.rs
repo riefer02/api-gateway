@@ -33,11 +33,19 @@ const GATEWAY_OWNED_REQUEST: &[&str] = &["host", "authorization", "cookie"];
 /// model lands; otherwise any caller can spoof its origin.
 const FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
     "x-real-ip",
+    "x-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "x-original-url",
+    "x-rewrite-url",
+    "x-http-method-override",
+    "x-method-override",
 ];
+
+/// Prefixes that must never survive from the caller, whatever the vendor calls
+/// them: `x-forwarded-*` covers for/host/proto/port and friends.
+const FORWARDED_PREFIXES: &[&str] = &["x-forwarded-"];
 
 /// Upstream identity headers: never forwarded to clients.
 const GATEWAY_OWNED_RESPONSE: &[&str] = &["server", "set-cookie"];
@@ -167,7 +175,7 @@ pub(crate) async fn forward(
                     continue;
                 }
 
-                breakers.record_failure(upstream_id);
+                breaker.record_failure();
 
                 tracing::warn!(
                     upstream = upstream_id,
@@ -241,6 +249,9 @@ fn is_dropped_request_header(name: &str, connection_tokens: &[String]) -> bool {
     HOP_BY_HOP.contains(&name)
         || GATEWAY_OWNED_REQUEST.contains(&name)
         || FORWARDED_HEADERS.contains(&name)
+        || FORWARDED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
         || connection_tokens
             .iter()
             .any(|token| token == name)
@@ -674,6 +685,57 @@ mod tests {
             .await
             .expect("recorded requests");
         assert_eq!(requests.len(), 2, "one retry happened");
+    }
+
+    #[tokio::test]
+    async fn never_retries_a_buffered_body() {
+        use futures_util::StreamExt as _;
+        use wiremock::matchers::body_string;
+
+        let upstream = MockServer::start().await;
+
+        // Only a request that still carries the body matches this mock.
+        Mock::given(method("POST"))
+            .and(body_string("payload"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[
+            ("RETRY_MAX_ATTEMPTS", "3"),
+            ("RETRY_BASE_DELAY_MS", "1"),
+            ("RETRY_BUDGET_RATIO", "5"),
+        ]);
+
+        let (app, token) = testing::app_with(&config, &upstream.uri(), Duration::from_secs(2));
+
+        // No Content-Length: the gateway buffers this body before forwarding,
+        // and must still treat it as un-replayable.
+        let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"payload"),
+        )]);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/swapi/echo")
+            .header("authorization", format!("Bearer {token}"))
+            .header("idempotency-key", "abc-123")
+            .body(Body::from_stream(stream.take(1)))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let requests = upstream
+            .received_requests()
+            .await
+            .expect("recorded requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a body-carrying request is never retried"
+        );
     }
 
     #[tokio::test]

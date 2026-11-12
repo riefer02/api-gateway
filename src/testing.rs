@@ -106,6 +106,9 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics: metrics_handle(),
+        readiness: Arc::new(crate::state::Readiness::new(
+            std::time::Duration::from_secs(1),
+        )),
     };
 
     (state, auth::key::token(&key_id, &secret))
@@ -128,6 +131,9 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics: metrics_handle(),
+        readiness: Arc::new(crate::state::Readiness::new(
+            std::time::Duration::from_secs(1),
+        )),
     }
 }
 
