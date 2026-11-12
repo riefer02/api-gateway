@@ -8,13 +8,17 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~9k lines of Rust, 104 tests, one binary, a distroless image with no
+**At a glance:** ~9k lines of Rust, 105 tests, one binary, a distroless image with no
 shell, and a measured +0.32 ms p50 over a direct call at 78k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
 and adapted — see [Using this as a template](#using-this-as-a-template).
 
 ## Status
+
+Portfolio-grade and pre-production: not security-audited, not battle-tested under real
+traffic. Read [`docs/threat-model.md`](docs/threat-model.md) before pointing it at anything
+that matters.
 
 Working data plane and control plane. Authentication with a bounded-staleness credential
 cache, a Postgres-backed route table with live reload, streaming proxy with strict header
@@ -430,5 +434,5 @@ terminates at the edge rather than in the gateway.
 | `just demo-route` | Registers the demo upstream and route |
 | `just db-up` / `just db-down` / `just db-logs` | Local Postgres |
 
-Rules: `main` is protected, no `unwrap` on request paths, secrets never reach logs or error
-bodies, and new dependencies go through `cargo add` and must pass `just deny`.
+Rules: CI must be green before a change lands; no `unwrap` on request paths; secrets never
+reach logs or error bodies; new dependencies go through `cargo add` and must pass `just deny`.
