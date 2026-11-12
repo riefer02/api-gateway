@@ -23,9 +23,12 @@ pub enum AppError {
     Forbidden,
     #[error("not found")]
     NotFound,
-    #[allow(dead_code)] // TODO(W6): emitted by the body-limit middleware once it owns the response.
     #[error("payload too large")]
     PayloadTooLarge,
+    #[error("request deadline exceeded")]
+    RequestTimeout,
+    #[error("method not allowed")]
+    MethodNotAllowed { allowed: Vec<axum::http::Method> },
     #[error("rate limited for {retry_after_secs}s")]
     RateLimited {
         retry_after_secs: u64,
@@ -68,6 +71,8 @@ impl AppError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::CircuitOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
@@ -84,6 +89,8 @@ impl AppError {
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::RequestTimeout => "request_timeout",
+            Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::RateLimited { .. } => "rate_limited",
             Self::CircuitOpen { .. } => "circuit_open",
             Self::UpstreamTimeout => "upstream_timeout",
@@ -100,6 +107,8 @@ impl AppError {
             Self::Forbidden => "the credential is not permitted to perform this request".into(),
             Self::NotFound => "no route matches this request".into(),
             Self::PayloadTooLarge => "request body exceeds the configured limit".into(),
+            Self::RequestTimeout => "the request exceeded the server deadline".into(),
+            Self::MethodNotAllowed { .. } => "this route does not accept that method".into(),
             Self::RateLimited { .. } => "too many requests".into(),
             Self::CircuitOpen { .. } => "the upstream is temporarily unavailable".into(),
             Self::UpstreamTimeout => "the upstream did not respond in time".into(),
@@ -181,6 +190,20 @@ impl IntoResponse for AppError {
             }
             if let Ok(value) = HeaderValue::from_str(&reset_after_secs.to_string()) {
                 headers.insert("ratelimit-reset", value);
+            }
+        }
+
+        if let Self::MethodNotAllowed { allowed } = &self {
+            let allow = allowed
+                .iter()
+                .map(|method| method.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            if let Ok(value) = HeaderValue::from_str(&allow) {
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, value);
             }
         }
 

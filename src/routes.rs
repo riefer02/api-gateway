@@ -63,6 +63,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_method_returns_405_with_allow() {
+        let (app, token) = testing::app("https://upstream.test", std::time::Duration::from_secs(1));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swapi/people/1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response
+                .headers()
+                .get("allow")
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, HEAD")
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_bodies_return_the_envelope() {
+        let (app, token) = testing::app("https://upstream.test", std::time::Duration::from_secs(1));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swapi/people/1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-length", "2000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("\"code\":\"payload_too_large\""));
+    }
+
+    #[tokio::test]
+    async fn request_deadline_uses_the_envelope() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(1_500)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[("REQUEST_TIMEOUT_SECS", "1")]);
+        let (app, token) =
+            testing::app_with(&config, &upstream.uri(), std::time::Duration::from_secs(5));
+
+        let response = app
+            .oneshot(testing::authorized("/swapi/people/1", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("\"code\":\"request_timeout\""));
+    }
+
+    #[tokio::test]
     async fn unauthenticated_callers_cannot_probe_routes() {
         let (app, _token) =
             testing::app("https://upstream.test", std::time::Duration::from_secs(1));
@@ -102,6 +186,31 @@ mod tests {
             .expect("generated request id");
 
         assert!(!request_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hostile_request_ids_are_replaced() {
+        let app = crate::app::build_app(&testing::config(), testing::empty_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-request-id", "a".repeat(400))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("sanitized request id");
+
+        assert_eq!(request_id.len(), 36, "replaced with a UUID");
+        assert_ne!(request_id, "a".repeat(400));
     }
 
     #[tokio::test]

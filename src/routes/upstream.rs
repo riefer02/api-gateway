@@ -10,6 +10,7 @@ use crate::{
     error::AppError,
     limits::{Decision, RateLimiter},
     proxy, routing,
+    routing::RouteMatch,
     state::AppState,
 };
 
@@ -57,9 +58,14 @@ async fn handle(state: &AppState, mut request: Request) -> Result<Response, AppE
 
     let method = request.method().clone();
     let table = state.routes.snapshot();
-    let route = table
-        .resolve(&method, &path)
-        .ok_or(AppError::NotFound)?;
+
+    let route = match table.resolve(&method, &path) {
+        RouteMatch::Found(route) => route,
+        RouteMatch::MethodNotAllowed(allowed) => {
+            return Err(AppError::MethodNotAllowed { allowed });
+        }
+        RouteMatch::NotFound => return Err(AppError::NotFound),
+    };
 
     let span = tracing::Span::current();
     span.record("route", route.id.as_str());

@@ -37,6 +37,14 @@ pub(crate) struct RouteTable {
     routes: Vec<CompiledRoute>,
 }
 
+/// Outcome of route resolution. Distinguishes "no such path" from "wrong
+/// method" so clients get a correct `405` with `Allow` instead of a `404`.
+pub(crate) enum RouteMatch<'a> {
+    Found(&'a CompiledRoute),
+    MethodNotAllowed(Vec<Method>),
+    NotFound,
+}
+
 impl RouteTable {
     pub(crate) fn version(&self) -> i64 {
         self.version
@@ -48,10 +56,36 @@ impl RouteTable {
 
     /// Longest matching prefix wins, then the higher priority. Routes are
     /// pre-sorted, so this is a scan over a usually tiny vector.
-    pub(crate) fn resolve(&self, method: &Method, path: &str) -> Option<&CompiledRoute> {
-        self.routes
-            .iter()
-            .find(|route| route.matches(method, path))
+    pub(crate) fn resolve(&self, method: &Method, path: &str) -> RouteMatch<'_> {
+        let mut allowed: Vec<Method> = Vec::new();
+
+        for route in &self.routes {
+            if !path_is_within(path, &route.path_prefix) {
+                continue;
+            }
+
+            if route.allows(method) {
+                return RouteMatch::Found(route);
+            }
+
+            for candidate in &route.methods {
+                if !allowed.contains(candidate) {
+                    allowed.push(candidate.clone());
+                }
+            }
+        }
+
+        if allowed.is_empty() {
+            return RouteMatch::NotFound;
+        }
+
+        // GET implies HEAD, which the gateway forwards and hyper answers
+        // without a body.
+        if allowed.contains(&Method::GET) && !allowed.contains(&Method::HEAD) {
+            allowed.push(Method::HEAD);
+        }
+
+        RouteMatch::MethodNotAllowed(allowed)
     }
 
     fn compile(
@@ -145,8 +179,9 @@ impl RouteTable {
 }
 
 impl CompiledRoute {
-    fn matches(&self, method: &Method, path: &str) -> bool {
-        self.methods.contains(method) && path_is_within(path, &self.path_prefix)
+    fn allows(&self, method: &Method) -> bool {
+        self.methods.contains(method)
+            || (*method == Method::HEAD && self.methods.contains(&Method::GET))
     }
 
     /// The path to request upstream, after prefix stripping and rewriting.
@@ -184,10 +219,24 @@ fn path_is_within(path: &str, prefix: &str) -> bool {
 
 /// `.` and `..` must be rejected before matching. Otherwise a path could match
 /// a permissive prefix and still reach a different upstream path once the
-/// normalizer drops those segments.
+/// normalizer drops those segments. Percent-encoded dots count: upstreams
+/// commonly decode `%2e%2e` after routing.
 pub(crate) fn has_dot_segments(path: &str) -> bool {
-    path.split('/')
-        .any(|segment| segment == "." || segment == "..")
+    if !path.contains('%') {
+        return path.split('/').any(is_dot_segment);
+    }
+
+    let decoded = path
+        .replace("%2e", ".")
+        .replace("%2E", ".")
+        .replace("%2f", "/")
+        .replace("%2F", "/");
+
+    decoded.split('/').any(is_dot_segment)
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    segment == "." || segment == ".."
 }
 
 /// Route syntax shared by the compiler and the admin write path.
@@ -561,6 +610,14 @@ mod tests {
         RouteTable::compile(1, rows, &[]).expect("valid route table")
     }
 
+    fn found<'a>(table: &'a RouteTable, method: HttpMethod, path: &str) -> &'a CompiledRoute {
+        match table.resolve(&method, path) {
+            RouteMatch::Found(route) => route,
+            RouteMatch::MethodNotAllowed(_) => panic!("{path} matched but rejected the method"),
+            RouteMatch::NotFound => panic!("{path} did not match a route"),
+        }
+    }
+
     #[test]
     fn longest_prefix_wins() {
         let table = table(vec![
@@ -569,52 +626,61 @@ mod tests {
             row("people", "/api/people", &["GET"]),
         ]);
 
-        let route = table
-            .resolve(&HttpMethod::GET, "/api/people/1")
-            .expect("matched");
-
-        assert_eq!(route.id, "people");
+        assert_eq!(found(&table, HttpMethod::GET, "/api/people/1").id, "people");
     }
 
     #[test]
     fn prefix_matching_respects_segment_boundaries() {
         let table = table(vec![row("api", "/api", &["GET"])]);
 
-        assert!(
-            table
-                .resolve(&HttpMethod::GET, "/api")
-                .is_some()
-        );
-        assert!(
-            table
-                .resolve(&HttpMethod::GET, "/api/people")
-                .is_some()
-        );
-        assert!(
-            table
-                .resolve(&HttpMethod::GET, "/apix")
-                .is_none()
-        );
+        found(&table, HttpMethod::GET, "/api");
+        found(&table, HttpMethod::GET, "/api/people");
+        assert!(matches!(
+            table.resolve(&HttpMethod::GET, "/apix"),
+            RouteMatch::NotFound
+        ));
     }
 
     #[test]
-    fn method_must_match() {
+    fn wrong_method_is_rejected_with_allow_list() {
         let table = table(vec![row("api", "/api", &["GET"])]);
 
-        assert!(
-            table
-                .resolve(&HttpMethod::POST, "/api")
-                .is_none()
-        );
+        match table.resolve(&HttpMethod::POST, "/api") {
+            RouteMatch::MethodNotAllowed(allowed) => {
+                assert_eq!(allowed, vec![HttpMethod::GET, HttpMethod::HEAD]);
+            }
+            _ => panic!("expected method-not-allowed"),
+        }
     }
 
     #[test]
-    fn detects_dot_segments() {
+    fn head_is_implied_by_get() {
+        let table = table(vec![row("api", "/api", &["GET"])]);
+
+        assert_eq!(found(&table, HttpMethod::HEAD, "/api").id, "api");
+    }
+
+    #[test]
+    fn unknown_paths_are_not_found() {
+        let table = table(vec![row("api", "/api", &["GET"])]);
+
+        assert!(matches!(
+            table.resolve(&HttpMethod::GET, "/other"),
+            RouteMatch::NotFound
+        ));
+    }
+
+    #[test]
+    fn detects_dot_segments_including_encoded_ones() {
         assert!(has_dot_segments("/a/../b"));
         assert!(has_dot_segments("/a/./b"));
         assert!(has_dot_segments("/.."));
+        assert!(has_dot_segments("/a/%2e%2e/b"));
+        assert!(has_dot_segments("/a/%2E%2E/b"));
+        assert!(has_dot_segments("/a%2f..%2fb"));
         assert!(!has_dot_segments("/a/b"));
         assert!(!has_dot_segments("/a..b/c"));
+        assert!(!has_dot_segments("/a%2Fb"));
     }
 
     #[test]
@@ -650,9 +716,7 @@ mod tests {
         let mut route = row("api", "/api/people", &["GET"]);
         route.rewrite_prefix = Some("/people".to_owned());
         let table = table(vec![route]);
-        let route = table
-            .resolve(&HttpMethod::GET, "/api/people/1")
-            .expect("matched");
+        let route = found(&table, HttpMethod::GET, "/api/people/1");
 
         assert_eq!(route.upstream_path("/api/people/1"), "/people/1");
         assert_eq!(route.upstream_path("/api/people"), "/people");

@@ -156,7 +156,7 @@ struct Breaker {
 enum State {
     Closed { failures: u32 },
     Open { until: Instant },
-    HalfOpen,
+    HalfOpen { probing: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,12 +183,25 @@ impl BreakerRegistry {
             });
 
         match &mut breaker.state {
-            State::Closed { .. } | State::HalfOpen => Ok(()),
+            State::Closed { .. } => Ok(()),
+            // Exactly one request probes a recovered upstream; the rest are
+            // rejected until the probe resolves. Otherwise a thundering herd
+            // hits the upstream the moment the cooldown expires.
+            State::HalfOpen { probing } => {
+                if *probing {
+                    Err(BreakerRejection {
+                        retry_after: Duration::from_secs(1),
+                    })
+                } else {
+                    *probing = true;
+                    Ok(())
+                }
+            }
             State::Open { until } => {
                 let now = Instant::now();
 
                 if now >= *until {
-                    breaker.state = State::HalfOpen;
+                    breaker.state = State::HalfOpen { probing: true };
                     Ok(())
                 } else {
                     Err(BreakerRejection {
@@ -225,7 +238,7 @@ impl BreakerRegistry {
             State::Closed { failures } => State::Closed {
                 failures: failures + 1,
             },
-            State::HalfOpen | State::Open { .. } => State::Open {
+            State::HalfOpen { .. } | State::Open { .. } => State::Open {
                 until: Instant::now() + self.cooldown,
             },
         };
@@ -311,6 +324,25 @@ mod tests {
             registry.check("upstream").is_ok(),
             "half-open probe allowed"
         );
+    }
+
+    #[test]
+    fn only_one_half_open_probe_is_allowed() {
+        let registry = BreakerRegistry::new(&limits());
+
+        registry.record_failure("upstream");
+        registry.record_failure("upstream");
+
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert!(registry.check("upstream").is_ok(), "first probe allowed");
+        assert!(
+            registry.check("upstream").is_err(),
+            "second probe rejected while the first is in flight"
+        );
+
+        registry.record_success("upstream");
+        assert!(registry.check("upstream").is_ok(), "circuit closed again");
     }
 
     #[test]

@@ -196,12 +196,24 @@ fn inbound_headers(headers: &HeaderMap) -> HeaderMap {
 }
 
 fn upstream_error(error: reqwest::Error) -> AppError {
-    if error.is_timeout() {
-        tracing::warn!(%error, "upstream timed out");
+    // Never log `Display`: reqwest includes the full URL, which may carry
+    // client query parameters.
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else {
+        "request"
+    };
+
+    if kind == "timeout" {
+        tracing::warn!(kind, "upstream timed out");
         return AppError::UpstreamTimeout;
     }
 
-    tracing::warn!(%error, "upstream request failed");
+    tracing::warn!(kind, "upstream request failed");
     AppError::BadGateway
 }
 
@@ -210,7 +222,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use axum::{body::to_bytes, http::StatusCode};
+    use axum::{body::to_bytes, http::Request, http::StatusCode};
     use tower::ServiceExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -428,6 +440,39 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("\"code\":\"circuit_open\""));
+    }
+
+    #[tokio::test]
+    async fn forwards_head_when_get_is_allowed() {
+        let upstream = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/people/1"))
+            .respond_with(ResponseTemplate::new(200).insert_header("x-upstream", "yes"))
+            .mount(&upstream)
+            .await;
+
+        let (app, token) = testing::app(&upstream.uri(), Duration::from_secs(2));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/swapi/people/1")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream")
+                .unwrap(),
+            "yes"
+        );
     }
 
     #[test]

@@ -15,17 +15,18 @@ Delete anything a linter, test, or type already enforces. No repo tours.
 
 ## Invariants
 
-- `src/app.rs` layer order is a contract: request id first, then propagation, tracing,
-  panic catch, deadline, body limit. Reordering silently breaks correlation.
+- `src/app.rs` layer order is a contract: set request id, sanitise it, propagate, metrics,
+  tracing, panic catch, deadline, body limit. Reordering silently breaks correlation.
 - Every HTTP failure goes through `AppError` (`src/error.rs`). Do not invent ad-hoc
   status codes or response bodies; the envelope carries the request id.
 - Secrets never appear in logs, traces, error bodies, metric labels, or `Debug` output.
-  Key material is stored as verifiers only.
-- `src/proxy.rs` owns header hygiene: hop-by-hop and gateway credentials are stripped
-  in both directions. Adding a pass-through header is a security change, not a tweak.
-- `src/routes/upstream.rs` is the whole request pipeline: reject dot segments,
-  authenticate, resolve route, authorize, proxy. Keep it readable; hidden layers are
-  how policy gets skipped.
+  Key material is stored as verifiers only. Never log a `reqwest::Error` with `Display`:
+  it embeds the request URL and its query string.
+- `src/proxy.rs` owns header hygiene: hop-by-hop, `Connection`-named, forwarded, and
+  gateway-owned headers are stripped in both directions. Redirects are never followed.
+- `src/routes/upstream.rs` is the whole request pipeline: reject malformed paths, limits,
+  authenticate, resolve, authorize, proxy. Keep it readable; hidden layers are how policy
+  gets skipped.
 - `unwrap`/`expect` are allowed only in bootstrap and tests.
 - All environment access lives in `src/config.rs`. A new setting needs a validation
   rule and a test in the same change.
@@ -34,6 +35,8 @@ Delete anything a linter, test, or type already enforces. No repo tours.
 - Admin mutations go through `src/admin`; the CLI is one adapter over that service.
 - Limits and breakers are in-process state (`src/limits.rs`). They are per replica and
   deliberately not shared; do not add cross-request locks outside those structures.
+- Anything personal — local deploy config, credentials, scratch notes — lives in
+  `.local/`, which is gitignored. Never reference a personal path from tracked files.
 
 ## Working style
 

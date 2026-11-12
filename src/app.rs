@@ -1,7 +1,9 @@
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode},
+    http::Request,
+    http::{HeaderValue, header},
+    response::IntoResponse,
 };
 use opentelemetry::{global, trace::TraceContextExt};
 use std::time::Instant;
@@ -10,12 +12,12 @@ use tower_http::{
     catch_panic::CatchPanicLayer,
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::config::Config;
+use crate::error::AppError;
 use crate::{request_context, state};
 
 /// Builds the gateway with the canonical layer order.
@@ -62,15 +64,22 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
 
     let layers = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(PropagateRequestIdLayer::x_request_id())
+        // Sanitise before propagation so the response echoes the value we
+        // actually logged, not a client-supplied one.
         .layer(axum::middleware::from_fn(record_request_id))
+        .layer(PropagateRequestIdLayer::x_request_id())
         .layer(axum::middleware::from_fn(record_metrics))
         .layer(trace_layer)
         .layer(CatchPanicLayer::new())
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
+        .layer(axum::middleware::from_fn_with_state(
             config.server.request_timeout,
+            request_deadline,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            config.server.request_body_limit_bytes,
+            reject_declared_oversize,
+        ))
+        // Streaming backstop for chunked bodies without a Content-Length.
         .layer(RequestBodyLimitLayer::new(
             config.server.request_body_limit_bytes,
         ));
@@ -78,16 +87,64 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
     crate::routes::router(state).layer(layers)
 }
 
-async fn record_request_id(
+/// Rejects oversized bodies with the gateway's error envelope. The tower
+/// limit layer below still enforces the limit while streaming.
+async fn reject_declared_oversize(
+    axum::extract::State(limit): axum::extract::State<usize>,
     request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+
+    if declared.is_some_and(|length| length > limit) {
+        return AppError::PayloadTooLarge.into_response();
+    }
+
+    next.run(request).await
+}
+
+/// Whole-request deadline with the gateway's error envelope.
+async fn request_deadline(
+    axum::extract::State(timeout): axum::extract::State<std::time::Duration>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match tokio::time::timeout(timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => AppError::RequestTimeout.into_response(),
+    }
+}
+
+/// Keeps log lines and response headers safe: bounded length, printable ASCII.
+fn is_valid_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+}
+
+async fn record_request_id(
+    mut request: Request<Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let request_id = request
         .headers()
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
+        .filter(|value| is_valid_request_id(value))
         .map(str::to_owned)
-        .unwrap_or_else(|| "unknown".to_owned());
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        request
+            .headers_mut()
+            .insert("x-request-id", value);
+    }
 
     request_context::scope(request_id, next.run(request)).await
 }
