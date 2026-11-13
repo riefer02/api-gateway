@@ -48,6 +48,9 @@ just run                      # applies migrations, seeds the dev key
 just demo-route               # in a second shell: registers /swapi -> swapi.dev
 ```
 
+If port 5432 is already taken, set `DB_HOST_PORT` and the matching port in
+`DATABASE_URL` — the container always listens on 5432 internally, so nothing else changes.
+
 ```bash
 curl -s localhost:8080/health          # liveness
 curl -s localhost:8080/ready           # readiness (checks Postgres)
