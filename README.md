@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~9k lines of Rust, 105 tests, one binary, a distroless image with no
+**At a glance:** ~9k lines of Rust, 121 tests, one binary, a distroless image with no
 shell, and a measured +0.32 ms p50 over a direct call at 78k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -431,8 +431,14 @@ terminates at the edge rather than in the gateway.
 | `just deny` | Licenses, advisories, duplicates, wildcards |
 | `just bench` | Measures gateway overhead against a local stub upstream |
 | `just replicas` | Starts two replicas and proves revocation + route convergence |
+| `just mutants` | Mutation testing (needs `cargo install cargo-mutants`; slow, on demand) |
 | `just demo-route` | Registers the demo upstream and route |
 | `just db-up` / `just db-down` / `just db-logs` | Local Postgres |
 
 Rules: CI must be green before a change lands; no `unwrap` on request paths; secrets never
 reach logs or error bodies; new dependencies go through `cargo add` and must pass `just deny`.
+
+The suite runs in about a second. Database tests run only when `DATABASE_URL` is set and
+fail loudly, with a hint, when it is unreachable — they never skip silently. Property tests
+cover the path, header, and client-identity invariants; `just mutants` runs mutation testing
+on demand (currently no surviving mutants in `retry`, `error`, or `net`).

@@ -201,21 +201,26 @@ impl CompiledRoute {
 
     /// The path to request upstream, after prefix stripping and rewriting.
     pub(crate) fn upstream_path(&self, path: &str) -> String {
-        let remainder = if self.path_prefix == "/" {
-            path
-        } else {
-            path.strip_prefix(&self.path_prefix)
-                .unwrap_or("")
-        };
+        translate_path(path, &self.path_prefix, self.rewrite_prefix.as_deref())
+    }
+}
 
-        // `/api/people` and `/api/people/` must map to the same upstream path.
-        let remainder = remainder.trim_end_matches('/');
+/// Strips the matched prefix and applies an optional rewrite.
+///
+/// `/api/people` and `/api/people/` map to the same upstream path.
+fn translate_path(path: &str, prefix: &str, rewrite: Option<&str>) -> String {
+    let remainder = if prefix == "/" {
+        path
+    } else {
+        path.strip_prefix(prefix).unwrap_or("")
+    };
 
-        match &self.rewrite_prefix {
-            Some(prefix) => format!("{prefix}{remainder}"),
-            None if remainder.is_empty() => "/".to_owned(),
-            None => remainder.to_owned(),
-        }
+    let remainder = remainder.trim_end_matches('/');
+
+    match rewrite {
+        Some(rewrite) => format!("{rewrite}{remainder}"),
+        None if remainder.is_empty() => "/".to_owned(),
+        None => remainder.to_owned(),
     }
 }
 
@@ -843,5 +848,96 @@ mod tests {
 
         assert_eq!(route.upstream_path("/api/people/1"), "/people/1");
         assert_eq!(route.upstream_path("/api/people"), "/people");
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn safe_path() -> impl Strategy<Value = String> {
+        prop::collection::vec("[A-Za-z0-9_~-]{1,10}", 0..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The invariant the backslash bug broke: a path we accept must survive the
+        /// URL parser without becoming a dot segment or a second separator.
+        #[test]
+        fn accepted_paths_do_not_normalize_into_dot_segments(path in safe_path()) {
+            prop_assert!(!is_unsafe_path(&path));
+
+            let url = reqwest::Url::parse(&format!("http://upstream.test{path}"))
+                .expect("safe paths parse");
+
+            prop_assert!(!url.path().contains('\\'));
+            prop_assert!(
+                !url.path().split('/').any(|segment| segment == "." || segment == ".."),
+                "accepted path {} normalized to {}",
+                path,
+                url.path()
+            );
+        }
+
+        /// Every spelling of traversal we know of is rejected, wherever it appears.
+        #[test]
+        fn traversal_is_rejected_in_any_position(
+            prefix in prop::collection::vec("[a-z]{1,6}", 0..2),
+            payload in prop_oneof![
+                Just("..".to_owned()),
+                Just(".".to_owned()),
+                Just("%2e%2e".to_owned()),
+                Just("%2E%2E".to_owned()),
+                Just("..\\..".to_owned()),
+                Just("%5c..".to_owned()),
+                Just("%2f..".to_owned()),
+            ],
+        ) {
+            let path = format!("/{}/{payload}/admin", prefix.join("/"));
+            prop_assert!(is_unsafe_path(&path), "{} was accepted", path);
+        }
+
+        /// Translation is exactly "strip the prefix, then append to the rewrite".
+        #[test]
+        fn translation_matches_the_oracle(
+            tail in prop::collection::vec("[a-z]{1,8}", 0..3),
+            rewrite in prop::option::of(Just("/rw".to_owned())),
+        ) {
+            let prefix = "/api";
+            let path = if tail.is_empty() {
+                prefix.to_owned()
+            } else {
+                format!("{prefix}/{}", tail.join("/"))
+            };
+
+            let translated = translate_path(&path, prefix, rewrite.as_deref());
+            let remainder = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", tail.join("/"))
+            };
+
+            match rewrite {
+                Some(rewrite) => prop_assert_eq!(translated, format!("{rewrite}{remainder}")),
+                None if remainder.is_empty() => prop_assert_eq!(translated, "/".to_owned()),
+                None => prop_assert_eq!(translated, remainder),
+            }
+        }
+
+        /// Whatever path we forward stays under the upstream's base path.
+        #[test]
+        fn translation_never_escapes_the_prefix(
+            tail in prop::collection::vec("[a-z]{1,8}", 0..3),
+        ) {
+            let prefix = "/api";
+            let path = format!("{prefix}/{}", tail.join("/"));
+            let translated = translate_path(&path, prefix, None);
+
+            prop_assert!(translated.starts_with('/'));
+            prop_assert!(!translated.split('/').any(|segment| segment == ".."));
+        }
     }
 }

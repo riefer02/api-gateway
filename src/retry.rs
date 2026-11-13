@@ -43,15 +43,18 @@ impl RetryPolicy {
 
     /// Exponential backoff with full jitter, capped at one second.
     pub(crate) fn delay(&self, attempt: u32) -> Duration {
+        self.ceiling(attempt)
+            .mul_f64(fastrand::f64())
+    }
+
+    /// The upper bound for an attempt, before jitter. Kept separate so the
+    /// growth curve is testable without depending on randomness.
+    fn ceiling(&self, attempt: u32) -> Duration {
         let exponent = attempt.saturating_sub(1).min(4);
-        let ceiling = self
-            .base_delay
+
+        self.base_delay
             .saturating_mul(1 << exponent)
-            .min(Duration::from_secs(1));
-
-        let jitter = fastrand::f64();
-
-        ceiling.mul_f64(jitter)
+            .min(Duration::from_secs(1))
     }
 
     pub(crate) fn should_retry_status(status: StatusCode) -> bool {
@@ -207,7 +210,8 @@ mod tests {
 
         let mut allowed = 0;
 
-        while policy.try_retry() {
+        // Bounded loop: a broken budget must fail the assertion, not hang.
+        while allowed < 1_000 && policy.try_retry() {
             allowed += 1;
         }
 
@@ -215,14 +219,49 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_and_is_bounded() {
+    fn backoff_ceiling_doubles_per_attempt() {
+        let policy = policy(5, 0.2);
+
+        assert_eq!(policy.ceiling(1), Duration::from_millis(10));
+        assert_eq!(policy.ceiling(2), Duration::from_millis(20));
+        assert_eq!(policy.ceiling(3), Duration::from_millis(40));
+        assert_eq!(policy.ceiling(4), Duration::from_millis(80));
+    }
+
+    #[test]
+    fn backoff_is_capped_at_one_second() {
+        // A large base is the only way to reach the cap.
+        let policy = RetryPolicy::new(&RetryConfig {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(500),
+            budget_ratio: 0.2,
+        });
+
+        assert_eq!(policy.ceiling(4), Duration::from_secs(1));
+        assert_eq!(policy.ceiling(9), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn delay_never_exceeds_its_ceiling() {
         let policy = policy(5, 0.2);
 
         for attempt in 1..=6 {
-            let delay = policy.delay(attempt);
-            assert!(delay <= Duration::from_secs(1));
+            assert!(policy.delay(attempt) <= policy.ceiling(attempt));
         }
+    }
 
-        assert!(policy.delay(1) <= Duration::from_millis(10));
+    #[test]
+    fn delay_is_jittered_rather_than_always_zero() {
+        let policy = policy(5, 0.2);
+
+        // With full jitter any single sample may be zero; a broken
+        // implementation is zero every time.
+        let largest = (0..64)
+            .map(|_| policy.delay(4))
+            .max()
+            .expect("samples");
+
+        assert!(largest > Duration::ZERO);
+        assert!(largest <= policy.ceiling(4));
     }
 }

@@ -170,3 +170,44 @@ mod tests {
         assert_eq!(client, "10.0.0.1".parse::<IpAddr>().unwrap());
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// The address we charge must never be one of our own proxies, or every
+        /// caller behind the same proxy would share its bucket.
+        #[test]
+        fn the_client_is_never_a_trusted_hop(
+            entries in prop::collection::vec(
+                prop_oneof![
+                    (0u8..=255).prop_map(|octet| format!("203.0.113.{octet}")),
+                    (0u8..=255).prop_map(|octet| format!("10.0.0.{octet}")),
+                ],
+                1..6,
+            ),
+        ) {
+            let proxies = TrustedProxies::parse(&["10.0.0.0/8".to_owned()]).expect("valid");
+            let chain = entries.join(", ");
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", chain.parse().unwrap());
+
+            let client = proxies.client_ip("10.0.0.1".parse().unwrap(), &headers);
+
+            let all_trusted = entries
+                .iter()
+                .all(|entry| proxies.contains(entry.parse().unwrap()));
+
+            prop_assert!(
+                !proxies.contains(client) || all_trusted,
+                "reported trusted address {:?} for chain {:?}",
+                client,
+                chain
+            );
+        }
+    }
+}

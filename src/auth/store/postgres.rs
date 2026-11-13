@@ -235,7 +235,9 @@ mod tests {
             .max_connections(2)
             .connect(&url)
             .await
-            .expect("connect to DATABASE_URL");
+            .unwrap_or_else(|error| {
+                panic!("cannot reach DATABASE_URL ({error}); start Postgres with `just db-up`")
+            });
 
         crate::db::migrate(&pool)
             .await

@@ -42,9 +42,15 @@ struct Bucket {
 
 impl RateLimiter {
     pub(crate) fn new(per_minute: u32) -> Self {
-        const SHARDS: usize = 16;
-
         let capacity = f64::from(per_minute);
+
+        Self::with_rates(capacity, capacity / 60.0)
+    }
+
+    /// Explicit capacity and refill rate. `new` derives the rate from the
+    /// per-minute allowance; tests use this to observe a refill quickly.
+    pub(crate) fn with_rates(capacity: f64, refill_per_second: f64) -> Self {
+        const SHARDS: usize = 16;
 
         Self {
             shards: (0..SHARDS)
@@ -56,7 +62,7 @@ impl RateLimiter {
                 })
                 .collect(),
             capacity,
-            refill_per_second: capacity / 60.0,
+            refill_per_second,
         }
     }
 
@@ -377,15 +383,13 @@ mod tests {
 
     #[test]
     fn refills_over_time() {
-        let limiter = RateLimiter::new(60);
+        // One token, refilled a thousand times a second.
+        let limiter = RateLimiter::with_rates(1.0, 1_000.0);
 
-        for _ in 0..60 {
-            assert!(matches!(limiter.check("ip:a"), Decision::Allowed { .. }));
-        }
-
+        assert!(matches!(limiter.check("ip:a"), Decision::Allowed { .. }));
         assert!(matches!(limiter.check("ip:a"), Decision::Denied { .. }));
 
-        std::thread::sleep(Duration::from_millis(1_100));
+        std::thread::sleep(Duration::from_millis(10));
 
         assert!(matches!(limiter.check("ip:a"), Decision::Allowed { .. }));
     }

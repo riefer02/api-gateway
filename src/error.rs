@@ -221,3 +221,196 @@ impl IntoResponse for AppError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn render(error: AppError) -> Response {
+        error.into_response()
+    }
+
+    #[tokio::test]
+    async fn every_variant_maps_to_a_status_and_a_stable_code() {
+        let cases = [
+            (
+                AppError::bad_request("bad"),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+            ),
+            (
+                AppError::Unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+            ),
+            (AppError::Forbidden, StatusCode::FORBIDDEN, "forbidden"),
+            (AppError::not_found(), StatusCode::NOT_FOUND, "not_found"),
+            (
+                AppError::PayloadTooLarge,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+            ),
+            (
+                AppError::RequestTimeout,
+                StatusCode::REQUEST_TIMEOUT,
+                "request_timeout",
+            ),
+            (
+                AppError::MethodNotAllowed {
+                    allowed: vec![axum::http::Method::GET],
+                },
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+            ),
+            (
+                AppError::RateLimited {
+                    retry_after_secs: 5,
+                    limit: 10,
+                    reset_after_secs: 5,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            ),
+            (
+                AppError::CircuitOpen {
+                    retry_after_secs: 30,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "circuit_open",
+            ),
+            (
+                AppError::UpstreamTimeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+            ),
+            (AppError::BadGateway, StatusCode::BAD_GATEWAY, "bad_gateway"),
+            (
+                AppError::ServiceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+            ),
+            (
+                AppError::internal("boom"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        ];
+
+        for (error, status, code) in cases {
+            let response = render(error).await;
+            assert_eq!(response.status(), status, "status for {code}");
+
+            let body = to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+
+            assert_eq!(json["error"]["code"], code);
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "message for {code} is empty"
+            );
+            assert!(
+                json["error"]
+                    .get("request_id")
+                    .is_some()
+            );
+        }
+    }
+
+    /// The caller-supplied text is what a client sees, so it must survive.
+    #[tokio::test]
+    async fn bad_request_keeps_the_caller_facing_message() {
+        let response = render(AppError::bad_request("field `name` is required")).await;
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+
+        assert_eq!(json["error"]["message"], "field `name` is required");
+    }
+
+    #[tokio::test]
+    async fn circuit_open_carries_retry_after() {
+        let response = render(AppError::CircuitOpen {
+            retry_after_secs: 12,
+        })
+        .await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .unwrap(),
+            "12"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_offers_a_challenge() {
+        let response = render(AppError::Unauthorized).await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_carries_retry_metadata() {
+        let response = render(AppError::RateLimited {
+            retry_after_secs: 7,
+            limit: 60,
+            reset_after_secs: 7,
+        })
+        .await;
+
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .unwrap(),
+            "7"
+        );
+        assert_eq!(headers.get("ratelimit-limit").unwrap(), "60");
+        assert_eq!(headers.get("ratelimit-reset").unwrap(), "7");
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_lists_the_methods() {
+        let response = render(AppError::MethodNotAllowed {
+            allowed: vec![axum::http::Method::GET, axum::http::Method::HEAD],
+        })
+        .await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ALLOW)
+                .unwrap(),
+            "GET, HEAD"
+        );
+    }
+
+    /// The whole point of the internal variant: the cause is for logs, never
+    /// for the client.
+    #[tokio::test]
+    async fn internal_errors_do_not_leak_their_cause() {
+        let response = render(AppError::internal("secret database detail")).await;
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!body.contains("secret database detail"));
+        assert!(body.contains("\"code\":\"internal_error\""));
+    }
+}

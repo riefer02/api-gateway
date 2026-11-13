@@ -53,6 +53,10 @@ bench:
 replicas:
     ./scripts/replicas.sh
 
+# Mutation testing (slow, on demand only). Needs `cargo install cargo-mutants`.
+mutants:
+    cargo mutants --jobs 4
+
 up:
     docker compose up -d --build
 

@@ -795,3 +795,55 @@ mod tests {
         assert_eq!(url.as_str(), "https://swapi.dev/api/people/a%20b");
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Whatever the caller puts in a forwarding, credential, or
+        /// connection-named header must not reach the upstream.
+        #[test]
+        fn caller_controlled_headers_never_reach_the_upstream(
+            connection_token in "[a-z]{3,10}",
+            forwarded in prop::sample::select(vec![
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-proto",
+                "x-forwarded-port",
+                "true-client-ip",
+                "cf-connecting-ip",
+                "x-real-ip",
+                "x-http-method-override",
+            ]),
+        ) {
+            let request = Request::builder()
+                .uri("/x")
+                .header(header::CONNECTION, &connection_token)
+                .header(connection_token.as_str(), "1")
+                .header(forwarded, "203.0.113.9")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .header(header::COOKIE, "session=abc")
+                .header("x-keep-me", "yes")
+                .body(Body::empty())
+                .unwrap();
+
+            let (parts, _) = request.into_parts();
+            let headers = outbound_headers(&parts);
+
+            prop_assert!(!headers.contains_key(forwarded));
+            prop_assert!(!headers.contains_key(header::AUTHORIZATION));
+            prop_assert!(!headers.contains_key(header::COOKIE));
+            prop_assert!(
+                !headers.contains_key(connection_token.as_str()),
+                "header named by Connection survived"
+            );
+            prop_assert_eq!(headers.get("x-keep-me").and_then(|v| v.to_str().ok()), Some("yes"));
+        }
+    }
+}

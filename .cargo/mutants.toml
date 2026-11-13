@@ -1,0 +1,20 @@
+# cargo-mutants configuration. Run with `just mutants`.
+#
+# Mutation testing is a review tool, not a gate: every mutant recompiles and
+# reruns the suite, so it belongs on demand or nightly (see ADR 0001).
+
+# Generated and example code has no meaningful mutation surface.
+exclude_globs = [
+    "examples/*",
+    "tests/*",
+]
+
+# Process wiring and concrete IO adapters: a surviving mutant here usually means
+# "no test covers the framework call", not a gap in domain logic.
+exclude_re = [
+    "^src/observability\\.rs$",
+    "^src/db\\.rs$",
+]
+
+# Generous compared to the ~1s suite, because a mutant can make a test hang.
+timeout_multiplier = 3.0
