@@ -223,37 +223,8 @@ pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{pg_pool, unique};
     use std::collections::HashSet;
-
-    use sqlx::postgres::PgPoolOptions;
-
-    /// Runs against a real Postgres. Skipped when DATABASE_URL is unset so the
-    /// default `cargo test` stays hermetic.
-    async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("cannot reach DATABASE_URL ({error}); start Postgres with `just db-up`")
-            });
-
-        crate::db::migrate(&pool)
-            .await
-            .expect("apply migrations");
-
-        Some(pool)
-    }
-
-    fn unique(prefix: &str) -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-
-        format!("{prefix}-{}-{nanos}", std::process::id())
-    }
 
     async fn provision(pool: &PgPool) -> (TenantId, ClientId) {
         let tenant_id = TenantId(unique("tenant"));
@@ -294,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trips_a_credential() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = pg_pool().await else {
             eprintln!("skipping: DATABASE_URL is not set");
             return;
         };
@@ -354,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_notifies_other_replicas() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = pg_pool().await else {
             eprintln!("skipping: DATABASE_URL is not set");
             return;
         };
@@ -402,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_key_returns_none() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = pg_pool().await else {
             eprintln!("skipping: DATABASE_URL is not set");
             return;
         };

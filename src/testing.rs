@@ -42,6 +42,36 @@ fn lazy_pool() -> sqlx::PgPool {
         .expect("lazy pool")
 }
 
+/// A database for the tests that need one. Skips when `DATABASE_URL` is unset,
+/// and fails with a hint when it is set but unusable — never a silent skip.
+pub(crate) async fn pg_pool() -> Option<sqlx::PgPool> {
+    let url = std::env::var("DATABASE_URL").ok()?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("cannot reach DATABASE_URL ({error}); start Postgres with `just db-up`")
+        });
+
+    crate::db::migrate(&pool)
+        .await
+        .expect("apply migrations");
+
+    Some(pool)
+}
+
+/// Unique identifiers keep parallel database tests from colliding.
+pub(crate) fn unique(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
 pub(crate) fn metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics_exporter_prometheus::PrometheusBuilder::new()
         .build_recorder()

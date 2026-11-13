@@ -941,3 +941,149 @@ mod property_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod behaviour_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn empty_table(version: i64) -> RouteTable {
+        RouteTable::for_tests(version, Vec::new())
+    }
+
+    #[test]
+    fn prefix_validation_rejects_bad_shapes() {
+        for bad in ["api", "/api/", "/a/../b", "/a\\b", "/./x", "/.."] {
+            assert!(validate_path_prefix(bad).is_err(), "accepted prefix {bad}");
+        }
+
+        for good in ["/", "/api", "/api/v1"] {
+            assert!(validate_path_prefix(good).is_ok(), "rejected prefix {good}");
+        }
+    }
+
+    #[test]
+    fn rewrite_validation_rejects_bad_shapes() {
+        for bad in ["api", "/a/../b", "/a\\b"] {
+            assert!(validate_rewrite(bad).is_err(), "accepted rewrite {bad}");
+        }
+
+        for good in ["/", "/api", "/v1/billing"] {
+            assert!(validate_rewrite(good).is_ok(), "rejected rewrite {good}");
+        }
+    }
+
+    #[test]
+    fn upstream_validation_rejects_unsafe_urls() {
+        assert!(validate_upstream_url("ftp://x.test", &[]).is_err());
+        assert!(validate_upstream_url("https://user@x.test", &[]).is_err());
+        assert!(validate_upstream_url("https://user:pw@x.test", &[]).is_err());
+        assert!(validate_upstream_url("https://x.test", &["other.test".to_owned()]).is_err());
+        assert!(validate_upstream_url("https://x.test", &["x.test".to_owned()]).is_ok());
+        assert!(validate_upstream_url("https://x.test", &[]).is_ok());
+    }
+
+    #[test]
+    fn truncated_escapes_are_not_mistaken_for_traversal() {
+        // Percent-escape parsing must not read past the end or invent a match.
+        for harmless in ["/a/%2", "/a/%zz", "/a2e", "/a5c", "/a/%"] {
+            assert!(!has_dot_segments(harmless), "flagged {harmless}");
+        }
+    }
+
+    #[test]
+    fn an_empty_table_reports_no_routes() {
+        let table = empty_table(1);
+
+        assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn replace_if_newer_ignores_older_and_equal_versions() {
+        let handle = RouteTableHandle::new(empty_table(5));
+
+        assert!(!handle.replace_if_newer(empty_table(5)), "equal version");
+        assert_eq!(handle.snapshot().version(), 5);
+
+        assert!(!handle.replace_if_newer(empty_table(4)), "older version");
+        assert_eq!(handle.snapshot().version(), 5);
+
+        assert!(handle.replace_if_newer(empty_table(6)), "newer version");
+        assert_eq!(handle.snapshot().version(), 6);
+    }
+
+    #[test]
+    fn refreshing_clears_staleness() {
+        let handle = RouteTableHandle::new(empty_table(1)).with_stale_after(Duration::ZERO);
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(handle.is_stale());
+
+        handle.mark_refreshed();
+        assert!(!handle.is_stale());
+    }
+
+    #[test]
+    fn route_table_errors_describe_themselves() {
+        use std::error::Error as _;
+
+        let invalid = RouteTableError::Invalid(vec!["route `a`: broken".to_owned()]);
+        assert!(
+            invalid
+                .to_string()
+                .contains("route `a`: broken")
+        );
+        assert!(invalid.source().is_none());
+
+        let store = RouteTableError::Store(sqlx::Error::RowNotFound);
+        assert!(store.source().is_some());
+        assert!(!store.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_and_refresh_follow_the_version_counter() {
+        let Some(pool) = crate::testing::pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let source = RouteSource::new(pool.clone(), Vec::new());
+
+        let before = source.version().await.expect("version");
+
+        // Distinguish a real read from a constant.
+        sqlx::query("UPDATE route_table_state SET version = version + 1 WHERE only_one")
+            .execute(&pool)
+            .await
+            .expect("bump version");
+
+        let after = source.version().await.expect("version");
+        assert_eq!(after, before + 1);
+
+        let handle = RouteTableHandle::new(source.load().await.expect("load"));
+        let refresh = RouteRefresh::new(source, handle.clone(), Duration::from_secs(1));
+
+        assert!(
+            !refresh
+                .refresh_once()
+                .await
+                .expect("refresh"),
+            "no change"
+        );
+
+        sqlx::query("UPDATE route_table_state SET version = version + 1 WHERE only_one")
+            .execute(&pool)
+            .await
+            .expect("bump version");
+
+        assert!(
+            refresh
+                .refresh_once()
+                .await
+                .expect("refresh"),
+            "changed"
+        );
+        assert_eq!(handle.snapshot().version(), after + 1);
+    }
+}

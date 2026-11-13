@@ -1070,11 +1070,11 @@ fn is_reference_violation(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
+    use crate::testing::{pg_pool, unique};
 
     #[tokio::test]
     async fn deleting_a_referenced_tenant_is_a_conflict() {
-        let Some(pool) = pool().await else {
+        let Some(pool) = pg_pool().await else {
             eprintln!("skipping: DATABASE_URL is not set");
             return;
         };
@@ -1137,35 +1137,9 @@ mod tests {
         );
     }
 
-    async fn pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("cannot reach DATABASE_URL ({error}); start Postgres with `just db-up`")
-            });
-
-        crate::db::migrate(&pool)
-            .await
-            .expect("apply migrations");
-
-        Some(pool)
-    }
-
-    fn unique(prefix: &str) -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-
-        format!("{prefix}-{}-{nanos}", std::process::id())
-    }
-
     #[tokio::test]
     async fn mutations_record_the_actor_and_source() {
-        let Some(pool) = pool().await else {
+        let Some(pool) = pg_pool().await else {
             eprintln!("skipping: DATABASE_URL is not set");
             return;
         };
