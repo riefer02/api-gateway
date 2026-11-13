@@ -6,3 +6,5 @@
 # local plans and notes (never committed)
 *.local.md
 .local/
+# cargo-mutants output
+/mutants.out*
