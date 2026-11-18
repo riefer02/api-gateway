@@ -297,6 +297,14 @@ These are the integration failures that actually block a connector:
   and `https://claude.com/api/mcp/auth_callback`; allowlist both.
 - **PKCE S256 metadata is mandatory**; a missing
   `code_challenge_methods_supported: ["S256"]` is a hard connector failure.
+- **Keycloak realm imports skip the standard client scopes.** `--import-realm`
+  creates only what the JSON lists, so a hand-written realm has no `profile`,
+  `email`, `roles`, `web-origins`, `acr`, or `basic` scope. Tokens then carry no
+  `realm_access`/`resource_access`, and the built-in account console returns
+  `403` after login. Create the realm through the admin API, or import the
+  standard scopes and assign them to the `account` and `account-console`
+  clients (Keycloak 26 ignores `defaultClientScopes` in a client update; use the
+  `clients/{id}/default-client-scopes/{scopeId}` endpoint).
 
 ## 11. Questions to settle with the client
 
