@@ -1,5 +1,7 @@
 //! Minimal MCP upstream for local demos and tests.
 //!
+//! Set `MCP_STUB_HOST=0.0.0.0` when it runs in a container so the gateway can
+//! reach it; the default is loopback for local use.
 //! It is intentionally not a real MCP implementation: it answers
 //! `tools/list`, `tools/call`, and `server/discover` well enough to exercise
 //! the gateway's policy, audit, and timing paths. No authentication.
@@ -9,12 +11,13 @@ use serde_json::{Value, json};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let host = std::env::var("MCP_STUB_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
     let port = std::env::var("MCP_STUB_PORT").unwrap_or_else(|_| "18100".to_owned());
 
     let app = Router::new().route("/mcp", post(handle));
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
-    eprintln!("MCP stub listening on http://127.0.0.1:{port}/mcp");
+    let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
+    eprintln!("MCP stub listening on http://{host}:{port}/mcp");
 
     axum::serve(listener, app).await?;
 
