@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~16k lines of Rust, 222 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 222 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -24,7 +24,7 @@ Working data plane and control plane. API-key and OAuth resource-server authenti
 bounded-staleness credential cache, a Postgres-backed route table with live reload, streaming proxy with strict header
 hygiene, per-IP and per-tenant rate limits, per-upstream circuit breakers, Prometheus
 metrics, OpenTelemetry traces, and graceful shutdown. The control plane is available as
-both a CLI and an HTTP API. Ships as a distroless container with a compose stack.
+both a CLI and an HTTP API.
 
 Ships with a distroless image, a compose stack, Kubernetes manifests, and a Caddy
 edge-TLS example. Not built: distributed rate limiting (needs more than one replica for

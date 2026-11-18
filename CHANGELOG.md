@@ -60,6 +60,9 @@ versions follow [Semantic Versioning](https://semver.org).
   process budget and reports a timeout.
 - **Streaming.** Response bodies have an idle timeout; `max_response_bytes: 0` means
   unlimited; filtered policy responses are capped at 4 MiB.
+- **Demo stub binding.** `examples/mcp_stub.rs` now honors `MCP_STUB_HOST` (default
+  loopback). It previously bound `127.0.0.1` unconditionally, so the gateway container
+  could not reach it in the compose demo.
 - **CORS.** `Mcp-Name` is allowed on preflight; upstream `Access-Control-*` headers
   are stripped so the gateway owns the policy.
 - **Token and cache hardening.** Bearer/key-id length caps, local-only revocation
