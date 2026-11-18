@@ -51,10 +51,21 @@ fn answer(request: &Value) -> Value {
             "serverInfo": { "name": "mcp-stub", "version": "0.1.0" }
         }),
         "server/discover" => json!({
-            "protocolVersion": "2026-07-28",
-            "capabilities": { "tools": {} }
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": { "tools": {} },
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "mcp-stub",
+                    "version": "0.1.0"
+                }
+            },
+            "instructions": "Demo ticket server. search_tickets reads; delete_ticket is a write.",
+            "ttlMs": 3_600_000,
+            "cacheScope": "public"
         }),
         "tools/list" => json!({
+            "resultType": "complete",
             "tools": [
                 {
                     "name": "search_tickets",
@@ -72,7 +83,9 @@ fn answer(request: &Value) -> Value {
                         "properties": { "id": { "type": "string" } }
                     }
                 }
-            ]
+            ],
+            "ttlMs": 300_000,
+            "cacheScope": "public"
         }),
         "tools/call" => {
             let tool = request
