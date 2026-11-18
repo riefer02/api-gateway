@@ -305,6 +305,18 @@ These are the integration failures that actually block a connector:
   standard scopes and assign them to the `account` and `account-console`
   clients (Keycloak 26 ignores `defaultClientScopes` in a client update; use the
   `clients/{id}/default-client-scopes/{scopeId}` endpoint).
+- **ChatGPT connectors call `server/discover` before anything else.** The
+  upstream must return the `2026-07-28` result shape (`resultType`,
+  `supportedVersions`, `serverInfo` under `_meta`, `ttlMs`, `cacheScope`). A
+  server that answers with the legacy `initialize` shape produces
+  "Authentication succeeded, action discovery failed" after a successful OAuth
+  flow, which looks like an auth bug but is a payload-shape bug.
+- **ChatGPT's automatic client registration usually does not work against a
+  hardened IdP.** Anonymous DCR is blocked by default (trusted-host policy) and
+  CIMD is not advertised by Keycloak. Use "User-Defined OAuth Client" with a
+  pre-registered public client and the callback
+  `https://chatgpt.com/connector_platform_oauth_redirect`, and grant `email`
+  and `offline_access` or the token request fails with `invalid_scope`.
 
 ## 11. Questions to settle with the client
 
