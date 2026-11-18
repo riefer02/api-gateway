@@ -42,7 +42,58 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let pool = db::connect(&config.database).await?;
     db::migrate(&pool).await?;
 
+    // Install the recorder before any component can set a gauge or counter.
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+
     let verifier = Arc::new(KeyVerifier::new(config.auth.pepper.clone()));
+    let oauth = config
+        .oauth
+        .as_ref()
+        .map(crate::auth::oauth::OAuth::new)
+        .transpose()
+        .map_err(|problem| format!("OAUTH configuration: {problem}"))?
+        .map(Arc::new);
+
+    if let Some(oauth) = &oauth
+        && let Err(error) = oauth.warm().await
+    {
+        // API-key traffic can still start; OAuth requests will fail closed
+        // until the key set is reachable.
+        tracing::warn!(?error, "could not warm the JWKS cache");
+    }
+
+    let exchange = config
+        .oauth
+        .as_ref()
+        .and_then(|oauth| oauth.token_exchange.as_ref())
+        .map(crate::auth::exchange::TokenExchange::new)
+        .transpose()
+        .map_err(|problem| format!("token exchange configuration: {problem}"))?
+        .map(Arc::new);
+
+    let (audit_sink, audit_receiver): (Arc<dyn crate::audit::AuditSink>, _) =
+        if config.data_audit.enabled {
+            let (sink, receiver) =
+                crate::audit::ChannelAudit::new(config.data_audit.queue_capacity);
+            (sink, Some(receiver))
+        } else {
+            (Arc::new(crate::audit::DisabledAudit), None)
+        };
+
+    let data_audit_task = audit_receiver.map(|receiver| {
+        tokio::spawn(crate::audit::run(
+            pool.clone(),
+            receiver,
+            config.data_audit.batch_size,
+        ))
+    });
+    let data_retention_task = (!config.data_audit.retention.is_zero()).then(|| {
+        tokio::spawn(crate::audit::run_retention(
+            pool.clone(),
+            config.data_audit.retention,
+        ))
+    });
+
     let mut revocation_task = None;
 
     let store: Arc<dyn ApiKeyStore> = if config.auth.cache_ttl.is_zero() {
@@ -66,12 +117,20 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         Arc::clone(&verifier),
         config.routing.allow_hosts.clone(),
         Arc::clone(&store),
-        config.server.request_timeout,
+        config.server.max_request_timeout,
+        config
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.token_exchange.is_some()),
     ));
 
     seed_development_key(config, &admin).await?;
 
-    let source = RouteSource::new(pool.clone(), config.routing.allow_hosts.clone());
+    let source = RouteSource::new(
+        pool.clone(),
+        config.routing.allow_hosts.clone(),
+        exchange.is_some(),
+    );
     let table = source.load().await?;
 
     if table.is_empty() {
@@ -83,7 +142,9 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let refresh = RouteRefresh::new(source, routes.clone(), config.routing.refresh_interval);
     let refresh_task = tokio::spawn(refresh.run());
 
-    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    // Parsed once and shared by both listeners: the data plane needs it to
+    // resolve the caller behind the edge proxy, and the control plane needs it
+    // for the audit source address.
     let trusted_proxies = Arc::new(
         crate::net::TrustedProxies::parse(&config.server.trusted_proxies)
             .map_err(|problem| format!("TRUSTED_PROXIES: {problem}"))?,
@@ -93,17 +154,24 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         api_key_store: Arc::clone(&store),
         db: pool,
         verifier,
+        oauth,
+        exchange,
         routes: routes.clone(),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(RetryPolicy::new(&config.retry)),
+        audit: audit_sink,
+        default_request_timeout: config.server.request_timeout,
+        max_request_timeout: config.server.max_request_timeout,
+        max_response_bytes: config.server.max_response_bytes,
+        stream_idle_timeout: config.server.stream_idle_timeout,
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics,
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
         )),
-        trusted_proxies: Arc::new(crate::net::TrustedProxies::default()),
+        trusted_proxies: Arc::clone(&trusted_proxies),
     };
 
     let admin_server = start_admin(config, Arc::clone(&admin), trusted_proxies).await?;
@@ -126,6 +194,26 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     .await;
     refresh_task.abort();
     audit_task.abort();
+    if let Some(task) = data_retention_task {
+        task.abort();
+    }
+    if let Some(task) = data_audit_task {
+        // Let the audit writer drain the queue before exit. The app (and the
+        // sink's last sender) is dropped when `run_server` returns. Use most of
+        // the process drain budget; a stalled database is reported explicitly.
+        let audit_drain = config
+            .server
+            .shutdown_drain
+            .min(std::time::Duration::from_secs(20));
+
+        if tokio::time::timeout(audit_drain, task)
+            .await
+            .is_err()
+        {
+            metrics::counter!("gateway_data_audit_shutdown_timeouts_total").increment(1);
+            tracing::warn!("data audit did not drain before shutdown; queued events may be lost");
+        }
+    }
     if let Some(task) = revocation_task {
         task.abort();
     }
@@ -153,8 +241,20 @@ fn log_startup(config: &Config, routes: &RouteTableHandle) {
         credential_cache_secs = config.auth.cache_ttl.as_secs(),
         ip_limit_per_min = config.limits.ip_per_minute,
         tenant_limit_per_min = config.limits.tenant_per_minute,
+        user_limit_per_min = config.limits.user_per_minute,
         retry_attempts = config.retry.max_attempts,
         trusted_proxies = config.server.trusted_proxies.len(),
+        oauth = if config.oauth.is_some() {
+            "resource-server"
+        } else {
+            "disabled"
+        },
+        token_exchange = config
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.token_exchange.is_some()),
+        data_audit = config.data_audit.enabled,
+        cors_origins = config.server.cors_allowed_origins.len(),
         "gateway ready"
     );
 

@@ -14,19 +14,32 @@ use thiserror::Error;
 /// Internal text never reaches a response body.
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[allow(dead_code)] // TODO(W5): emitted once route matching can reject malformed paths.
     #[error("bad request: {message}")]
     BadRequest { message: Cow<'static, str> },
     #[error("unauthorized")]
     Unauthorized,
+    #[error("oauth unauthorized")]
+    OAuthUnauthorized {
+        /// `invalid_token`, or `None` when no credential was presented.
+        error: Option<&'static str>,
+        scope: Option<String>,
+        resource_metadata: String,
+    },
     #[error("forbidden")]
     Forbidden,
+    #[error("oauth insufficient scope")]
+    OAuthForbidden {
+        scope: String,
+        resource_metadata: String,
+    },
     #[error("not found: {message}")]
     NotFound { message: Cow<'static, str> },
     #[error("conflict: {message}")]
     Conflict { message: Cow<'static, str> },
     #[error("payload too large")]
     PayloadTooLarge,
+    #[error("response too large")]
+    ResponseTooLarge,
     #[error("request deadline exceeded")]
     RequestTimeout,
     #[error("method not allowed")]
@@ -41,6 +54,8 @@ pub enum AppError {
     CircuitOpen { retry_after_secs: u64 },
     #[error("upstream timed out")]
     UpstreamTimeout,
+    #[error("upstream authentication failed")]
+    UpstreamAuthFailed,
     #[error("bad gateway")]
     BadGateway,
     #[error("service unavailable")]
@@ -75,16 +90,18 @@ impl AppError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Unauthorized | Self::OAuthUnauthorized { .. } => StatusCode::UNAUTHORIZED,
+            Self::Forbidden | Self::OAuthForbidden { .. } => StatusCode::FORBIDDEN,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::ResponseTooLarge => StatusCode::BAD_GATEWAY,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::CircuitOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::UpstreamAuthFailed => StatusCode::BAD_GATEWAY,
             Self::BadGateway => StatusCode::BAD_GATEWAY,
             Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -94,16 +111,18 @@ impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::BadRequest { .. } => "bad_request",
-            Self::Unauthorized => "invalid_credentials",
-            Self::Forbidden => "forbidden",
+            Self::Unauthorized | Self::OAuthUnauthorized { .. } => "invalid_credentials",
+            Self::Forbidden | Self::OAuthForbidden { .. } => "forbidden",
             Self::NotFound { .. } => "not_found",
             Self::Conflict { .. } => "conflict",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::ResponseTooLarge => "response_too_large",
             Self::RequestTimeout => "request_timeout",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::RateLimited { .. } => "rate_limited",
             Self::CircuitOpen { .. } => "circuit_open",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::UpstreamAuthFailed => "upstream_auth_failed",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
             Self::Internal { .. } => "internal_error",
@@ -113,16 +132,22 @@ impl AppError {
     fn public_message(&self) -> Cow<'static, str> {
         match self {
             Self::BadRequest { message } => message.clone(),
-            Self::Unauthorized => "invalid or missing bearer credentials".into(),
-            Self::Forbidden => "the credential is not permitted to perform this request".into(),
+            Self::Unauthorized | Self::OAuthUnauthorized { .. } => {
+                "invalid or missing bearer credentials".into()
+            }
+            Self::Forbidden | Self::OAuthForbidden { .. } => {
+                "the credential is not permitted to perform this request".into()
+            }
             Self::NotFound { message } => message.clone(),
             Self::Conflict { message } => message.clone(),
             Self::PayloadTooLarge => "request body exceeds the configured limit".into(),
+            Self::ResponseTooLarge => "the upstream response exceeds the configured limit".into(),
             Self::RequestTimeout => "the request exceeded the server deadline".into(),
             Self::MethodNotAllowed { .. } => "this route does not accept that method".into(),
             Self::RateLimited { .. } => "too many requests".into(),
             Self::CircuitOpen { .. } => "the upstream is temporarily unavailable".into(),
             Self::UpstreamTimeout => "the upstream did not respond in time".into(),
+            Self::UpstreamAuthFailed => "the upstream credential exchange failed".into(),
             Self::BadGateway => "the upstream returned an invalid response".into(),
             Self::ServiceUnavailable => "the service is temporarily unavailable".into(),
             Self::Internal { .. } => "an internal error occurred".into(),
@@ -179,10 +204,55 @@ impl IntoResponse for AppError {
 
         let mut response = (status, Json(body)).into_response();
 
-        if status == StatusCode::UNAUTHORIZED {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        match &self {
+            Self::Unauthorized => {
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            }
+            Self::OAuthUnauthorized {
+                error,
+                scope,
+                resource_metadata,
+            } => {
+                let mut challenge = String::from("Bearer ");
+
+                if let Some(error) = error {
+                    challenge.push_str(&format!("error=\"{error}\", "));
+                }
+                if let Some(scope) = scope
+                    && !scope.is_empty()
+                {
+                    challenge.push_str(&format!("scope=\"{}\", ", escape_challenge(scope)));
+                }
+                challenge.push_str(&format!(
+                    "resource_metadata=\"{}\"",
+                    escape_challenge(resource_metadata)
+                ));
+
+                if let Ok(value) = HeaderValue::from_str(&challenge) {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, value);
+                }
+            }
+            Self::OAuthForbidden {
+                scope,
+                resource_metadata,
+            } => {
+                let challenge = format!(
+                    "Bearer error=\"insufficient_scope\", scope=\"{}\", resource_metadata=\"{}\"",
+                    escape_challenge(scope),
+                    escape_challenge(resource_metadata)
+                );
+
+                if let Ok(value) = HeaderValue::from_str(&challenge) {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, value);
+                }
+            }
+            _ => {}
         }
 
         if let Some(seconds) = retry_after
@@ -220,6 +290,15 @@ impl IntoResponse for AppError {
 
         response
     }
+}
+
+/// OAuth challenges are header values, not JSON: strip anything that could
+/// break the quoted-string grammar or inject a second header.
+fn escape_challenge(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control() && *character != '"' && *character != '\\')
+        .collect()
 }
 
 #[cfg(test)]
@@ -412,5 +491,71 @@ mod tests {
 
         assert!(!body.contains("secret database detail"));
         assert!(body.contains("\"code\":\"internal_error\""));
+    }
+
+    #[tokio::test]
+    async fn oauth_unauthorized_points_at_the_metadata() {
+        let response = render(AppError::OAuthUnauthorized {
+            error: Some("invalid_token"),
+            scope: None,
+            resource_metadata: "https://gw.example.com/.well-known/oauth-protected-resource/mcp"
+                .to_owned(),
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://gw.example.com/.well-known/oauth-protected-resource/mcp\""
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_forbidden_is_a_step_up_challenge() {
+        let response = render(AppError::OAuthForbidden {
+            scope: "mcp:tools read".to_owned(),
+            resource_metadata: "https://gw.example.com/.well-known/oauth-protected-resource"
+                .to_owned(),
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Bearer error=\"insufficient_scope\", scope=\"mcp:tools read\", resource_metadata=\"https://gw.example.com/.well-known/oauth-protected-resource\""
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_challenge_values_cannot_inject_headers() {
+        let response = render(AppError::OAuthForbidden {
+            scope: "read\"\r\nX-Evil: 1".to_owned(),
+            resource_metadata: "https://gw.example.com/mcp".to_owned(),
+        })
+        .await;
+
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        assert!(!challenge.contains('\r'));
+        assert!(!challenge.contains('\n'));
+        assert_eq!(
+            response
+                .headers()
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .count(),
+            1
+        );
     }
 }

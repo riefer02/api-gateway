@@ -7,8 +7,14 @@ use time::OffsetDateTime;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Bound before any store lookup, cache key, or base64 decode.
+const MAX_BEARER_TOKEN_BYTES: usize = 8 * 1024;
+const MAX_API_KEY_ID_BYTES: usize = 64;
+
 pub(crate) mod cache;
+pub(crate) mod exchange;
 pub(crate) mod key;
+pub(crate) mod oauth;
 pub(crate) mod store;
 pub(crate) mod verifier;
 
@@ -92,11 +98,46 @@ pub(crate) struct Credential {
 
 /// Constructed after successful authentication; safe to pass to handlers.
 #[derive(Clone, Debug)]
-pub(crate) struct ClientIdentity {
+pub(crate) struct Principal {
     pub(crate) tenant_id: TenantId,
     pub(crate) client_id: ClientId,
-    pub(crate) key_id: ApiKeyId,
+    /// Present for service API keys; absent for OAuth callers.
+    pub(crate) key_id: Option<ApiKeyId>,
+    /// Present for OAuth callers; absent for service API keys.
+    pub(crate) subject: Option<String>,
+    pub(crate) auth_method: AuthMethod,
     pub(crate) scopes: HashSet<String>,
+    /// Roles from the token (`roles` and `groups` claims). API keys get
+    /// `service`, so tool policy can grant them deliberately.
+    pub(crate) roles: HashSet<String>,
+    pub(crate) token_id: Option<String>,
+    /// The inbound access token, kept only for RFC 8693 exchange. It is
+    /// zeroized on drop and never logged.
+    pub(crate) subject_token: Option<crate::config::SecretString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthMethod {
+    ApiKey,
+    OAuth,
+}
+
+impl AuthMethod {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::OAuth => "oauth",
+        }
+    }
+}
+
+impl Principal {
+    /// The stable key for per-user limits and audit attribution.
+    pub(crate) fn user_key(&self) -> Option<String> {
+        self.subject
+            .as_ref()
+            .map(|subject| format!("{}:{subject}", self.tenant_id))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -133,7 +174,7 @@ pub(crate) async fn verify_api_key(
     verifier: &KeyVerifier,
     key_id: &ApiKeyId,
     secret: &str,
-) -> Result<ClientIdentity, AuthError> {
+) -> Result<Principal, AuthError> {
     let credential = store
         .find_by_key_id(key_id)
         .await
@@ -160,11 +201,16 @@ pub(crate) async fn verify_api_key(
         return Err(AuthError::Forbidden);
     }
 
-    Ok(ClientIdentity {
+    Ok(Principal {
         tenant_id: credential.tenant.id,
         client_id: credential.client.id,
-        key_id: credential.key.key_id,
+        key_id: Some(credential.key.key_id),
+        subject: None,
+        auth_method: AuthMethod::ApiKey,
         scopes: credential.key.scopes,
+        roles: HashSet::from(["service".to_owned()]),
+        token_id: None,
+        subject_token: None,
     })
 }
 
@@ -176,13 +222,73 @@ fn is_expired(key: &ApiKeyRecord) -> bool {
 pub(crate) async fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<ClientIdentity, AppError> {
-    let token = bearer_token(headers).ok_or(AppError::Unauthorized)?;
+) -> Result<Principal, AppError> {
+    let token = bearer_token(headers).ok_or_else(|| match &state.oauth {
+        Some(oauth) => oauth.challenge_unauthorized(None),
+        None => AppError::Unauthorized,
+    })?;
+
+    if token.len() > MAX_BEARER_TOKEN_BYTES {
+        return Err(match &state.oauth {
+            Some(oauth) => oauth.challenge_unauthorized(Some("invalid_token")),
+            None => AppError::Unauthorized,
+        });
+    }
+
+    // Access tokens are signed JWTs with three segments. API keys are
+    // `key_id.secret`, so the shapes cannot be confused without an accidental
+    // dot in a generated secret.
+    if let Some(oauth) = &state.oauth
+        && token.split('.').count() == 3
+    {
+        let identity = oauth
+            .authenticate(token)
+            .await
+            .map_err(|error| match error {
+                oauth::OAuthError::Invalid => {
+                    metrics::counter!(
+                        "gateway_auth_failures_total",
+                        "reason" => "oauth_invalid",
+                    )
+                    .increment(1);
+
+                    oauth.challenge_unauthorized(Some("invalid_token"))
+                }
+                oauth::OAuthError::Unavailable => {
+                    metrics::counter!(
+                        "gateway_auth_failures_total",
+                        "reason" => "oauth_unavailable",
+                    )
+                    .increment(1);
+
+                    AppError::ServiceUnavailable
+                }
+            })?;
+
+        let principal = Principal {
+            tenant_id: TenantId(identity.tenant_id),
+            client_id: ClientId(identity.client_id),
+            key_id: None,
+            subject: Some(identity.subject),
+            auth_method: AuthMethod::OAuth,
+            scopes: identity.scopes,
+            roles: identity.roles,
+            token_id: identity.token_id,
+            subject_token: Some(crate::config::SecretString::new(token.to_owned())),
+        };
+
+        record_identity(&principal);
+        return Ok(principal);
+    }
+
     let (key_id, secret) = token
         .split_once('.')
-        .ok_or(AppError::Unauthorized)?;
+        .ok_or_else(|| match &state.oauth {
+            Some(oauth) => oauth.challenge_unauthorized(Some("invalid_token")),
+            None => AppError::Unauthorized,
+        })?;
 
-    if key_id.is_empty() || secret.is_empty() {
+    if key_id.is_empty() || secret.is_empty() || key_id.len() > MAX_API_KEY_ID_BYTES {
         return Err(AppError::Unauthorized);
     }
 
@@ -200,22 +306,36 @@ pub(crate) async fn authenticate(
         )
         .increment(1);
 
-        error.into_app_error()
+        match (&state.oauth, &error) {
+            (Some(oauth), AuthError::InvalidCredentials) => {
+                oauth.challenge_unauthorized(Some("invalid_token"))
+            }
+            _ => error.into_app_error(),
+        }
     })?;
 
-    let span = tracing::Span::current();
-    span.record("tenant_id", identity.tenant_id.as_str());
-    span.record("client_id", identity.client_id.as_str());
-    span.record("key_id", identity.key_id.as_str());
+    record_identity(&identity);
 
     Ok(identity)
 }
 
+fn record_identity(identity: &Principal) {
+    let span = tracing::Span::current();
+    span.record("tenant_id", identity.tenant_id.as_str());
+    span.record("client_id", identity.client_id.as_str());
+    span.record("auth_method", identity.auth_method.as_str());
+
+    if let Some(key_id) = &identity.key_id {
+        span.record("key_id", key_id.as_str());
+    }
+
+    if let Some(subject) = &identity.subject {
+        span.record("subject", subject.as_str());
+    }
+}
+
 /// Routes declare the scopes they require; all of them must be present.
-pub(crate) fn authorize(
-    identity: &ClientIdentity,
-    required: &HashSet<String>,
-) -> Result<(), AppError> {
+pub(crate) fn authorize(identity: &Principal, required: &HashSet<String>) -> Result<(), AppError> {
     if required.is_empty()
         || required
             .iter()
@@ -383,11 +503,16 @@ mod tests {
 
     #[test]
     fn authorize_requires_every_declared_scope() {
-        let identity = ClientIdentity {
+        let identity = Principal {
             tenant_id: TenantId("tenant".to_owned()),
             client_id: ClientId("client".to_owned()),
-            key_id: ApiKeyId("key".to_owned()),
+            key_id: Some(ApiKeyId("key".to_owned())),
+            subject: None,
+            auth_method: AuthMethod::ApiKey,
             scopes: HashSet::from(["read".to_owned()]),
+            roles: HashSet::from(["service".to_owned()]),
+            token_id: None,
+            subject_token: None,
         };
 
         assert!(authorize(&identity, &HashSet::new()).is_ok());
@@ -413,5 +538,25 @@ mod tests {
 
         headers.insert(header::AUTHORIZATION, "Bearer two tokens".parse().unwrap());
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn user_key_is_tenant_scoped_and_absent_for_service_keys() {
+        let mut principal = Principal {
+            tenant_id: TenantId("acme".to_owned()),
+            client_id: ClientId("client".to_owned()),
+            key_id: None,
+            subject: Some("user-1".to_owned()),
+            auth_method: AuthMethod::OAuth,
+            scopes: HashSet::new(),
+            roles: HashSet::new(),
+            token_id: None,
+            subject_token: None,
+        };
+
+        assert_eq!(principal.user_key().as_deref(), Some("acme:user-1"));
+
+        principal.subject = None;
+        assert!(principal.user_key().is_none());
     }
 }

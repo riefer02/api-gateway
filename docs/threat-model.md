@@ -1,15 +1,16 @@
 # Threat model
 
-Scope: the gateway process, its Postgres database, and the trust boundary between callers
-and upstreams. Out of scope: the upstream services themselves, the host OS, and the
-identity provider (there is none yet).
+Scope: the gateway process, its Postgres database, the identity provider it trusts, and
+the trust boundary between callers and upstreams. Out of scope: the upstream services
+themselves and the host OS.
 
 ## Trust boundaries
 
 ```
  untrusted caller ──▶ [ edge TLS terminator ] ──▶ [ gateway ] ──▶ [ upstream ]
                                                     │
-                                                    └──▶ [ Postgres ]
+                                                    ├──▶ [ Postgres ]
+                                                    └──▶ [ IdP / JWKS ]
  operator ──▶ [ admin CLI / admin listener ] ───────┘
 ```
 
@@ -27,10 +28,17 @@ identity provider (there is none yet).
 | Key id enumeration | Lookup by id then constant-time verify; auth failures are indistinguishable | Timing on the id lookup remains theoretically observable |
 | Stolen admin token | Separate listener, named tokens with scopes, not exposed by default | No mTLS/OIDC yet; rotate the token |
 | SSRF through route config | Upstream allowlist enforced at write and compile; redirects disabled; credentials in URLs rejected | DNS rebinding between validation and use is not defended against; pin hosts at the network layer |
-| Path confusion (authorize one path, forward another) | Dot segments, including percent-encoded forms, rejected before matching | Upstreams that decode other encodings (e.g. `%252e`) are out of our control |
+| Path confusion (authorize one path, forward another) | Dot segments, backslashes, and matrix-parameter `;`/`%3b` rejected before matching | Upstreams that double-decode other encodings (e.g. `%252e`) remain out of our control |
 | Request smuggling | Hyper rejects ambiguous `Content-Length`/`Transfer-Encoding`; hop-by-hop and `Connection`-named headers stripped | Depends on hyper's parser |
-| Credential leakage to upstreams | `Authorization`, `Cookie`, `Host`, and forwarded headers stripped before forwarding | Upstreams that need caller identity must be given an explicit design decision |
-| Secret leakage to logs | No secret is logged; upstream errors logged by kind, not `Display`; request ids sanitized | URL paths may still contain caller-chosen secrets if callers put them there |
+| Credential leakage to upstreams | `Authorization`, `Cookie`, `Host`, and forwarded headers stripped before forwarding | Upstreams that need caller identity get an exchanged token, never the inbound one |
+| Token accepted for another service | JWT validation checks signature, issuer, audience, expiry, and algorithm; ID tokens are rejected | An issuer that mints a shared audience defeats this; configure a unique audience per gateway |
+| Token passthrough / confused deputy | The inbound token is never forwarded; RFC 8693 exchange mints a token for the upstream audience; the gateway never issues tokens | Depends on the IdP binding `audience` correctly and on the upstream validating it |
+| Tool-policy bypass | `tools/call` is parsed on enforcing routes; `tools/list` is filtered; malformed bodies are refused rather than passed | An upstream that accepts non-JSON-RPC shapes or a route left in `off` mode bypasses tool policy by design |
+| Prompt injection through tool output | Tool allow-lists, write-tool approval (roadmap), response caps, and audit | The gateway cannot make an unsafe or over-broad tool safe; record-level authz belongs in the data layer |
+| Cross-tenant route access | Optional `routes.tenant_id`; a tenant route is invisible to other tenants and never falls through to a shorter prefix | A shared route with broad scopes is reachable by every tenant by design |
+| Browser origin abuse / DNS rebinding | `Origin` is validated against an exact allow-list when CORS is configured; preflight is answered before auth; upstream CORS headers are stripped | With CORS unset, browser clients are not origin-checked; an MCP deployment should configure the allow-list |
+| Audit tampering or gaps | Append-only by convention; route-gated per-call audit; status-derived decisions; bounded queue with explicit drop/write-failure/shutdown metrics; identifiers only | Someone with database write access can rewrite rows; export to an append-only sink if required |
+| Secret leakage to logs | No secret is logged; upstream errors logged by kind, not `Display`; request ids sanitized; tool arguments are not audited | URL paths and tool arguments may still contain caller-chosen secrets if callers put them there |
 | Resource exhaustion | Body limits, whole-request deadline, header-read timeout, connection cap, per-IP and per-tenant rate limits, cached readiness probe | In-process limits are per replica |
 | Amplification via retries | Idempotent, body-less retries only, gated by a token-bucket retry budget | Retried requests still reach the upstream twice |
 | Spoofed client identity | Forwarding headers are believed only from `TRUSTED_PROXIES`; the chain is walked right to left, skipping trusted hops | A misconfigured trusted CIDR lets a caller spoof its address |
@@ -43,14 +51,24 @@ identity provider (there is none yet).
 
 - TLS terminates at a trusted edge (Caddy, nginx, a load balancer). The gateway surfaces
   `X-Forwarded-*` advisories by stripping client-supplied values.
+- OAuth is delegated to the customer's identity provider. The gateway validates
+  tokens and never issues them.
 - The database is on a private network and its credentials are injected from a secret store.
 - Operators are identified by named admin tokens; scopes bound what each may do, but all
   scopes are still coarse (`config:write` covers every route and upstream).
+- One organization per deployment for v1. Shared deployments need tenant-scoped
+  admin roles and audit partitioning before they are supported.
 
 ## Open work
 
 - mTLS or OIDC for the admin listener, replacing static tokens.
 - Distributed rate limiting so limits hold across replicas.
+- Tool-schema pinning and drift alerts; approval workflow for write tools.
+- Opaque-token introspection, with an explicit outage policy.
+- Static upstream credentials, if a customer cannot use token exchange: envelope
+  encryption/KMS, rotation, and a documented residual risk.
 - Audit rows are append-only but not tamper-evident: someone with database write access
   can delete or rewrite them. Hash-chaining or shipping to an append-only sink is the
   next step if that matters to you.
+- Record-level authorization remains in the MCP server or data API; the gateway must
+  not become the only authorization layer.

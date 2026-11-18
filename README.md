@@ -8,8 +8,8 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~9k lines of Rust, 130 tests, one binary, a distroless image with no
-shell, and a measured +0.32 ms p50 over a direct call at 78k req/s.
+**At a glance:** ~16k lines of Rust, 222 tests, one binary, a distroless image with no
+shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
 and adapted — see [Using this as a template](#using-this-as-a-template).
@@ -20,8 +20,8 @@ Portfolio-grade and pre-production: not security-audited, not battle-tested unde
 traffic. Read [`docs/threat-model.md`](docs/threat-model.md) before pointing it at anything
 that matters.
 
-Working data plane and control plane. Authentication with a bounded-staleness credential
-cache, a Postgres-backed route table with live reload, streaming proxy with strict header
+Working data plane and control plane. API-key and OAuth resource-server authentication with a
+bounded-staleness credential cache, a Postgres-backed route table with live reload, streaming proxy with strict header
 hygiene, per-IP and per-tenant rate limits, per-upstream circuit breakers, Prometheus
 metrics, OpenTelemetry traces, and graceful shutdown. The control plane is available as
 both a CLI and an HTTP API. Ships as a distroless container with a compose stack.
@@ -49,9 +49,15 @@ just demo-route               # in a second shell: registers /swapi -> swapi.dev
 ```
 
 If port 5432 is already taken, set `DB_HOST_PORT` and the matching port in
-`DATABASE_URL` — the container always listens on 5432 internally, so nothing else changes.
+`DATABASE_URL` for the host-binary path — the container always listens on 5432
+internally, so the compose stack needs no other change.
+
+The shell does not read `.env`; load it first (or copy the token printed by
+`admin key create`):
 
 ```bash
+set -a; . ./.env; set +a
+
 curl -s localhost:8080/health          # liveness
 curl -s localhost:8080/ready           # readiness (checks Postgres)
 curl -s -H "Authorization: Bearer dev-local.$DEV_API_KEY_SECRET" \
@@ -69,11 +75,12 @@ curl -s -H "Authorization: Bearer dev-local.$DEV_API_KEY_SECRET" \
 client
   │
   ▼
-request id → metrics → trace → panic guard → deadline → body limit
+request id → CORS/Origin → metrics → trace → panic guard → deadline → body limit
   │
   ▼
 route pipeline: reject malformed paths → IP limit → authenticate → tenant limit
-                → resolve route → authorize scopes → breakers → proxy
+                → user limit → resolve route → authorize scopes → MCP policy
+                → upstream auth → breakers → proxy → audit
   │
   ▼
 allowlisted upstream
@@ -85,7 +92,9 @@ allowlisted upstream
 | `src/routes/upstream.rs` | The request pipeline, in one readable function. |
 | `src/routing.rs` | Route table: compile, validate, match, atomically reload. |
 | `src/proxy.rs` | Forwarding, header policy, body streaming, error mapping. |
-| `src/auth/` | Tokens, peppered verifiers, credential cache, store. |
+| `src/auth/` | Tokens, peppered verifiers, credential cache, OAuth/JWKS, store. |
+| `src/mcp/` | Tool policy and the small JSON-RPC surface the gateway enforces. |
+| `src/audit.rs` | Bounded, batched per-call audit off the request path. |
 | `src/admin/` | Control-plane service with CLI and HTTP adapters. |
 | `src/limits.rs` | Rate limiters and circuit breaker registry. |
 | `src/config.rs` | Typed configuration with validation and redaction. |
@@ -134,14 +143,21 @@ api-gateway admin client rm acme-app
 api-gateway admin tenant rm acme
 ```
 
+A route `PUT`/`route put` is **partial for security fields**: omitting `tenant_id`,
+`scopes`, `tool_policy`, or the enable flags preserves what is stored. An explicit
+empty value clears it (for example `--scope` with `--replace-scopes` and no values, or
+`--tenant ""`). Omitted non-security fields (`rewrite`, timeout, cap) also preserve; an empty
+`rewrite` clears it, timeout `0` restores the default, and cap `0` means unlimited. This is deliberate: a routine timeout edit must not
+widen tenancy or disable tool policy.
+
 The HTTP API serves the same operations on a separate listener. Configure named tokens
 to enable it; each name becomes the audit identity for everything that token does.
 
 ```bash
 # no scope list = full admin
-ADMIN_TOKENS="alice:$ALICE_TOKEN,bob:$BOB_TOKEN"
+ADMIN_TOKENS="alice:replace-with-a-long-random-token,bob:another-long-random-token"
 # scoped: readable config, but no writes and no key access
-ADMIN_TOKENS="auditor:$AUDITOR_TOKEN:config:read+audit:read"
+ADMIN_TOKENS="auditor:replace-with-a-long-random-token:config:read+audit:read"
 ```
 
 Scopes: `tenants:write`, `keys:read`, `keys:write`, `config:read`, `config:write`,
@@ -152,7 +168,10 @@ Scopes: `tenants:write`, `keys:read`, `keys:write`, `config:read`, `config:write
 `admin`. Tokens must be at least 16 characters; the listener stays off when neither is set.
 
 ```bash
-TOKEN=... ADMIN=http://127.0.0.1:9090
+# Set these to the tokens you configured in ADMIN_TOKENS.
+ADMIN=http://127.0.0.1:9090
+TOKEN=...   # the token you gave `alice` in ADMIN_TOKENS
+# BOB_TOKEN and AUDITOR_TOKEN are used in the audit examples below.
 
 curl -s -X PUT "$ADMIN/v1/upstreams/billing" \
   -H "Authorization: Bearer $TOKEN" \
@@ -198,11 +217,28 @@ immediately. Revocations are also broadcast on a Postgres channel, so every repl
 the entry at the same moment; `AUTH_CACHE_TTL_SECS` is only the fallback for a replica
 whose listener is disconnected.
 
+### Per-call data audit
+
+The data plane records every authenticated call separately from the control plane:
+
+```bash
+curl -s "$ADMIN/v1/data-audit?limit=20" -H "Authorization: Bearer $AUDITOR_TOKEN"
+api-gateway admin audit data --limit 20
+```
+
+Each row carries the tenant, OIDC subject, assistant client, MCP method, tool, decision,
+status, latency, request id, and token id. Payloads, tokens, and verifier material never
+appear. Writes go through a bounded queue and a batched insert; a full queue increments
+`gateway_data_audit_dropped_total` rather than slowing the request.
+
 ## Protection
 
-- **Rate limits**: token buckets per client IP (before authentication) and per tenant
-  (after). `429` carries `Retry-After` and `RateLimit-*`. In-process and per replica, so
-  N replicas enforce N times the configured rate.
+- **Rate limits**: token buckets per client IP (before authentication), per tenant,
+  and per user. `429` carries `Retry-After` and `RateLimit-*`. In-process and per
+  replica, so N replicas enforce N times the configured rate.
+- **MCP policy**: routes may enforce a role-based tool allow-list; denied calls are
+  JSON-RPC errors, `tools/list` is filtered, and every authenticated call is audited
+  with the user, assistant, tool, and decision.
 - **Circuit breaker**: per upstream, consecutive-failure trigger, cooldown, single
   half-open probe. Open circuits answer `503` with `Retry-After`.
 - **Retries**: idempotent, body-less requests are retried on `502`/`503`/`504`,
@@ -217,8 +253,9 @@ whose listener is disconnected.
 - **Bounded growth**: audit rows are pruned on a timer (`AUDIT_RETENTION_DAYS`); the rate
   limiter and credential cache sweep their shards on a timer, not on every insert.
 - **Header hygiene**: hop-by-hop headers — including those named by `Connection` — plus
-  `Forwarded`/`X-Forwarded-*`, `Host`, `Authorization`, and `Cookie` are stripped before
-  forwarding. `Server` and `Set-Cookie` are stripped on the way back. Redirects are never
+  `Forwarded`/`X-Forwarded-*`, `Host`, the caller's `Authorization`, and `Cookie` are
+  stripped before forwarding. A route with an upstream audience gets a freshly
+  exchanged token; the caller's token is never reused. `Server` and `Set-Cookie` are stripped on the way back. Redirects are never
   followed.
 - **Client identity**: the direct peer is the caller unless it appears in
   `TRUSTED_PROXIES`. Only then is `X-Forwarded-For`/`X-Real-IP` believed, walking the chain
@@ -255,6 +292,17 @@ This table is the specification.
 | Upstream `503` on a `POST` with a body | Never retried; the body cannot be replayed |
 | Retry budget exhausted | The failing response is served instead of amplifying |
 | Bodiless `POST` with `Idempotency-Key` | Retried |
+| OAuth token for another audience/issuer | `401` with `invalid_token` and the metadata pointer |
+| JWKS unreachable and no cached key | `503`, never `401` |
+| Valid token, missing route scope | `403 insufficient_scope` with the required scopes |
+| Tool outside the route's allow-list | `200` with a JSON-RPC error; audited as `deny` |
+| `tools/list` outside policy | Denied tools removed; unparseable/non-JSON fails closed; batches filter every list |
+| `server/discover` on an allow-list route | Passed through; it carries no tool catalogue |
+| `Mcp-Method` / `Mcp-Name` disagrees with body | `400` with JSON-RPC `HeaderMismatch` (`-32020`) |
+| Route bound to another tenant | `404`, no fallback to a shorter prefix |
+| Upstream with an audience | RFC 8693 exchanged token; inbound token never forwarded |
+| Response over the route cap | `502 response_too_large` (declared) or truncated stream (chunked); `0` means unlimited |
+| Browser request from an unlisted origin | `403` when `CORS_ALLOWED_ORIGINS` is configured |
 
 ## Observability
 
@@ -273,9 +321,14 @@ This table is the specification.
 | `gateway_admin_auth_failures_total` | — |
 | `gateway_connections_rejected_total` | — |
 | `gateway_ready` | — (0/1, set by `/ready`) |
+| `gateway_oauth_jwks_ready` | — (0/1; key set loaded) |
+| `gateway_mcp_denied_total` | `route` |
+| `gateway_upstream_auth_failures_total` | `reason` |
+| `gateway_data_audit_dropped_total` | — |
+| `gateway_data_audit_write_failures_total` | — |
 
-Spans carry `route`, `upstream`, `tenant_id`, `client_id`, and `key_id` (identifiers only,
-never secrets). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export; otherwise logs only.
+Spans carry `route`, `upstream`, `tenant_id`, `client_id`, `key_id`, `subject`, and
+`auth_method` (identifiers only, never secrets). Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export; otherwise logs only.
 
 The metrics endpoint shares the public listener — keep it off the edge with network policy.
 
@@ -313,7 +366,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `LOG_LEVEL` | `info` | `tracing` filter |
 | `DATABASE_URL` | — (required) | Postgres connection string |
 | `AUTH_PEPPER` | dev value | Required in production; rotating it invalidates keys |
-| `AUTH_CACHE_TTL_SECS` | `30` | Credential cache lifetime; `0` disables |
+| `AUTH_CACHE_TTL_SECS` | `30` | Credential cache lifetime (max 3600); `0` disables |
 | `METRICS_TOKEN` | unset | Requires a bearer token on `/metrics` when set |
 | `ADMIN_TOKEN` | unset | Single shared token, actor `admin` |
 | `ADMIN_TOKENS` | unset | `name:token[:scope+scope]`; enables the control plane and names the actor |
@@ -323,21 +376,38 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `UPSTREAM_ALLOW_HOSTS` | — | Comma-separated allowlist; required in production |
 | `ROUTE_REFRESH_INTERVAL_MS` | `2000` | Route table poll interval |
 | `RATE_LIMIT_BACKEND` | `local` | `redis` is rejected until implemented |
-| `RATE_LIMIT_IP_PER_MINUTE` | `600` | `0` disables |
-| `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | `0` disables |
+| `RATE_LIMIT_IP_PER_MINUTE` | `600` | Pre-auth abuse control; `0` disables |
+| `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | Per-tenant fairness; `0` disables |
+| `RATE_LIMIT_USER_PER_MINUTE` | `600` | Per-user fairness for OAuth callers; `0` disables |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures to open |
 | `CIRCUIT_COOLDOWN_SECS` | `30` | Open duration |
 | `RETRY_MAX_ATTEMPTS` | `2` | Total attempts; `1` disables retries |
 | `RETRY_BASE_DELAY_MS` | `50` | Backoff base, jittered, capped at 1 s |
 | `RETRY_BUDGET_RATIO` | `0.2` | Retries per request as a fraction of traffic; `0` disables |
-| `REQUEST_TIMEOUT_SECS` | `15` | Whole-request deadline |
+| `REQUEST_TIMEOUT_SECS` | `15` | Default route deadline |
+| `MAX_REQUEST_TIMEOUT_SECS` | `300` | Absolute cap a route may request |
+| `MAX_RESPONSE_BYTES` | `10485760` | Default response cap; a route may set `0` for unlimited |
+| `STREAM_IDLE_TIMEOUT_SECS` | `60` | Cut a response stream that produces no bytes for this long |
+| `CORS_ALLOWED_ORIGINS` | — | Exact browser origins; empty disables CORS and `Origin` validation |
 | `HEADER_READ_TIMEOUT_SECS` | `10` | Bound on receiving a complete request head |
 | `MAX_CONNECTIONS` | `1024` | Concurrent socket cap |
 | `TRUSTED_PROXIES` | — | CIDRs allowed to set the client address; empty trusts nobody |
 | `ADMIN_TIMEOUT_SECS` | `10` | Control-plane request deadline |
-| `AUDIT_RETENTION_DAYS` | `90` | Audit pruning window; `0` keeps forever |
+| `AUDIT_RETENTION_DAYS` | `90` | Control-plane audit window; `0` keeps forever |
+| `DATA_AUDIT_ENABLED` | `true` | Per-call data-plane audit |
+| `DATA_AUDIT_QUEUE_CAPACITY` / `DATA_AUDIT_BATCH_SIZE` | `1024` / `100` | Bounded queue and batch size |
+| `DATA_AUDIT_RETENTION_DAYS` | `90` | Data audit window; `0` keeps forever |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Inbound body limit |
 | `SHUTDOWN_DRAIN_SECS` | `25` | Graceful drain budget |
+| `OAUTH_ISSUER` | unset | Enables OAuth when set; the IdP issuer |
+| `OAUTH_AUDIENCE` / `OAUTH_JWKS_URI` / `OAUTH_RESOURCE` / `OAUTH_AUTHORIZATION_SERVERS` | — | Required with `OAUTH_ISSUER`; a partial block is a boot error |
+| `OAUTH_SCOPES_SUPPORTED` | — | advertised scopes |
+| `OAUTH_ALGORITHMS` | `RS256` | RS256/384/512 or ES256/384 |
+| `OAUTH_TOKEN_FORMAT` | `jwt` | Only JWT is implemented; introspection is a deliberate seam |
+| `OAUTH_CLOCK_SKEW_SECS` / `OAUTH_JWKS_TTL_SECS` | `30` / `300` | Validation and cache windows |
+| `OAUTH_DEFAULT_TENANT` | `oauth` | Tenant for tokens without a tenant claim |
+| `OAUTH_TOKEN_ENDPOINT` / `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` | unset | RFC 8693 exchange; required for an upstream audience |
+| `OAUTH_CLIENT_AUTH` | `basic` | `basic` or `post` for the token endpoint |
 | `DB_MAX_CONNECTIONS` / `DB_MIN_CONNECTIONS` / `DB_ACQUIRE_TIMEOUT_SECS` | `10` / `1` / `5` | Pool sizing |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/gRPC; logs only when unset |
 
@@ -356,8 +426,10 @@ that runs `api-gateway healthcheck`, so no shell or curl is needed.
 Kubernetes manifests live in [`deploy/k8s`](deploy/k8s): a non-root, read-only deployment
 with probes, HPA, PDB, and a default-deny NetworkPolicy. [`deploy/Caddyfile`](deploy/Caddyfile)
 is the reference edge that terminates TLS and keeps `/metrics` and `/ready` private. Set
-`TRUSTED_PROXIES` to that proxy's address (the Caddy example runs on loopback) or every
-caller shares the proxy's bucket.
+`TRUSTED_PROXIES` to the address the gateway actually sees for that proxy: `127.0.0.1`
+only when Caddy shares the gateway's network namespace, otherwise the Docker bridge
+gateway or the ingress pod CIDR. If it is wrong, every caller shares one bucket — verify
+with the runbook's client-address check.
 
 ## Scaling and replicas
 
@@ -371,6 +443,9 @@ as you like behind one load balancer, all pointing at the same Postgres.
 | Rate limits | **per replica** | deliberately not shared — N replicas allow N × the configured rate |
 | Retry budget | **per replica** | same arithmetic |
 | Circuit breakers | per replica | each replica learns an upstream's health independently |
+| JWKS cache | per replica | each replica fetches and refreshes the issuer's keys independently |
+| Token-exchange cache | per replica | short-lived tokens; a miss exchanges again |
+| Data audit | per replica queue, shared table | batched inserts; a full queue drops with a metric |
 | Migrations | global | sqlx takes an advisory lock, so concurrent starters serialise |
 
 Prove the interesting half locally, with no cluster:
@@ -405,9 +480,17 @@ CIDR, or `127.0.0.1` when the proxy runs in the same network namespace.
 4. **Replace the demo upstream**: `just demo-route` points at swapi.dev. Delete it and
    register your own through the admin API or CLI.
 5. **Tune the limits** against a load test; the defaults are guesses for a small deployment.
-6. **Set `ADMIN_TOKEN`** if you want the HTTP control plane, and keep its listener private.
+6. **Set `ADMIN_TOKENS`** if you want the HTTP control plane, and keep its listener private (`ADMIN_TOKEN` is the legacy single-token form).
 7. **Decide on revocation staleness**: cross-replica revocation is immediate over Postgres
    `LISTEN/NOTIFY`; `AUTH_CACHE_TTL_SECS` is the fallback window if a listener drops.
+8. **Wire an identity provider for MCP**: set the `OAUTH_*` block, publish
+   `/.well-known/oauth-protected-resource`, and verify the issuer advertises PKCE
+   `S256`. If upstreams need per-user tokens, configure `OAUTH_TOKEN_ENDPOINT` and
+   give each upstream an `audience`. Do not build an authorization server into the
+   gateway.
+9. **Decide tool policy per route**: `off` is a deliberate transparent proxy; an
+   allow-list is the governed mode. Record-level authorization stays in the MCP
+   server.
 
 Deliberately generic: no cloud provider, no vendor SDK, no auth provider. The `AuthError`
 and rate-limiter seams are where those integrations belong.
@@ -415,6 +498,107 @@ and rate-limiter seams are where those integrations belong.
 Known gaps, stated plainly: rate limits, retry budgets, and breakers are per replica;
 unknown-length request bodies are buffered up to the limit instead of streamed; TLS
 terminates at the edge rather than in the gateway.
+
+## Enterprise AI connectors (MCP)
+
+The same data plane can front organization-installed AI connectors: ChatGPT apps
+and Claude connectors, both of which speak the Model Context Protocol over
+Streamable HTTP.
+
+**Protocol era:** design for both. The `2026-07-28` revision is stateless and is
+the target, but current Claude connectors still use the `2025-11-25` initialization
+era and OpenAI has not published `2026-07-28` support. The gateway forwards
+`initialize`, `Mcp-Session-Id`, and legacy `Last-Event-ID` rather than holding
+session state; `2026-07-28` clients simply ignore them. Do not assume the pilot is
+stateless-only.
+
+**Implemented in this template**
+
+- **OAuth 2.1 resource server.** Validates JWTs from the configured issuer against
+  a cached JWKS, checks `iss`/`aud`/`exp`/`nbf`, and rejects ID tokens by audience
+  (and `typ: id+jwt` early). Publishes RFC 9728 protected-resource metadata.
+  OAuth `401`s carry `error` + `resource_metadata` + `scope`; OAuth `403`s carry
+  `insufficient_scope`; API-key failures carry `Bearer` only. The gateway never
+  issues tokens.
+- **Per-user principal.** One identity type for API keys and OAuth, with subject,
+  assistant client, scopes, roles/groups, and token id. Per-user rate limits and
+  per-call audit use it.
+- **Tool-level policy.** A route can carry an allow-list keyed by role. Every
+  `tools/call` is checked before forwarding, including each call in a batch, and
+  denied calls return a JSON-RPC error the model can render. `tools/list` responses
+  are filtered so the model never sees a tool the caller cannot use; a
+  wrong-content-type or unparseable list fails closed. `server/discover` and
+  JSON-RPC error envelopes pass through. `Mcp-Method`, `Mcp-Name`, and
+  `MCP-Protocol-Version` must agree with the body when present. Filtered lists are
+  rewritten `cacheScope: private` and lose their shared-cache `ttlMs`.
+- **Upstream identity.** Routes can declare an audience. The gateway exchanges the
+  caller's token with RFC 8693 and sends a short-lived token minted for that
+  upstream. The inbound token is never forwarded to another audience.
+- **Per-call audit.** Tenant, subject, assistant, tool, decision, status, latency,
+  request id, and token id go to a bounded queue and a batched insert. A full queue
+  drops and increments a metric rather than adding latency.
+- **MCP timing.** Per-route deadline and response cap; `max_response_bytes: 0`
+  disables the cap for long-lived streams, and every streamed body has an idle
+  timeout (`STREAM_IDLE_TIMEOUT_SECS`). Tool calls carry bodies and are never
+  retried. The global deadline is a hard backstop, not the route budget.
+- **Edge behaviour.** Exact-origin CORS and `Origin` validation when
+  `CORS_ALLOWED_ORIGINS` is set; `Mcp-*` headers pass through; upstream
+  `Access-Control-*` headers are stripped so the gateway owns CORS; hop-by-hop and
+  credential headers are still stripped. Browser clients using `x-mcp-header` tools
+  must add those `Mcp-Param-*` names to the CORS allow-list; server-side connectors
+  do not.
+
+Example control-plane calls:
+
+For a local end-to-end demo, run `just mcp-stub` and `just mcp-route` (with the
+host binary, not the compose gateway), then after sourcing `.env`:
+
+```bash
+curl -s -X POST localhost:8080/mcp \
+  -H "Authorization: Bearer dev-local.$DEV_API_KEY_SECRET" \
+  -H "content-type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_tickets","arguments":{"query":"open"}}}'
+```
+
+The same request for `delete_ticket` returns a JSON-RPC denial and an audit row.
+
+Production-shaped example (requires the `OAUTH_TOKEN_ENDPOINT`/client block for the
+`--audience`):
+
+```bash
+api-gateway admin upstream put corp-mcp \
+  --base-url https://mcp.internal \
+  --timeout-ms 30000 \
+  --audience https://mcp.internal
+
+api-gateway admin route put mcp \
+  --prefix /mcp \
+  --upstream corp-mcp \
+  --method POST \
+  --rewrite /mcp \
+  --request-timeout-ms 120000 \
+  --tool-policy '{"mode":"allow_list","roles":{"support":["search_tickets"]}}'
+```
+
+**Still out of scope, deliberately**
+
+- Record-level authorization. The MCP server or data API decides which records a
+  user may read; the gateway decides which tools they may call.
+- Prompt-injection and tool-poisoning defence beyond tool allow-lists, output caps,
+  and the planned schema pinning. Do not claim the gateway makes an unsafe tool
+  safe.
+- Opaque-token introspection. JWT access tokens are supported; introspection is a
+  deliberate seam, not a silent fallback.
+- A static upstream credential store. Token exchange is the supported path; a
+  service credential is a documented residual risk, not a default.
+- Tool-schema pinning/drift alerts and a human approval workflow for write tools.
+- DLP/PII inspection of tool output.
+- Virtual MCP aggregation across multiple upstream servers.
+- Multi-tenant admin and shared deployments. v1 is one organization per deployment.
+
+See [`docs/mcp-gateway.md`](docs/mcp-gateway.md) for the protocol details and the
+phased backlog, and [ADR 0002](docs/adr/0002-mcp-resource-server.md) for the
+direction.
 
 ## Further reading
 
@@ -436,12 +620,14 @@ terminates at the edge rather than in the gateway.
 | `just replicas` | Starts two replicas and proves revocation + route convergence |
 | `just mutants` | Mutation testing (needs `cargo install cargo-mutants`; slow, on demand) |
 | `just demo-route` | Registers the demo upstream and route |
+| `just mcp-stub` | Runs a local MCP upstream on `127.0.0.1:18100` |
+| `just mcp-route` | Registers `/mcp` with a `search_tickets` allow-list |
 | `just db-up` / `just db-down` / `just db-logs` | Local Postgres |
 
 Rules: CI must be green before a change lands; no `unwrap` on request paths; secrets never
 reach logs or error bodies; new dependencies go through `cargo add` and must pass `just deny`.
 
-The suite runs in about a second. Database tests run only when `DATABASE_URL` is set and
+The suite runs in about two seconds. Database tests run only when `DATABASE_URL` is set and
 fail loudly, with a hint, when it is unreachable — they never skip silently. Property tests
 cover the path, header, and client-identity invariants. `just mutants` runs mutation testing
 on demand; the retry, error, client-identity, and routing modules currently report no

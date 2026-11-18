@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -135,27 +138,49 @@ pub(crate) struct CachedApiKeyStore {
     /// Unknown keys are cached briefly so credential scanners cannot turn every
     /// request into a database round trip.
     negative: TtlCache<ApiKeyId, ()>,
-    /// Recently revoked ids. A lookup that raced the revoke must not re-cache
-    /// the pre-revocation row.
+    /// Recently revoked ids. A lookup that raced a *local* revoke must not
+    /// re-cache the pre-revocation row. Remote notifications are only hints:
+    /// tombstoning them would let any database role deny a known key id for
+    /// the tombstone lifetime.
     tombstones: TtlCache<ApiKeyId, ()>,
+    /// Bumped on every invalidation. A lookup captures it before the store
+    /// read and refuses to insert if it changed while the read was in flight.
+    generation: AtomicU64,
 }
 
 impl CachedApiKeyStore {
     pub(crate) fn new(inner: Arc<dyn ApiKeyStore>, ttl: Duration) -> Self {
+        // The tombstone must outlive the positive cache; otherwise a revoke
+        // with a long TTL can be undone by a lookup that started before it.
+        let tombstone_ttl = (ttl + Duration::from_secs(1)).max(Duration::from_secs(60));
+
         Self {
             inner,
             cache: TtlCache::with_capacity(ttl, 262_144),
             negative: TtlCache::with_capacity(NEGATIVE_TTL, 4_096),
-            tombstones: TtlCache::with_capacity(Duration::from_secs(60), 4_096),
+            tombstones: TtlCache::with_capacity(tombstone_ttl, 4_096),
+            generation: AtomicU64::new(0),
         }
     }
 
-    /// Drops one entry. Called locally on revoke and remotely via `LISTEN`.
-    pub(crate) fn invalidate(&self, key_id: &ApiKeyId) {
+    /// A local revoke is authoritative: drop the entry and block re-insertion
+    /// until the database write is visible to every in-flight lookup.
+    fn invalidate_local(&self, key_id: &ApiKeyId) {
+        self.generation
+            .fetch_add(1, Ordering::AcqRel);
         self.cache.invalidate(key_id);
         self.negative.invalidate(key_id);
         self.tombstones
             .insert(key_id.clone(), ());
+    }
+
+    /// A remote notification is only a hint. The next lookup re-reads the
+    /// database; a forged payload cannot deny a key.
+    fn invalidate_remote(&self, key_id: &ApiKeyId) {
+        self.generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.cache.invalidate(key_id);
+        self.negative.invalidate(key_id);
     }
 }
 
@@ -178,17 +203,21 @@ impl ApiKeyStore for CachedApiKeyStore {
         }
 
         metrics::counter!("gateway_auth_cache_total", "result" => "miss").increment(1);
+        let generation = self.generation.load(Ordering::Acquire);
 
         let credential = self
             .inner
             .find_by_key_id(key_id)
             .await?;
 
-        match &credential {
-            Some(credential) => self
-                .cache
-                .insert(key_id.clone(), credential.clone()),
-            None => self.negative.insert(key_id.clone(), ()),
+        // A revoke that landed while the store read was in flight must win.
+        if self.generation.load(Ordering::Acquire) == generation {
+            match &credential {
+                Some(credential) => self
+                    .cache
+                    .insert(key_id.clone(), credential.clone()),
+                None => self.negative.insert(key_id.clone(), ()),
+            }
         }
 
         Ok(credential)
@@ -197,7 +226,7 @@ impl ApiKeyStore for CachedApiKeyStore {
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError> {
         // Invalidate first: a failed revoke is retried by the caller, and a
         // stale hit would keep a revoked key alive for the TTL.
-        self.invalidate(key_id);
+        self.invalidate_local(key_id);
 
         self.inner
             .revoke_by_key_id(key_id)
@@ -239,7 +268,7 @@ pub(crate) async fn listen_for_revocations(pool: sqlx::PgPool, store: Arc<Cached
         loop {
             match listener.recv().await {
                 Ok(notification) => {
-                    store.invalidate(&ApiKeyId(notification.payload().to_owned()));
+                    store.invalidate_remote(&ApiKeyId(notification.payload().to_owned()));
                     tracing::debug!(key_id = notification.payload(), "cache invalidated");
                 }
                 Err(error) => {
@@ -307,6 +336,36 @@ mod tests {
             .unwrap();
 
         assert!(cached.key.revoked_at.is_none(), "served from cache");
+    }
+
+    #[tokio::test]
+    async fn remote_invalidation_is_a_hint_not_a_tombstone() {
+        let (inner, store) = store_with_key(Duration::from_secs(30));
+        inner
+            .insert_key(key("k1"))
+            .await
+            .expect("insert");
+
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("k1".to_owned()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A forged pg_notify payload is untrusted. It may drop the cache entry,
+        // but the next lookup must re-read Postgres rather than deny the key.
+        store.invalidate_remote(&ApiKeyId("k1".to_owned()));
+
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("k1".to_owned()))
+                .await
+                .unwrap()
+                .is_some(),
+            "an unverified notification must not revoke an active key"
+        );
     }
 
     #[tokio::test]

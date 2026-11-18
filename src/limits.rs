@@ -28,6 +28,7 @@ pub(crate) struct RateLimiter {
     shards: Vec<Mutex<Shard>>,
     capacity: f64,
     refill_per_second: f64,
+    max_buckets_per_shard: usize,
 }
 
 struct Shard {
@@ -63,6 +64,7 @@ impl RateLimiter {
                 .collect(),
             capacity,
             refill_per_second,
+            max_buckets_per_shard: 4_096,
         }
     }
 
@@ -78,6 +80,18 @@ impl RateLimiter {
         if now.saturating_duration_since(shard.last_swept) > Duration::from_secs(30) {
             evict_idle(&mut shard.buckets, now);
             shard.last_swept = now;
+        }
+
+        // A caller-controlled key (especially a source IP) must not grow the
+        // map without bound between sweeps.
+        if shard.buckets.len() >= self.max_buckets_per_shard {
+            evict_idle(&mut shard.buckets, now);
+
+            if shard.buckets.len() >= self.max_buckets_per_shard
+                && let Some(oldest) = shard.buckets.keys().next().cloned()
+            {
+                shard.buckets.remove(&oldest);
+            }
         }
 
         let bucket = shard
@@ -141,10 +155,11 @@ fn evict_idle(shard: &mut HashMap<String, Bucket>, now: Instant) {
     shard.retain(|_, bucket| now.saturating_duration_since(bucket.updated_at) < idle);
 }
 
-/// The two limits the gateway enforces, each disabled by setting it to zero.
+/// The limits the gateway enforces, each disabled by setting it to zero.
 pub(crate) struct RateLimits {
     pub(crate) ip: Option<RateLimiter>,
     pub(crate) tenant: Option<RateLimiter>,
+    pub(crate) user: Option<RateLimiter>,
 }
 
 impl RateLimits {
@@ -160,6 +175,7 @@ impl RateLimits {
         Self {
             ip: limiter(config.ip_per_minute),
             tenant: limiter(config.tenant_per_minute),
+            user: limiter(config.user_per_minute),
         }
     }
 }
@@ -357,6 +373,7 @@ mod tests {
         LimitsConfig {
             ip_per_minute: 60,
             tenant_per_minute: 600,
+            user_per_minute: 60,
             circuit_failure_threshold: 2,
             circuit_cooldown: Duration::from_millis(50),
             backend: crate::config::RateLimitBackend::Local,

@@ -1,9 +1,10 @@
 use axum::{Router, body::Body, http::Request, http::header, response::IntoResponse};
 use opentelemetry::{global, trace::TraceContextExt};
-use std::time::Instant;
+use std::{collections::HashSet, sync::Arc, time::Instant};
 use tower::ServiceBuilder;
 use tower_http::{
     catch_panic::CatchPanicLayer,
+    cors::{AllowOrigin, CorsLayer},
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
@@ -40,6 +41,8 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
             tenant_id = tracing::field::Empty,
             client_id = tracing::field::Empty,
             key_id = tracing::field::Empty,
+            subject = tracing::field::Empty,
+            auth_method = tracing::field::Empty,
             route = tracing::field::Empty,
             upstream = tracing::field::Empty,
         );
@@ -56,29 +59,126 @@ pub fn build_app(config: &Config, state: state::AppState) -> Router {
         span
     });
 
-    let layers = ServiceBuilder::new()
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        // Sanitise before propagation so the response echoes the value we
-        // actually logged, not a client-supplied one.
-        .layer(axum::middleware::from_fn(request_context::scope_request_id))
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(axum::middleware::from_fn(record_metrics))
-        .layer(trace_layer)
-        .layer(CatchPanicLayer::new())
-        .layer(axum::middleware::from_fn_with_state(
-            config.server.request_timeout,
-            request_deadline,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            config.server.request_body_limit_bytes,
-            reject_declared_oversize,
-        ))
-        // Streaming backstop for chunked bodies without a Content-Length.
-        .layer(RequestBodyLimitLayer::new(
-            config.server.request_body_limit_bytes,
-        ));
+    let layers =
+        ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            // Sanitise before propagation so the response echoes the value we
+            // actually logged, not a client-supplied one.
+            .layer(axum::middleware::from_fn(request_context::scope_request_id))
+            .layer(PropagateRequestIdLayer::x_request_id())
+            // Preflight is answered before authentication, as browsers require.
+            .option_layer(cors_layer(config))
+            .option_layer(origin_set(config).map(|origins| {
+                axum::middleware::from_fn_with_state(origins, reject_untrusted_origin)
+            }))
+            .layer(axum::middleware::from_fn(record_metrics))
+            .layer(trace_layer)
+            .layer(CatchPanicLayer::new())
+            .layer(axum::middleware::from_fn_with_state(
+                config.server.max_request_timeout,
+                request_deadline,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                config.server.request_body_limit_bytes,
+                reject_declared_oversize,
+            ))
+            // Streaming backstop for chunked bodies without a Content-Length.
+            .layer(RequestBodyLimitLayer::new(
+                config.server.request_body_limit_bytes,
+            ));
 
     crate::routes::router(state).layer(layers)
+}
+
+fn origin_set(config: &Config) -> Option<Arc<HashSet<String>>> {
+    if config
+        .server
+        .cors_allowed_origins
+        .is_empty()
+    {
+        return None;
+    }
+
+    Some(Arc::new(
+        config
+            .server
+            .cors_allowed_origins
+            .iter()
+            .map(|origin| origin.to_ascii_lowercase())
+            .collect(),
+    ))
+}
+
+fn cors_layer(config: &Config) -> Option<CorsLayer> {
+    let origins: Vec<axum::http::HeaderValue> = config
+        .server
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|origin| axum::http::HeaderValue::from_str(origin).ok())
+        .collect();
+
+    if origins.is_empty() {
+        return None;
+    }
+
+    use axum::http::{Method, header::HeaderName};
+
+    let headers = vec![
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+        header::ORIGIN,
+        HeaderName::from_static("mcp-method"),
+        HeaderName::from_static("mcp-name"),
+        HeaderName::from_static("mcp-protocol-version"),
+        HeaderName::from_static("mcp-session-id"),
+        HeaderName::from_static("last-event-id"),
+        HeaderName::from_static("x-request-id"),
+    ];
+
+    let exposed = vec![
+        header::WWW_AUTHENTICATE,
+        HeaderName::from_static("mcp-session-id"),
+        HeaderName::from_static("mcp-protocol-version"),
+        HeaderName::from_static("x-request-id"),
+        HeaderName::from_static("ratelimit-limit"),
+        HeaderName::from_static("ratelimit-remaining"),
+        HeaderName::from_static("ratelimit-reset"),
+        HeaderName::from_static("retry-after"),
+    ];
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers(headers)
+            .expose_headers(exposed)
+            .max_age(std::time::Duration::from_secs(600)),
+    )
+}
+
+/// A browser `Origin` is a security boundary, not a hint. Requests without one
+/// (server-to-server connectors) pass; a present, unlisted origin is refused
+/// even if it would not have preflighted.
+async fn reject_untrusted_origin(
+    axum::extract::State(allowed): axum::extract::State<Arc<HashSet<String>>>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    for origin in request
+        .headers()
+        .get_all(header::ORIGIN)
+    {
+        let Ok(origin) = origin.to_str() else {
+            return AppError::Forbidden.into_response();
+        };
+
+        if !allowed.contains(&origin.to_ascii_lowercase()) {
+            return AppError::Forbidden.into_response();
+        }
+    }
+
+    next.run(request).await
 }
 
 /// Rejects oversized bodies with the gateway's error envelope. The tower

@@ -24,7 +24,7 @@ AUTH="Authorization: Bearer ${ADMIN_TOKEN}"
 
 cleanup() {
   if [[ "${KEEP:-0}" != "1" ]]; then
-    docker compose --profile replicas down >/dev/null 2>&1 || true
+    docker compose --profile replicas down -v >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -51,6 +51,25 @@ ADMIN_TOKENS="ops:${ADMIN_TOKEN}" \
 wait_ready "$A" "replica a"
 wait_ready "$B" "replica b"
 
+# The seeded development key belongs to the compose database; create the
+# client this script uses explicitly so a fresh volume works.
+docker compose exec -T gateway /usr/local/bin/api-gateway \
+  admin tenant create demo-tenant >/dev/null 2>&1 || true
+docker compose exec -T gateway /usr/local/bin/api-gateway \
+  admin client create demo-client --tenant demo-tenant >/dev/null 2>&1 || true
+
+put() {
+  local url=$1 body=$2 code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$url" \
+    -H "$AUTH" -H 'content-type: application/json' -d "$body")
+  [[ "$code" == "204" ]] || fail "PUT ${url} returned ${code}"
+}
+
+put "${ADMIN_A}/v1/upstreams/replicas-demo" '{"base_url":"https://swapi.dev/api"}'
+put "${ADMIN_A}/v1/routes/replicas-demo" \
+  '{"path_prefix":"/replicas-demo","methods":["GET"],"upstream_id":"replicas-demo","scopes":["read"]}'
+sleep 3
+
 echo
 echo "1. an issued key works on both replicas"
 KEY=$(docker compose exec -T gateway /usr/local/bin/api-gateway \
@@ -61,7 +80,7 @@ KEY=$(docker compose exec -T gateway /usr/local/bin/api-gateway \
 
 for name in a b; do
   base=$A; [[ $name == b ]] && base=$B
-  code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "${base}/swapi/people/1")
+  code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "${base}/replicas-demo/people/1")
   [[ "$code" == "200" ]] || fail "replica ${name} returned ${code}"
   pass "replica ${name} accepted the key"
 done
@@ -74,7 +93,7 @@ docker compose exec -T gateway /usr/local/bin/api-gateway \
 
 for name in a b; do
   base=$A; [[ $name == b ]] && base=$B
-  code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "${base}/swapi/people/1")
+  code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "${base}/replicas-demo/people/1")
   [[ "$code" == "401" ]] || fail "replica ${name} still accepts the revoked key (${code})"
   pass "replica ${name} rejected the revoked key"
 done
@@ -82,16 +101,9 @@ done
 echo
 echo "3. a route added on replica a appears on replica b without a restart"
 
-put() {
-  local url=$1 body=$2 code
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$url" \
-    -H "$AUTH" -H 'content-type: application/json' -d "$body")
-  [[ "$code" == "204" ]] || fail "PUT ${url} returned ${code}"
-}
-
-put "${ADMIN_A}/v1/upstreams/replicas-demo" '{"base_url":"https://swapi.dev/api"}'
-put "${ADMIN_A}/v1/routes/replicas-demo" \
-  '{"path_prefix":"/replicas-demo","methods":["GET"],"upstream_id":"replicas-demo","scopes":["read"]}'
+put "${ADMIN_A}/v1/upstreams/replicas-added" '{"base_url":"https://swapi.dev/api"}'
+put "${ADMIN_A}/v1/routes/replicas-added" \
+  '{"path_prefix":"/replicas-added","methods":["GET"],"upstream_id":"replicas-added","scopes":["read"]}'
 
 NEW_KEY=$(docker compose exec -T gateway /usr/local/bin/api-gateway \
   admin key create --client demo-client --scope read 2>/dev/null \
@@ -99,7 +111,7 @@ NEW_KEY=$(docker compose exec -T gateway /usr/local/bin/api-gateway \
 
 for attempt in $(seq 1 20); do
   code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${NEW_KEY}" \
-    "${B}/replicas-demo/people/1")
+    "${B}/replicas-added/people/1")
   [[ "$code" == "200" ]] && break
   sleep 0.5
 done

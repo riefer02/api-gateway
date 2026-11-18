@@ -361,12 +361,30 @@ mod tests {
                 .expect("revoke")
         );
 
-        let notification = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
-            .await
-            .expect("notification within 2s")
-            .expect("notification");
+        // Every test shares the Postgres channel, so another test's revoke can
+        // arrive first. Wait for this key's notification instead of assuming
+        // the first one is ours.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut matched = false;
 
-        assert_eq!(notification.payload(), key_id.as_str());
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+
+            match tokio::time::timeout(remaining, listener.recv()).await {
+                Ok(Ok(notification)) if notification.payload() == key_id.as_str() => {
+                    matched = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => panic!("listener failed: {error}"),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            matched,
+            "revocation notification for {key_id} was not observed"
+        );
 
         cleanup(&pool, &tenant_id, &client_id).await;
     }

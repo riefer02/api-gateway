@@ -15,8 +15,9 @@ Delete anything a linter, test, or type already enforces. No repo tours.
 
 ## Invariants
 
-- `src/app.rs` layer order is a contract: set request id, sanitise it, propagate, metrics,
-  tracing, panic catch, deadline, body limit. Reordering silently breaks correlation.
+- `src/app.rs` layer order is a contract: set request id, sanitise it, propagate,
+  CORS/Origin, metrics, tracing, panic catch, deadline, body limit. Reordering silently
+  breaks correlation or makes preflight require a credential.
 - Every HTTP failure goes through `AppError` (`src/error.rs`). Do not invent ad-hoc
   status codes or response bodies; the envelope carries the request id.
 - Secrets never appear in logs, traces, error bodies, metric labels, or `Debug` output.
@@ -42,6 +43,8 @@ Delete anything a linter, test, or type already enforces. No repo tours.
   `detail` payload holds identifiers only — never tokens or verifier material.
 - Limits and breakers are in-process state (`src/limits.rs`). They are per replica and
   deliberately not shared; do not add cross-request locks outside those structures.
+  The JWKS and token-exchange caches are the exception: their locks are short, and the
+  JWKS refresh mutex is a single-flight fetch, never held across a proxied request.
 - Anything personal — local deploy config, credentials, scratch notes — lives in
   `.local/`, which is gitignored. Never reference a personal path from tracked files.
 

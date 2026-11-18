@@ -1,10 +1,12 @@
 mod admin;
 mod app;
+mod audit;
 mod auth;
 mod config;
 mod db;
 mod error;
 mod limits;
+mod mcp;
 mod net;
 mod observability;
 mod proxy;

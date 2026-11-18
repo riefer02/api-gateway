@@ -3,6 +3,95 @@
 Notable changes, newest first. Format loosely follows [Keep a Changelog](https://keepachangelog.com);
 versions follow [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **OAuth 2.1 resource server.** JWKS cache with cooldown and outage handling, JWT
+  validation (issuer, audience, expiry, `nbf`, algorithm allow-list, ID-token
+  rejection), RFC 9728 protected-resource metadata, and MCP-shaped `401`/`403`
+  challenges. Delegates token issuance to the customer's IdP.
+- **Per-user principal.** One identity type for API keys and OAuth, with subject,
+  assistant client, scopes, roles/groups, token id, and the inbound token for
+  exchange. Per-user rate limits are keyed `tenant:subject`.
+- **MCP tool policy.** Role-based `tools/call` allow-lists, JSON-RPC denials,
+  filtered `tools/list`/`server/discover` responses, and a typed `tool_policy` on
+  each route.
+- **RFC 8693 token exchange.** Routes can declare an upstream audience; the gateway
+  mints a short-lived upstream token and never forwards the inbound token to another
+  audience. Exchanged tokens are cached per `(subject, audience, scope)`. Supports
+  HTTP Basic and `client_secret_post`; opaque-token introspection is rejected at
+  boot rather than silently accepted.
+- **Per-call data audit.** Bounded queue, batched inserts, explicit drop and write
+  failure metrics, separate retention, and a control-plane reader
+  (`GET /v1/data-audit`, `admin audit data`).
+- **Tenant-bound routes.** Optional `routes.tenant_id`; a tenant route is invisible
+  to other tenants and does not fall through to a shorter prefix.
+- **Per-route timing.** `request_timeout_ms` and `max_response_bytes` with
+  `MAX_REQUEST_TIMEOUT_SECS` as the hard cap.
+- **CORS and `Origin` validation.** Exact origins only, preflight before auth,
+  unlisted origins refused.
+- **Control-plane fields.** Upstream `audience`/`exchange_scope`; route
+  `tenant_id`/`tool_policy`/`request_timeout_ms`/`max_response_bytes`; CLI and
+  OpenAPI updated.
+
+### Fixed
+
+- **MCP policy bypasses found in review.** A batch `tools/list` is now filtered even
+  when the first message is a notification; `server/discover` and JSON-RPC error
+  envelopes pass through instead of returning 502; `Mcp-Name` and
+  `MCP-Protocol-Version` must agree with the body; duplicate JSON keys and a JSON-RPC
+  body on a non-POST method are refused. Filtered lists are `cacheScope: private`
+  and lose `ttlMs`.
+- **JWKS resilience.** One unsupported key in the issuer's set no longer takes OAuth
+  offline; an empty-cache outage respects the refresh cooldown; unknown `kid`s are
+  still bounded.
+- **Token exchange binding.** The cache key includes tenant and a hash of the inbound
+  token, the lifetime is capped, and `issued_token_type` must be an access token.
+- **Route writes are partial for security fields.** Omitting `tenant_id`, `scopes`,
+  `tool_policy`, or enable flags preserves the stored value; `route list` returns
+  scopes.
+- **Tenant deletion is `RESTRICT`**, matching clients: a tenant with routes returns
+  409 rather than silently deleting them. The runbook documents the forward-only
+  rollback check for tenant/tool-policy routes.
+- **Audit truthfulness.** Per-call rows are written only after a route resolves;
+  status >= 400 defaults to `deny`; `occurred_at` is the call time, not the batch
+  insert time; pruning is advisory-locked and batched; shutdown drain uses the
+  process budget and reports a timeout.
+- **Streaming.** Response bodies have an idle timeout; `max_response_bytes: 0` means
+  unlimited; filtered policy responses are capped at 4 MiB.
+- **CORS.** `Mcp-Name` is allowed on preflight; upstream `Access-Control-*` headers
+  are stripped so the gateway owns the policy.
+- **Token and cache hardening.** Bearer/key-id length caps, local-only revocation
+  tombstones with a generation check, OAuth/JWKS/cache TTL bounds, and a boot error
+  when OAuth companions are set without `OAUTH_ISSUER`.
+- `TRUSTED_PROXIES` was parsed and then discarded for the data plane: `serve.rs`
+  installed an empty trust list into `AppState`, so behind an edge proxy every caller
+  was resolved as the proxy's address. That collapsed per-IP rate limiting into one
+  shared bucket and made the audit source address useless. The parsed list is now
+  shared by both listeners, and a regression test asserts the forwarded client
+  address reaches the upstream.
+
+### Changed
+
+- The 15 s request timeout is now the default route deadline, not an absolute
+  whole-process deadline; a route may request up to `MAX_REQUEST_TIMEOUT_SECS`
+  (300 s). The previous 408 behaviour remains the default for routes that do not
+  override it.
+- `AdminService` takes the maximum request deadline and whether token exchange is
+  configured, so an upstream audience cannot be stored without a way to exchange.
+
+### Documentation
+
+- [`docs/mcp-gateway.md`](docs/mcp-gateway.md): protocol details, implemented
+  capabilities, remaining work, deployment, and threat-model additions for
+  organization-installed AI connectors.
+- [`docs/adr/0002-mcp-resource-server.md`](docs/adr/0002-mcp-resource-server.md):
+  the gateway is an MCP-aware OAuth resource server, not an authorization server;
+  one organization per deployment for v1.
+- Runbook: OAuth revocation, JWKS outage, token-exchange failure, data audit, and
+  tool-policy rollback.
+
 ## [0.1.0] — 2026-11-12
 
 First tagged build: a working data plane and an audited control plane.

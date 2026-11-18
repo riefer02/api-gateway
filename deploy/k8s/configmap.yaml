@@ -16,19 +16,39 @@ data:
   RATE_LIMIT_BACKEND: local
   RATE_LIMIT_IP_PER_MINUTE: "600"
   RATE_LIMIT_TENANT_PER_MINUTE: "6000"
+  RATE_LIMIT_USER_PER_MINUTE: "600"
   CIRCUIT_FAILURE_THRESHOLD: "5"
   CIRCUIT_COOLDOWN_SECS: "30"
   RETRY_MAX_ATTEMPTS: "2"
   RETRY_BASE_DELAY_MS: "50"
   RETRY_BUDGET_RATIO: "0.2"
   REQUEST_TIMEOUT_SECS: "15"
+  MAX_REQUEST_TIMEOUT_SECS: "300"
+  MAX_RESPONSE_BYTES: "10485760"
+  STREAM_IDLE_TIMEOUT_SECS: "60"
   HEADER_READ_TIMEOUT_SECS: "10"
   MAX_CONNECTIONS: "1024"
   # Your ingress controller's pod CIDR; empty trusts nobody.
   TRUSTED_PROXIES: ""
+  # Exact browser origins; leave empty for server-to-server connectors.
+  CORS_ALLOWED_ORIGINS: ""
+  # OAuth is disabled until these are set. Audience must be unique to this gateway.
+  # OAUTH_ISSUER: https://login.example.com
+  # OAUTH_AUDIENCE: https://gateway.example.com/mcp
+  # OAUTH_JWKS_URI: https://login.example.com/.well-known/jwks.json
+  # OAUTH_RESOURCE: https://gateway.example.com/mcp
+  # OAUTH_AUTHORIZATION_SERVERS: https://login.example.com
+  # OAUTH_SCOPES_SUPPORTED: mcp:tools
+  # OAUTH_TOKEN_ENDPOINT: https://login.example.com/oauth/token
+  # OAUTH_CLIENT_ID: api-gateway
   MAX_REQUEST_BODY_BYTES: "1048576"
+  DATA_AUDIT_ENABLED: "true"
+  DATA_AUDIT_QUEUE_CAPACITY: "1024"
+  DATA_AUDIT_BATCH_SIZE: "100"
+  DATA_AUDIT_RETENTION_DAYS: "90"
   SHUTDOWN_DRAIN_SECS: "25"
   DB_MAX_CONNECTIONS: "10"
   DB_MIN_CONNECTIONS: "1"
   DB_ACQUIRE_TIMEOUT_SECS: "5"
-  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability:4317
+  # Uncomment when an OTLP collector exists.
+  # OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability:4317

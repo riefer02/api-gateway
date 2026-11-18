@@ -42,6 +42,18 @@ demo-route:
     cargo run --quiet -- admin upstream put swapi --base-url https://swapi.dev/api
     cargo run --quiet -- admin route put swapi-people --prefix /swapi --upstream swapi --scope read
 
+# Local MCP upstream for the policy/audit path: run `just mcp-stub` in one shell
+# and `just mcp-route` in another.
+mcp-stub:
+    cargo run --quiet --example mcp_stub
+
+mcp-route:
+    cargo run --quiet -- admin upstream put mcp-stub --base-url http://127.0.0.1:18100 --timeout-ms 30000
+    cargo run --quiet -- admin route put mcp --prefix /mcp --upstream mcp-stub --method POST \
+        --rewrite /mcp \
+        --request-timeout-ms 120000 \
+        --tool-policy '{"mode":"allow_list","roles":{"service":["search_tickets"]}}'
+
 docker:
     docker build -t api-gateway:dev .
 

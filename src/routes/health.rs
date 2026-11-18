@@ -10,6 +10,7 @@ pub(crate) async fn live() -> StatusCode {
 /// whose route table has stopped refreshing is removed from rotation.
 pub(crate) async fn ready(State(state): State<AppState>) -> StatusCode {
     if state.routes.is_stale() {
+        metrics::gauge!("gateway_ready").set(0.0);
         tracing::warn!(
             "readiness check failed: route table has not refreshed within its staleness window"
         );

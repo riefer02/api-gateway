@@ -22,6 +22,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap owns the shape; parsed once at startup.
 pub(crate) enum Command {
     /// Run the data plane
     Serve(ServeArgs),
@@ -76,13 +77,27 @@ pub(crate) enum AdminCommand {
         #[command(subcommand)]
         command: AuditCommand,
     },
+    /// Apply pending migrations (explicit; the other admin commands do not)
+    Migrate,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum AuditCommand {
+    /// Control-plane mutations
     List {
         #[arg(long, default_value_t = 50)]
         limit: i64,
+    },
+    /// Data-plane calls (who used which tool)
+    Data {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[arg(long)]
+        before_id: Option<i64>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -139,10 +154,17 @@ pub(crate) enum UpstreamCommand {
         base_url: String,
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u32,
+        /// RFC 8693 audience for the exchanged upstream token
+        #[arg(long)]
+        audience: Option<String>,
+        /// Optional scope to request during token exchange
+        #[arg(long)]
+        exchange_scope: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap owns the shape; parsed once at startup.
 pub(crate) enum RouteCommand {
     Rm {
         id: String,
@@ -159,12 +181,30 @@ pub(crate) enum RouteCommand {
         /// Replace the matched prefix with this path (default: strip it)
         #[arg(long)]
         rewrite: Option<String>,
-        /// Scope a caller needs; repeat for several
+        /// Bind the route to one tenant; omit for a shared route
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Scope a caller needs; repeat for several. Omit to preserve existing scopes.
         #[arg(long = "scope")]
         scopes: Vec<String>,
-        /// Register the route disabled
+        /// Replace the stored scopes with the --scope values (or clear them with none)
         #[arg(long)]
+        replace_scopes: bool,
+        /// Tool policy as JSON, e.g. '{"mode":"allow_list","roles":{"support":["search"]}}'
+        #[arg(long)]
+        tool_policy: Option<String>,
+        /// Per-route request deadline in milliseconds
+        #[arg(long)]
+        request_timeout_ms: Option<u32>,
+        /// Per-route response cap in bytes
+        #[arg(long)]
+        max_response_bytes: Option<u64>,
+        /// Register the route disabled
+        #[arg(long, conflicts_with = "enable")]
         disabled: bool,
+        /// Enable the route (preserves the current state if neither flag is given)
+        #[arg(long)]
+        enable: bool,
         /// Higher priority wins between routes with the same prefix
         #[arg(long)]
         priority: Option<i32>,
@@ -208,7 +248,12 @@ async fn dispatch(
     command: AdminCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool = db::connect(&config.database).await?;
-    db::migrate(&pool).await?;
+
+    if matches!(command, AdminCommand::Migrate) {
+        db::migrate(&pool).await?;
+        println!("migrations applied");
+        return Ok(());
+    }
 
     let verifier = Arc::new(KeyVerifier::new(config.auth.pepper.clone()));
     let store: Arc<dyn ApiKeyStore> = Arc::new(
@@ -219,7 +264,11 @@ async fn dispatch(
         verifier,
         config.routing.allow_hosts.clone(),
         store,
-        config.server.request_timeout,
+        config.server.max_request_timeout,
+        config
+            .oauth
+            .as_ref()
+            .is_some_and(|oauth| oauth.token_exchange.is_some()),
     );
 
     let actor = Actor::local("cli");
@@ -259,6 +308,7 @@ async fn dispatch(
         }
         AdminCommand::Route { command } => run_route_command(&service, &actor, command).await?,
         AdminCommand::Audit { command } => run_audit_command(&service, command).await?,
+        AdminCommand::Migrate => {}
     }
 
     Ok(())
@@ -286,6 +336,51 @@ async fn run_audit_command(
                     entry.subject,
                     entry
                         .source_ip
+                        .unwrap_or_else(|| "-".to_owned())
+                );
+            }
+        }
+        AuditCommand::Data {
+            limit,
+            before_id,
+            since,
+            tenant,
+        } => {
+            let since = since
+                .as_deref()
+                .map(|value| {
+                    time::OffsetDateTime::parse(
+                        value,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map_err(|_| "`--since` must be an RFC 3339 timestamp".to_owned())
+                })
+                .transpose()?;
+
+            let entries = service
+                .list_data_audit(limit, before_id, since, tenant.as_deref())
+                .await?;
+
+            if entries.is_empty() {
+                println!("no data audit events");
+                return Ok(());
+            }
+
+            for entry in entries {
+                println!(
+                    "{:<32} {:<12} {:<20} {:<18} {:<8} {}",
+                    entry.occurred_at.to_string(),
+                    entry.tenant_id,
+                    entry
+                        .subject
+                        .unwrap_or_else(|| "-".to_owned()),
+                    entry.tool_name.unwrap_or_else(|| entry
+                        .mcp_method
+                        .unwrap_or_else(|| "-".to_owned())),
+                    entry.decision,
+                    entry
+                        .status
+                        .map(|status| status.to_string())
                         .unwrap_or_else(|| "-".to_owned())
                 );
             }
@@ -367,11 +462,30 @@ async fn run_upstream_command(
             id,
             base_url,
             timeout_ms,
+            audience,
+            exchange_scope,
         } => {
             service
-                .put_upstream(actor, &id, &base_url, timeout_ms)
+                .put_upstream(
+                    actor,
+                    &id,
+                    &base_url,
+                    timeout_ms,
+                    audience.as_deref(),
+                    exchange_scope.as_deref(),
+                )
                 .await?;
-            println!("upstream `{id}` -> {base_url} (timeout {timeout_ms}ms)");
+            println!(
+                "upstream `{id}` -> {base_url} (timeout {timeout_ms}ms{}{})",
+                audience
+                    .as_deref()
+                    .map(|audience| format!(", audience {audience}"))
+                    .unwrap_or_default(),
+                exchange_scope
+                    .as_deref()
+                    .map(|scope| format!(", scope {scope}"))
+                    .unwrap_or_default()
+            );
         }
     }
 
@@ -394,10 +508,36 @@ async fn run_route_command(
             upstream,
             methods,
             rewrite,
+            tenant,
             scopes,
+            replace_scopes,
+            tool_policy,
+            request_timeout_ms,
+            max_response_bytes,
             disabled,
+            enable,
             priority,
         } => {
+            let tool_policy = match tool_policy {
+                Some(json) => Some(
+                    serde_json::from_str::<crate::mcp::ToolPolicy>(&json)
+                        .map_err(|error| format!("invalid --tool-policy JSON: {error}"))?,
+                ),
+                None => None,
+            };
+            let scopes = if scopes.is_empty() && !replace_scopes {
+                None
+            } else {
+                Some(scopes)
+            };
+            let enabled = if enable {
+                Some(true)
+            } else if disabled {
+                Some(false)
+            } else {
+                None
+            };
+
             service
                 .put_route(
                     actor,
@@ -407,9 +547,13 @@ async fn run_route_command(
                         methods,
                         upstream_id: upstream,
                         rewrite_prefix: rewrite,
+                        tenant_id: tenant,
                         scopes,
-                        enabled: !disabled,
-                        priority: priority.unwrap_or(0),
+                        tool_policy,
+                        request_timeout_ms,
+                        max_response_bytes,
+                        enabled,
+                        priority,
                     },
                 )
                 .await?;
@@ -425,8 +569,21 @@ async fn run_route_command(
             }
 
             for route in routes {
+                let tools = match route.tool_policy.mode {
+                    crate::mcp::ToolMode::Off => "tools=off",
+                    crate::mcp::ToolMode::AllowList => "tools=allow_list",
+                };
+                let timeout = route
+                    .request_timeout_ms
+                    .map(|ms| format!(" timeout={ms}ms"))
+                    .unwrap_or_default();
+                let cap = route
+                    .max_response_bytes
+                    .map(|bytes| format!(" cap={bytes}B"))
+                    .unwrap_or_default();
+
                 println!(
-                    "{:<20} {:<24} {:<10} -> {}  {}{}",
+                    "{:<20} {:<24} {:<10} -> {}  {}{}{}{}  {}{}{}",
                     route.id,
                     route.path_prefix,
                     route.methods.join(","),
@@ -435,7 +592,19 @@ async fn run_route_command(
                         Some(rewrite) => format!("rewrite {rewrite}"),
                         None => "strip prefix".to_owned(),
                     },
-                    if route.enabled { "" } else { "  (disabled)" }
+                    match &route.tenant_id {
+                        Some(tenant) => format!("  tenant {tenant}"),
+                        None => String::new(),
+                    },
+                    if route.enabled { "" } else { "  (disabled)" },
+                    if route.scopes.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  scopes={}", route.scopes.join(","))
+                    },
+                    tools,
+                    timeout,
+                    cap
                 );
             }
         }

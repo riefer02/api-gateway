@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
-description = "A production-shaped HTTP API gateway: API-key auth, Postgres-backed routing, streaming proxy, limits, metrics."
+description = "A production-shaped HTTP API gateway: API-key and OAuth auth, Postgres-backed routing, streaming proxy, MCP tool policy, per-call audit, limits, metrics."
 
 [dependencies]
 arc-swap = "1.9.5"
@@ -13,29 +13,31 @@ axum = "0.8"
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
 fastrand = "2.5.0"
+futures-core = "0.3.34"
 getrandom = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
 hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["server-auto", "tokio", "service", "http1", "http2"] }
 ipnet = "2.12.2"
+jsonwebtoken = "9.3.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry = "0.33.1"
 opentelemetry-http = "0.33.0"
 opentelemetry-otlp = { version = "0.33.1", features = ["trace", "grpc-tonic"] }
 opentelemetry_sdk = { version = "0.33.1", features = ["trace"] }
-reqwest = { version = "0.13.5", features = ["stream"] }
+reqwest = { version = "0.13.5", features = ["form", "json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "time", "migrate", "macros", "derive"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "time", "migrate", "macros", "derive", "json"] }
 subtle = "2.6.1"
 thiserror = "2.0.21"
 time = "0.3.55"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
 tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.7.1", features = ["request-id", "trace", "timeout", "limit", "catch-panic"] }
+tower-http = { version = "0.7.1", features = ["request-id", "trace", "timeout", "limit", "catch-panic", "cors"] }
 tracing = "0.1.44"
 tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -20,12 +20,13 @@ gateway.example.com {
 	respond @internal 404
 
 	reverse_proxy 127.0.0.1:8080 {
-		# The gateway trusts 127.0.0.1 when TRUSTED_PROXIES includes it, so this
-		# is what makes per-IP limits and audit rows reflect real callers.
+		# TRUSTED_PROXIES must name the address the gateway sees for this proxy.
+		# 127.0.0.1 only works when Caddy shares the gateway's network namespace;
+		# through a published Docker port the peer is the bridge gateway.
 		header_up X-Real-IP {remote_host}
 		transport http {
 			dial_timeout 5s
-			response_header_timeout 30s
+			response_header_timeout 310s
 		}
 	}
 

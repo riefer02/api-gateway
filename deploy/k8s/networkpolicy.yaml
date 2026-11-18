@@ -12,6 +12,7 @@ spec:
       app.kubernetes.io/name: api-gateway
   policyTypes: [Ingress, Egress]
   ingress:
+    # Data plane: the ingress controller and monitoring may scrape it.
     - from:
         - namespaceSelector:
             matchLabels:
@@ -22,6 +23,12 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    # Admin listener: operators only. Never allow the ingress namespace here.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: api-gateway-operators
+      ports:
         - protocol: TCP
           port: 9090
   egress:
@@ -33,7 +40,7 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
-    # Upstreams and the OTLP collector
+    # In-cluster upstreams and the OTLP collector.
     - to:
         - namespaceSelector: {}
       ports:
@@ -41,6 +48,15 @@ spec:
           port: 443
         - protocol: TCP
           port: 4317
+    # External identity provider and upstreams. Replace the placeholder with
+    # the IdP/upstream CIDRs before enabling OAuth; a public issuer is not a
+    # pod IP and would otherwise be denied.
+    # - to:
+    #     - ipBlock:
+    #         cidr: 203.0.113.0/24
+    #   ports:
+    #     - protocol: TCP
+    #       port: 443
     # DNS
     - to:
         - namespaceSelector:

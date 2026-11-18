@@ -9,6 +9,8 @@ use arc_swap::ArcSwap;
 use reqwest::{Method, Url};
 use sqlx::{FromRow, PgPool};
 
+use crate::mcp::ToolPolicy;
+
 /// A route compiled for request matching: no allocation, no locks on the path.
 #[derive(Clone, Debug)]
 pub(crate) struct CompiledRoute {
@@ -16,7 +18,14 @@ pub(crate) struct CompiledRoute {
     pub(crate) path_prefix: String,
     pub(crate) methods: Vec<Method>,
     pub(crate) rewrite_prefix: Option<String>,
+    /// `None` matches every tenant. `Some` matches only that tenant.
+    pub(crate) tenant_id: Option<String>,
     pub(crate) scopes: HashSet<String>,
+    pub(crate) tool_policy: ToolPolicy,
+    /// Overrides `REQUEST_TIMEOUT_SECS` for this route.
+    pub(crate) request_timeout: Option<Duration>,
+    /// Overrides `MAX_RESPONSE_BYTES` for this route.
+    pub(crate) max_response_bytes: Option<u64>,
     pub(crate) upstream: Arc<Upstream>,
     pub(crate) priority: i32,
 }
@@ -27,6 +36,10 @@ pub(crate) struct Upstream {
     pub(crate) base_url: Url,
     pub(crate) client: reqwest::Client,
     pub(crate) timeout: Duration,
+    /// RFC 8693 `audience` for the exchanged upstream token.
+    pub(crate) audience: Option<String>,
+    /// Optional scope to request during exchange.
+    pub(crate) exchange_scope: Option<String>,
 }
 
 /// Immutable snapshot. Replaced atomically; in-flight requests keep the
@@ -60,9 +73,17 @@ impl RouteTable {
 
     /// Longest matching prefix wins, then the higher priority. Routes are
     /// pre-sorted, so this is a scan over a usually tiny vector.
-    pub(crate) fn resolve(&self, method: &Method, path: &str) -> RouteMatch<'_> {
-        // Only the longest matching prefix participates. Falling through to a
-        // shorter prefix would proxy a request under scopes it never earned.
+    ///
+    /// A tenant-specific route only matches its tenant. If the longest prefix
+    /// belongs to another tenant, this returns `NotFound` rather than falling
+    /// through to a shorter prefix: falling through would proxy the request
+    /// under scopes it never earned.
+    pub(crate) fn resolve(
+        &self,
+        method: &Method,
+        path: &str,
+        tenant: Option<&str>,
+    ) -> RouteMatch<'_> {
         let Some(prefix) = self
             .routes
             .iter()
@@ -73,12 +94,28 @@ impl RouteTable {
         };
 
         let mut allowed: Vec<Method> = Vec::new();
+        let tenant_owns_prefix = tenant.is_some_and(|tenant| {
+            self.routes.iter().any(|route| {
+                route.path_prefix == prefix && route.tenant_id.as_deref() == Some(tenant)
+            })
+        });
 
         for route in self
             .routes
             .iter()
             .filter(|route| route.path_prefix == prefix)
         {
+            if !route.matches_tenant(tenant) {
+                continue;
+            }
+
+            // A tenant route owns the prefix for that tenant: a shared route
+            // at the same prefix must not quietly serve methods the tenant
+            // route did not list.
+            if tenant_owns_prefix && route.tenant_id.is_none() {
+                continue;
+            }
+
             if route.allows(method) {
                 return RouteMatch::Found(route);
             }
@@ -107,12 +144,13 @@ impl RouteTable {
         version: i64,
         rows: Vec<RouteRow>,
         allow_hosts: &[String],
+        token_exchange_enabled: bool,
     ) -> Result<Self, Vec<String>> {
         let mut problems = Vec::new();
         let mut routes = Vec::with_capacity(rows.len());
         let mut route_ids = HashSet::new();
         let mut claims = HashSet::new();
-        let mut upstreams: HashMap<(String, String, u64), Arc<Upstream>> = HashMap::new();
+        let mut upstreams: HashMap<UpstreamKey, Arc<Upstream>> = HashMap::new();
 
         for row in rows {
             if !route_ids.insert(row.id.clone()) {
@@ -125,8 +163,23 @@ impl RouteTable {
                 continue;
             }
 
+            if row
+                .tenant_id
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                problems.push(format!("route `{}`: tenant_id must not be empty", row.id));
+                continue;
+            }
+
             let methods = compile_methods(&row, &mut problems);
-            let upstream = compile_upstream(&row, allow_hosts, &mut upstreams, &mut problems);
+            let upstream = compile_upstream(
+                &row,
+                allow_hosts,
+                token_exchange_enabled,
+                &mut upstreams,
+                &mut problems,
+            );
 
             let (Some(methods), Some(upstream)) = (methods, upstream) else {
                 continue;
@@ -139,10 +192,31 @@ impl RouteTable {
                 continue;
             }
 
+            let request_timeout = match compile_optional_deadline(&row, &mut problems) {
+                Some(timeout) => timeout,
+                None => continue,
+            };
+
+            let max_response_bytes = match compile_response_cap(&row, &mut problems) {
+                Some(cap) => cap,
+                None => continue,
+            };
+
+            let tool_policy = match compile_tool_policy(&row, &mut problems) {
+                Some(policy) => policy,
+                None => continue,
+            };
+
             for method in &methods {
-                if !claims.insert((row.path_prefix.clone(), method.clone())) {
+                let claim = (
+                    row.path_prefix.clone(),
+                    method.clone(),
+                    row.tenant_id.clone(),
+                );
+
+                if !claims.insert(claim) {
                     problems.push(format!(
-                        "route `{}`: {} {} is already claimed by another route",
+                        "route `{}`: {} {} is already claimed by another route in the same tenant",
                         row.id,
                         method.as_str(),
                         row.path_prefix
@@ -157,7 +231,11 @@ impl RouteTable {
                 rewrite_prefix: row
                     .rewrite_prefix
                     .map(|prefix| normalize_rewrite(&prefix)),
+                tenant_id: row.tenant_id,
                 scopes: row.scopes.into_iter().collect(),
+                tool_policy,
+                request_timeout,
+                max_response_bytes,
                 upstream,
                 priority: row.priority,
             });
@@ -167,13 +245,7 @@ impl RouteTable {
             return Err(problems);
         }
 
-        routes.sort_by(|left, right| {
-            right
-                .path_prefix
-                .len()
-                .cmp(&left.path_prefix.len())
-                .then(right.priority.cmp(&left.priority))
-        });
+        sort_routes(&mut routes);
 
         Ok(Self { version, routes })
     }
@@ -181,22 +253,50 @@ impl RouteTable {
     /// Test-only constructor: routes are sorted exactly as `compile` would.
     #[cfg(test)]
     pub(crate) fn for_tests(version: i64, mut routes: Vec<CompiledRoute>) -> Self {
-        routes.sort_by(|left, right| {
-            right
-                .path_prefix
-                .len()
-                .cmp(&left.path_prefix.len())
-                .then(right.priority.cmp(&left.priority))
-        });
+        sort_routes(&mut routes);
 
         Self { version, routes }
     }
+}
+
+type UpstreamKey = (String, String, u64, Option<String>, Option<String>);
+
+fn sort_routes(routes: &mut [CompiledRoute]) {
+    routes.sort_by(|left, right| {
+        right
+            .path_prefix
+            .len()
+            .cmp(&left.path_prefix.len())
+            .then(right.priority.cmp(&left.priority))
+            // A tenant-specific route wins over a shared route at the same
+            // prefix and priority.
+            .then(
+                right
+                    .tenant_id
+                    .is_some()
+                    .cmp(&left.tenant_id.is_some()),
+            )
+    });
 }
 
 impl CompiledRoute {
     fn allows(&self, method: &Method) -> bool {
         self.methods.contains(method)
             || (*method == Method::HEAD && self.methods.contains(&Method::GET))
+    }
+
+    fn matches_tenant(&self, tenant: Option<&str>) -> bool {
+        match &self.tenant_id {
+            None => true,
+            Some(bound) => tenant == Some(bound.as_str()),
+        }
+    }
+
+    /// The effective deadline for this route, bounded by the configured cap.
+    pub(crate) fn effective_timeout(&self, default: Duration, maximum: Duration) -> Duration {
+        self.request_timeout
+            .unwrap_or(default)
+            .min(maximum)
     }
 
     /// The path to request upstream, after prefix stripping and rewriting.
@@ -293,7 +393,14 @@ pub(crate) fn has_dot_segments(path: &str) -> bool {
 /// as one for http(s). Reject it outright so the path we authorize is the path
 /// we forward.
 pub(crate) fn is_unsafe_path(path: &str) -> bool {
-    path.contains('\\') || has_dot_segments(path)
+    // Semicolons are path parameters to several frameworks (`..;/admin`).
+    // The gateway does not interpret them, so accepting one would let the
+    // authorized path differ from the path an upstream executes.
+    path.contains('\\')
+        || path.contains(';')
+        || path.contains("%3b")
+        || path.contains("%3B")
+        || has_dot_segments(path)
 }
 
 fn is_dot_segment(segment: &str) -> bool {
@@ -381,7 +488,8 @@ fn compile_methods(row: &RouteRow, problems: &mut Vec<String>) -> Option<Vec<Met
 fn compile_upstream(
     row: &RouteRow,
     allow_hosts: &[String],
-    cache: &mut HashMap<(String, String, u64), Arc<Upstream>>,
+    token_exchange_enabled: bool,
+    cache: &mut HashMap<UpstreamKey, Arc<Upstream>>,
     problems: &mut Vec<String>,
 ) -> Option<Arc<Upstream>> {
     let problem = |problems: &mut Vec<String>, message: String| {
@@ -396,6 +504,23 @@ fn compile_upstream(
         }
     };
 
+    if row
+        .audience
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        problem(problems, "upstream audience must not be empty".to_owned());
+        return None;
+    }
+
+    if row.audience.is_some() && !token_exchange_enabled {
+        problem(
+            problems,
+            "upstream has an audience but token exchange is not configured".to_owned(),
+        );
+        return None;
+    }
+
     let timeout_ms = u64::try_from(row.timeout_ms)
         .unwrap_or(1)
         .max(1);
@@ -404,6 +529,8 @@ fn compile_upstream(
         row.upstream_id.clone(),
         base_url.as_str().to_owned(),
         timeout_ms,
+        row.audience.clone(),
+        row.exchange_scope.clone(),
     );
 
     if let Some(upstream) = cache.get(&cache_key) {
@@ -434,11 +561,79 @@ fn compile_upstream(
         base_url,
         client,
         timeout,
+        audience: row.audience.clone(),
+        exchange_scope: row.exchange_scope.clone(),
     });
 
     cache.insert(cache_key, Arc::clone(&upstream));
 
     Some(upstream)
+}
+
+/// `None` means "use the gateway default"; `Some(None)` means the row was
+/// invalid and the caller should skip it.
+#[allow(clippy::option_option)]
+fn compile_optional_deadline(
+    row: &RouteRow,
+    problems: &mut Vec<String>,
+) -> Option<Option<Duration>> {
+    let Some(ms) = row.request_timeout_ms else {
+        return Some(None);
+    };
+
+    if !(1..=3_600_000).contains(&ms) {
+        problems.push(format!(
+            "route `{}`: request_timeout_ms must be between 1 and 3600000",
+            row.id
+        ));
+        return None;
+    }
+
+    Some(Some(Duration::from_millis(u64::try_from(ms).unwrap_or(1))))
+}
+
+fn compile_response_cap(row: &RouteRow, problems: &mut Vec<String>) -> Option<Option<u64>> {
+    let Some(cap) = row.max_response_bytes else {
+        return Some(None);
+    };
+
+    let Ok(cap) = u64::try_from(cap) else {
+        problems.push(format!(
+            "route `{}`: max_response_bytes must be positive",
+            row.id
+        ));
+        return None;
+    };
+
+    if cap != 0 && !(1024..=1_073_741_824).contains(&cap) {
+        problems.push(format!(
+            "route `{}`: max_response_bytes must be 0 (unlimited) or between 1024 and 1073741824",
+            row.id
+        ));
+        return None;
+    }
+
+    Some(Some(cap))
+}
+
+fn compile_tool_policy(row: &RouteRow, problems: &mut Vec<String>) -> Option<ToolPolicy> {
+    let policy: ToolPolicy = match serde_json::from_value(row.tool_policy.clone()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            problems.push(format!(
+                "route `{}`: tool_policy is invalid: {error}",
+                row.id
+            ));
+            return None;
+        }
+    };
+
+    if let Err(problem) = policy.validate() {
+        problems.push(format!("route `{}`: {problem}", row.id));
+        return None;
+    }
+
+    Some(policy)
 }
 
 pub(crate) fn normalize_rewrite(prefix: &str) -> String {
@@ -471,11 +666,17 @@ struct RouteRow {
     path_prefix: String,
     methods: Vec<String>,
     rewrite_prefix: Option<String>,
+    tenant_id: Option<String>,
     scopes: Vec<String>,
     priority: i32,
+    request_timeout_ms: Option<i32>,
+    max_response_bytes: Option<i64>,
+    tool_policy: serde_json::Value,
     upstream_id: String,
     base_url: String,
     timeout_ms: i32,
+    audience: Option<String>,
+    exchange_scope: Option<String>,
 }
 
 #[derive(Debug)]
@@ -518,11 +719,20 @@ impl From<sqlx::Error> for RouteTableError {
 pub(crate) struct RouteSource {
     pool: PgPool,
     allow_hosts: Vec<String>,
+    token_exchange_enabled: bool,
 }
 
 impl RouteSource {
-    pub(crate) fn new(pool: PgPool, allow_hosts: Vec<String>) -> Self {
-        Self { pool, allow_hosts }
+    pub(crate) fn new(
+        pool: PgPool,
+        allow_hosts: Vec<String>,
+        token_exchange_enabled: bool,
+    ) -> Self {
+        Self {
+            pool,
+            allow_hosts,
+            token_exchange_enabled,
+        }
     }
 
     pub(crate) async fn version(&self) -> Result<i64, RouteTableError> {
@@ -555,11 +765,17 @@ impl RouteSource {
                 r.path_prefix,
                 r.methods,
                 r.rewrite_prefix,
+                r.tenant_id,
                 r.scopes,
                 r.priority,
+                r.request_timeout_ms,
+                r.max_response_bytes,
+                r.tool_policy,
                 u.id AS upstream_id,
                 u.base_url,
-                u.timeout_ms
+                u.timeout_ms,
+                u.audience,
+                u.exchange_scope
             FROM routes r
             JOIN upstreams u ON u.id = r.upstream_id
             WHERE r.enabled
@@ -570,7 +786,13 @@ impl RouteSource {
 
         transaction.commit().await?;
 
-        RouteTable::compile(version, rows, &self.allow_hosts).map_err(RouteTableError::Invalid)
+        RouteTable::compile(
+            version,
+            rows,
+            &self.allow_hosts,
+            self.token_exchange_enabled,
+        )
+        .map_err(RouteTableError::Invalid)
     }
 }
 
@@ -702,20 +924,35 @@ mod tests {
                 .map(|method| (*method).to_owned())
                 .collect(),
             rewrite_prefix: None,
+            tenant_id: None,
             scopes: Vec::new(),
             priority: 0,
+            request_timeout_ms: None,
+            max_response_bytes: None,
+            tool_policy: serde_json::json!({"mode": "off", "roles": {}}),
             upstream_id: "upstream".to_owned(),
             base_url: "https://example.test/api".to_owned(),
             timeout_ms: 5_000,
+            audience: None,
+            exchange_scope: None,
         }
     }
 
     fn table(rows: Vec<RouteRow>) -> RouteTable {
-        RouteTable::compile(1, rows, &[]).expect("valid route table")
+        RouteTable::compile(1, rows, &[], false).expect("valid route table")
     }
 
     fn found<'a>(table: &'a RouteTable, method: HttpMethod, path: &str) -> &'a CompiledRoute {
-        match table.resolve(&method, path) {
+        found_for(table, None, method, path)
+    }
+
+    fn found_for<'a>(
+        table: &'a RouteTable,
+        tenant: Option<&str>,
+        method: HttpMethod,
+        path: &str,
+    ) -> &'a CompiledRoute {
+        match table.resolve(&method, path, tenant) {
             RouteMatch::Found(route) => route,
             RouteMatch::MethodNotAllowed(_) => panic!("{path} matched but rejected the method"),
             RouteMatch::NotFound => panic!("{path} did not match a route"),
@@ -740,7 +977,7 @@ mod tests {
         found(&table, HttpMethod::GET, "/api");
         found(&table, HttpMethod::GET, "/api/people");
         assert!(matches!(
-            table.resolve(&HttpMethod::GET, "/apix"),
+            table.resolve(&HttpMethod::GET, "/apix", None),
             RouteMatch::NotFound
         ));
     }
@@ -749,7 +986,7 @@ mod tests {
     fn wrong_method_is_rejected_with_allow_list() {
         let table = table(vec![row("api", "/api", &["GET"])]);
 
-        match table.resolve(&HttpMethod::POST, "/api") {
+        match table.resolve(&HttpMethod::POST, "/api", None) {
             RouteMatch::MethodNotAllowed(allowed) => {
                 assert_eq!(allowed, vec![HttpMethod::GET, HttpMethod::HEAD]);
             }
@@ -769,7 +1006,7 @@ mod tests {
         let table = table(vec![row("api", "/api", &["GET"])]);
 
         assert!(matches!(
-            table.resolve(&HttpMethod::GET, "/other"),
+            table.resolve(&HttpMethod::GET, "/other", None),
             RouteMatch::NotFound
         ));
     }
@@ -795,6 +1032,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_matrix_parameter_traversal() {
+        assert!(is_unsafe_path("/api/x/..;/admin"));
+        assert!(is_unsafe_path("/api/x/..%3b/admin"));
+        assert!(is_unsafe_path("/api/x/..%3B/admin"));
+    }
+
+    #[test]
     fn a_specific_route_never_falls_through_to_a_shorter_prefix() {
         let table = table(vec![
             row("public", "/api", &["GET"]),
@@ -803,7 +1047,7 @@ mod tests {
 
         // GET /api/admin/users matches /api/admin, which only allows POST. It
         // must not be proxied under /api's scopes.
-        match table.resolve(&HttpMethod::GET, "/api/admin/users") {
+        match table.resolve(&HttpMethod::GET, "/api/admin/users", None) {
             RouteMatch::MethodNotAllowed(allowed) => {
                 assert_eq!(allowed, vec![HttpMethod::POST]);
             }
@@ -817,6 +1061,7 @@ mod tests {
             1,
             vec![row("a", "/api", &["GET"]), row("b", "/api", &["GET"])],
             &[],
+            false,
         )
         .expect_err("ambiguous table");
 
@@ -833,6 +1078,7 @@ mod tests {
             1,
             vec![row("api", "/api", &["GET"])],
             &["allowed.example".to_owned()],
+            false,
         )
         .expect_err("host not allowed");
 
@@ -848,6 +1094,131 @@ mod tests {
 
         assert_eq!(route.upstream_path("/api/people/1"), "/people/1");
         assert_eq!(route.upstream_path("/api/people"), "/people");
+    }
+
+    #[test]
+    fn a_tenant_route_is_invisible_to_other_tenants() {
+        let mut tenant_a = row("a", "/mcp", &["POST"]);
+        tenant_a.tenant_id = Some("tenant-a".to_owned());
+
+        let table = table(vec![tenant_a]);
+
+        assert_eq!(
+            found_for(&table, Some("tenant-a"), HttpMethod::POST, "/mcp").id,
+            "a"
+        );
+        assert!(matches!(
+            table.resolve(&HttpMethod::POST, "/mcp", Some("tenant-b")),
+            RouteMatch::NotFound
+        ));
+        assert!(matches!(
+            table.resolve(&HttpMethod::POST, "/mcp", None),
+            RouteMatch::NotFound
+        ));
+    }
+
+    #[test]
+    fn a_tenant_route_shadows_a_shared_route_for_unlisted_methods() {
+        let shared = row("shared", "/mcp", &["GET", "POST"]);
+
+        let mut tenant = row("tenant", "/mcp", &["POST"]);
+        tenant.tenant_id = Some("tenant-a".to_owned());
+
+        let table = table(vec![shared, tenant]);
+
+        // The tenant's route owns the prefix; GET must not fall back to the
+        // shared route's scopes/policy.
+        assert!(matches!(
+            table.resolve(&HttpMethod::GET, "/mcp", Some("tenant-a")),
+            RouteMatch::MethodNotAllowed(_)
+        ));
+    }
+
+    #[test]
+    fn a_tenant_route_wins_over_a_shared_route() {
+        let shared = row("shared", "/mcp", &["POST"]);
+
+        let mut tenant = row("tenant", "/mcp", &["POST"]);
+        tenant.tenant_id = Some("tenant-a".to_owned());
+
+        let table = table(vec![shared, tenant]);
+
+        assert_eq!(
+            found_for(&table, Some("tenant-a"), HttpMethod::POST, "/mcp").id,
+            "tenant"
+        );
+        assert_eq!(
+            found_for(&table, Some("tenant-b"), HttpMethod::POST, "/mcp").id,
+            "shared"
+        );
+    }
+
+    #[test]
+    fn another_tenants_route_does_not_fall_through_to_a_shorter_prefix() {
+        let shared = row("shared", "/api", &["GET"]);
+
+        let mut tenant = row("tenant", "/api/private", &["GET"]);
+        tenant.tenant_id = Some("tenant-a".to_owned());
+
+        let table = table(vec![shared, tenant]);
+
+        assert!(matches!(
+            table.resolve(&HttpMethod::GET, "/api/private/data", Some("tenant-b")),
+            RouteMatch::NotFound
+        ));
+    }
+
+    #[test]
+    fn route_deadline_and_response_cap_are_compiled() {
+        let mut route = row("mcp", "/mcp", &["POST"]);
+        route.request_timeout_ms = Some(120_000);
+        route.max_response_bytes = Some(32 * 1024 * 1024);
+
+        let table = table(vec![route]);
+        let route = found(&table, HttpMethod::POST, "/mcp");
+
+        assert_eq!(
+            route.effective_timeout(Duration::from_secs(15), Duration::from_secs(300)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(route.max_response_bytes, Some(32 * 1024 * 1024));
+    }
+
+    #[test]
+    fn route_deadline_is_bounded_by_the_hard_cap() {
+        let mut route = row("mcp", "/mcp", &["POST"]);
+        route.request_timeout_ms = Some(600_000);
+
+        let table = table(vec![route]);
+        let route = found(&table, HttpMethod::POST, "/mcp");
+
+        assert_eq!(
+            route.effective_timeout(Duration::from_secs(15), Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_tool_policy() {
+        let mut route = row("mcp", "/mcp", &["POST"]);
+        route.tool_policy = serde_json::json!({"mode": "allow_list", "roles": {}});
+
+        let problems = RouteTable::compile(1, vec![route], &[], false).expect_err("invalid policy");
+        assert!(problems[0].contains("at least one role"));
+    }
+
+    #[test]
+    fn compiles_an_allow_list_tool_policy() {
+        let mut route = row("mcp", "/mcp", &["POST"]);
+        route.tool_policy = serde_json::json!({
+            "mode": "allow_list",
+            "roles": {"support": ["search_tickets"]}
+        });
+
+        let table = table(vec![route]);
+        let route = found(&table, HttpMethod::POST, "/mcp");
+
+        assert!(route.tool_policy.is_enforcing());
     }
 }
 
@@ -1048,7 +1419,7 @@ mod behaviour_tests {
             return;
         };
 
-        let source = RouteSource::new(pool.clone(), Vec::new());
+        let source = RouteSource::new(pool.clone(), Vec::new(), false);
 
         let before = source.version().await.expect("version");
 

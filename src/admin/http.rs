@@ -56,6 +56,7 @@ pub(crate) fn router(
         .route("/v1/routes", get(list_routes))
         .route("/v1/routes/{id}", put(put_route).delete(delete_route))
         .route("/v1/audit", get(list_audit))
+        .route("/v1/data-audit", get(list_data_audit))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             enforce_admin_deadline,
@@ -72,7 +73,10 @@ pub(crate) fn router(
                 .layer(axum::middleware::from_fn(
                     crate::request_context::scope_request_id,
                 ))
-                .layer(tower_http::request_id::PropagateRequestIdLayer::x_request_id()),
+                .layer(tower_http::request_id::PropagateRequestIdLayer::x_request_id())
+                // Control-plane payloads are tiny; this keeps a mistaken or
+                // compromised operator from turning a JSON body into memory.
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
         )
         .with_state(state)
 }
@@ -362,6 +366,8 @@ struct UpstreamView {
     id: String,
     base_url: String,
     timeout_ms: u32,
+    audience: Option<String>,
+    exchange_scope: Option<String>,
 }
 
 async fn list_upstreams(
@@ -379,6 +385,8 @@ async fn list_upstreams(
                 id: upstream.id,
                 base_url: upstream.base_url,
                 timeout_ms: upstream.timeout_ms,
+                audience: upstream.audience,
+                exchange_scope: upstream.exchange_scope,
             })
             .collect(),
     ))
@@ -388,6 +396,8 @@ async fn list_upstreams(
 struct PutUpstream {
     base_url: String,
     timeout_ms: Option<u32>,
+    audience: Option<String>,
+    exchange_scope: Option<String>,
 }
 
 async fn put_upstream(
@@ -405,6 +415,8 @@ async fn put_upstream(
             &id,
             &body.base_url,
             body.timeout_ms.unwrap_or(10_000),
+            body.audience.as_deref(),
+            body.exchange_scope.as_deref(),
         )
         .await?;
 
@@ -418,6 +430,11 @@ struct RouteView {
     methods: Vec<String>,
     upstream_id: String,
     rewrite_prefix: Option<String>,
+    tenant_id: Option<String>,
+    scopes: Vec<String>,
+    tool_policy: crate::mcp::ToolPolicy,
+    request_timeout_ms: Option<u32>,
+    max_response_bytes: Option<u64>,
     enabled: bool,
     priority: i32,
 }
@@ -439,6 +456,11 @@ async fn list_routes(
                 methods: route.methods,
                 upstream_id: route.upstream_id,
                 rewrite_prefix: route.rewrite_prefix,
+                tenant_id: route.tenant_id,
+                scopes: route.scopes,
+                tool_policy: route.tool_policy,
+                request_timeout_ms: route.request_timeout_ms,
+                max_response_bytes: route.max_response_bytes,
                 enabled: route.enabled,
                 priority: route.priority,
             })
@@ -453,8 +475,11 @@ struct PutRoute {
     methods: Vec<String>,
     upstream_id: String,
     rewrite_prefix: Option<String>,
-    #[serde(default)]
-    scopes: Vec<String>,
+    tenant_id: Option<String>,
+    scopes: Option<Vec<String>>,
+    tool_policy: Option<crate::mcp::ToolPolicy>,
+    request_timeout_ms: Option<u32>,
+    max_response_bytes: Option<u64>,
     enabled: Option<bool>,
     priority: Option<i32>,
 }
@@ -477,9 +502,13 @@ async fn put_route(
                 methods: body.methods,
                 upstream_id: body.upstream_id,
                 rewrite_prefix: body.rewrite_prefix,
+                tenant_id: body.tenant_id,
                 scopes: body.scopes,
-                enabled: body.enabled.unwrap_or(true),
-                priority: body.priority.unwrap_or(0),
+                tool_policy: body.tool_policy,
+                request_timeout_ms: body.request_timeout_ms,
+                max_response_bytes: body.max_response_bytes,
+                enabled: body.enabled,
+                priority: body.priority,
             },
         )
         .await?;
@@ -576,7 +605,8 @@ mod tests {
                 Arc::new(crate::auth::KeyVerifier::new(SecretString::new("pepper"))),
                 Vec::new(),
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(300),
+                false,
             )),
             Arc::new(accounts),
             std::time::Duration::from_secs(5),
@@ -664,6 +694,9 @@ mod tests {
 #[derive(Deserialize)]
 struct AuditQuery {
     limit: Option<i64>,
+    before_id: Option<i64>,
+    since: Option<String>,
+    tenant: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -703,6 +736,71 @@ async fn list_audit(
     ))
 }
 
+#[derive(Serialize)]
+struct DataAuditView {
+    occurred_at: String,
+    tenant_id: String,
+    subject: Option<String>,
+    assistant: Option<String>,
+    auth_method: String,
+    mcp_method: Option<String>,
+    route_id: Option<String>,
+    tool_name: Option<String>,
+    decision: String,
+    status: Option<u16>,
+    latency_ms: Option<u32>,
+    request_id: Option<String>,
+    token_id: Option<String>,
+}
+
+async fn list_data_audit(
+    State(state): State<AdminState>,
+    Extension(actor): Extension<Actor>,
+    ApiQuery(query): ApiQuery<AuditQuery>,
+) -> Result<Json<Vec<DataAuditView>>, AppError> {
+    actor.require(AdminScope::AuditRead)?;
+
+    let since = query
+        .since
+        .as_deref()
+        .map(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| AppError::bad_request("`since` must be an RFC 3339 timestamp"))
+        })
+        .transpose()?;
+
+    let entries = state
+        .service
+        .list_data_audit(
+            query.limit.unwrap_or(100),
+            query.before_id,
+            since,
+            query.tenant.as_deref(),
+        )
+        .await?;
+
+    Ok(Json(
+        entries
+            .into_iter()
+            .map(|entry| DataAuditView {
+                occurred_at: entry.occurred_at.to_string(),
+                tenant_id: entry.tenant_id,
+                subject: entry.subject,
+                assistant: entry.assistant,
+                auth_method: entry.auth_method,
+                mcp_method: entry.mcp_method,
+                route_id: entry.route_id,
+                tool_name: entry.tool_name,
+                decision: entry.decision,
+                status: entry.status,
+                latency_ms: entry.latency_ms,
+                request_id: entry.request_id,
+                token_id: entry.token_id,
+            })
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod scope_tests {
     use super::*;
@@ -731,7 +829,8 @@ mod scope_tests {
                 Arc::new(crate::auth::KeyVerifier::new(SecretString::new("pepper"))),
                 Vec::new(),
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(300),
+                false,
             )),
             Arc::new(accounts),
             std::time::Duration::from_secs(5),

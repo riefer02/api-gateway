@@ -90,3 +90,88 @@ groups:
         annotations:
           summary: "More than 20% of requests are rate limited"
           description: "Either a client is abusive or the limits are too low for real traffic."
+
+  - name: gateway-oauth
+    rules:
+      - alert: JwksUnavailable
+        expr: increase(gateway_auth_failures_total{reason="oauth_unavailable"}[10m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OAuth key set is unreachable"
+          description: "OAuth callers are failing closed. Check the issuer and OAUTH_JWKS_URI."
+
+      - alert: JwksNotWarm
+        expr: gateway_oauth_jwks_ready == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OAuth key set has never been loaded"
+          description: "OAuth traffic cannot be validated. API-key routes may still be serving."
+
+      - alert: OAuthInvalidTokenSpike
+        expr: sum(rate(gateway_auth_failures_total{reason="oauth_invalid"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated invalid OAuth tokens"
+          description: "Check issuer/audience configuration, token lifetime, and client clock skew."
+
+      - alert: UpstreamTokenExchangeFailing
+        expr: increase(gateway_upstream_auth_failures_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Token exchange is failing"
+          description: "An upstream audience is configured but the authorization server refused or is unavailable."
+
+  - name: gateway-audit
+    rules:
+      - alert: AdminAuditWriteFailures
+        expr: increase(gateway_admin_audit_write_failures_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Control-plane audit writes are failing"
+          description: "A key or route mutation may be missing its audit row. Check Postgres and the audit_events table."
+
+      - alert: DataAuditDropped
+        expr: increase(gateway_data_audit_dropped_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data-plane audit is dropping events"
+          description: "The bounded queue is full. Increase capacity or reduce traffic; the audit trail has gaps."
+
+      - alert: DataAuditWriteFailures
+        expr: increase(gateway_data_audit_write_failures_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data-plane audit writes are failing"
+          description: "Check Postgres health and the data_audit_events table."
+
+      - alert: DataAuditShutdownTimeout
+        expr: increase(gateway_data_audit_shutdown_timeouts_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data audit did not drain before shutdown"
+          description: "A deploy may have lost queued audit events; check the database and queue depth."
+
+      - alert: McpToolDeniedSpike
+        expr: sum by (route) (rate(gateway_mcp_denied_total[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tool denials are elevated on {{ $labels.route }}"
+          description: "A client is requesting tools outside its policy, or the policy is too strict."

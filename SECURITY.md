@@ -34,9 +34,14 @@ edge).
 
 - API keys are stored as peppered HMAC verifiers, never plaintext, and compared in
   constant time.
+- OAuth access tokens are validated against the issuer's cached JWKS, with exact
+  issuer/audience checks, an algorithm allow-list, and a `503` (not `401`) on a
+  key-set outage.
+- Inbound tokens are never forwarded upstream; routes with an audience use RFC 8693
+  exchange and a short-lived token minted for that upstream.
 - Admin tokens are named identities with scopes; `/metrics` can require its own token.
 - Upstream destinations are allowlisted, redirects are never followed, and hop-by-hop,
   forwarded, and credential headers are stripped in both directions.
 - Paths are rejected before matching when they could normalize differently in the URL
   parser than in the router.
-- Every control-plane mutation is audited with the actor and request id.
+- SQL control-plane mutations are audited in the same transaction; key issuance/rotation use a best-effort audit write, and a failure is logged and counted. Audit rows are identifiers only, never tokens or verifier material.

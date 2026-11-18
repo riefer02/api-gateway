@@ -21,6 +21,13 @@ spec:
     spec:
       # Matches SHUTDOWN_DRAIN_SECS (25s) with room for the process to exit.
       terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -56,9 +63,9 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 64Mi
+              memory: 128Mi
             limits:
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

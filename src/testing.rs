@@ -1,12 +1,18 @@
 //! Shared test scaffolding. Compiled only for tests.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{Router, body::Body, http::Method, http::Request};
 use sqlx::postgres::PgPoolOptions;
 
 use crate::{
-    app, auth,
+    app,
+    audit::{AuditSink, DataAuditEvent},
+    auth,
     auth::{KeyVerifier, store::InMemoryApiKeyStore},
     config::{Config, EnvSource},
     limits::{BreakerRegistry, RateLimits},
@@ -78,6 +84,71 @@ pub(crate) fn metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle 
         .handle()
 }
 
+/// An audit sink that keeps events for assertions.
+#[derive(Default)]
+pub(crate) struct RecordingAudit {
+    events: Mutex<Vec<DataAuditEvent>>,
+}
+
+impl RecordingAudit {
+    pub(crate) fn events(&self) -> Vec<DataAuditEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl AuditSink for RecordingAudit {
+    fn record(&self, event: DataAuditEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+    }
+}
+
+/// A route against `upstream_url` with the caller's chosen MCP and timing
+/// settings. Tests use it instead of hand-building every field.
+pub(crate) fn route(
+    upstream_url: &str,
+    timeout: Duration,
+    tool_policy: crate::mcp::ToolPolicy,
+    request_timeout: Option<Duration>,
+    max_response_bytes: Option<u64>,
+) -> CompiledRoute {
+    let upstream = Arc::new(Upstream {
+        id: "test".to_owned(),
+        base_url: upstream_url
+            .parse()
+            .expect("valid upstream url"),
+        client: reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("client"),
+        timeout,
+        audience: None,
+        exchange_scope: None,
+    });
+
+    CompiledRoute {
+        id: "test".to_owned(),
+        path_prefix: "/swapi".to_owned(),
+        methods: vec![Method::GET, Method::POST],
+        rewrite_prefix: None,
+        tenant_id: None,
+        scopes: SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect(),
+        tool_policy,
+        request_timeout,
+        max_response_bytes,
+        upstream,
+        priority: 0,
+    }
+}
+
 /// State with one `/swapi` route pointing at `upstream_url`, plus the token
 /// that authenticates against it with the [`SCOPES`] scopes.
 pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (AppState, String) {
@@ -100,46 +171,39 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         .insert_active(key)
         .expect("seed credential");
 
-    let upstream = Arc::new(Upstream {
-        id: "test".to_owned(),
-        base_url: upstream_url
-            .parse()
-            .expect("valid upstream url"),
-        client: reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("client"),
+    let route = route(
+        upstream_url,
         timeout,
-    });
-
-    let route = CompiledRoute {
-        id: "test".to_owned(),
-        path_prefix: "/swapi".to_owned(),
-        methods: vec![Method::GET, Method::POST],
-        rewrite_prefix: None,
-        scopes: SCOPES
-            .iter()
-            .map(|scope| (*scope).to_owned())
-            .collect(),
-        upstream,
-        priority: 0,
-    };
+        crate::mcp::ToolPolicy::default(),
+        None,
+        None,
+    );
 
     let state = AppState {
         db: lazy_pool(),
         api_key_store: Arc::new(store),
         verifier: Arc::new(verifier),
+        oauth: None,
+        exchange: None,
         routes: RouteTableHandle::new(RouteTable::for_tests(1, vec![route])),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
+        audit: Arc::new(crate::audit::DisabledAudit),
+        default_request_timeout: config.server.request_timeout,
+        max_request_timeout: config.server.max_request_timeout,
+        max_response_bytes: config.server.max_response_bytes,
+        stream_idle_timeout: config.server.stream_idle_timeout,
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics: metrics_handle(),
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
         )),
-        trusted_proxies: Arc::new(crate::net::TrustedProxies::default()),
+        trusted_proxies: Arc::new(
+            crate::net::TrustedProxies::parse(&config.server.trusted_proxies)
+                .expect("test trusted proxies"),
+        ),
     };
 
     (state, auth::key::token(&key_id, &secret))
@@ -155,17 +219,27 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
         db: lazy_pool(),
         api_key_store: Arc::new(InMemoryApiKeyStore::default()),
         verifier: Arc::new(KeyVerifier::new(config.auth.pepper.clone())),
+        oauth: None,
+        exchange: None,
         routes: RouteTableHandle::new(RouteTable::for_tests(1, Vec::new())),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
+        audit: Arc::new(crate::audit::DisabledAudit),
+        default_request_timeout: config.server.request_timeout,
+        max_request_timeout: config.server.max_request_timeout,
+        max_response_bytes: config.server.max_response_bytes,
+        stream_idle_timeout: config.server.stream_idle_timeout,
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics: metrics_handle(),
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
         )),
-        trusted_proxies: Arc::new(crate::net::TrustedProxies::default()),
+        trusted_proxies: Arc::new(
+            crate::net::TrustedProxies::parse(&config.server.trusted_proxies)
+                .expect("test trusted proxies"),
+        ),
     }
 }
 

@@ -1,17 +1,38 @@
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     http::{HeaderMap, HeaderValue, header, request::Parts},
     response::{IntoResponse, Response},
 };
+use futures_core::Stream;
 use reqwest::Url;
 
 use crate::{
     error::AppError,
     limits::{BreakerGuard, BreakerRegistry},
+    mcp::{self, ToolFilter},
     request_context,
     retry::RetryPolicy,
     routing::CompiledRoute,
 };
+
+/// Everything the forwarder needs beyond the route and the request.
+pub(crate) struct ForwardOptions {
+    /// A token exchanged for this upstream. Applied after caller headers are
+    /// stripped, so a caller can never spoof it.
+    pub(crate) upstream_authorization: Option<HeaderValue>,
+    /// Present when the request was `tools/list` and the route enforces a tool
+    /// policy; the response is buffered and filtered.
+    pub(crate) filter_tools: Option<ToolFilter>,
+    pub(crate) response_cap: u64,
+    pub(crate) stream_idle_timeout: Duration,
+}
 
 /// Meaningful only for a single hop; must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
@@ -55,6 +76,7 @@ pub(crate) async fn forward(
     route: &CompiledRoute,
     breakers: &BreakerRegistry,
     retry: &RetryPolicy,
+    options: ForwardOptions,
 ) -> Result<Response, AppError> {
     let upstream_id = route.upstream.id.as_str();
 
@@ -86,7 +108,11 @@ pub(crate) async fn forward(
 
     let path = route.upstream_path(parts.uri.path());
     let url = upstream_url(&route.upstream.base_url, &path, parts.uri.query())?;
-    let mut headers = Some(outbound_headers(&parts));
+    let mut headers = Some(outbound_headers(
+        &parts,
+        options.upstream_authorization.as_ref(),
+        options.filter_tools.is_some(),
+    ));
     let mut breaker = BreakerGuard::new(breakers, upstream_id);
 
     retry.deposit();
@@ -100,9 +126,13 @@ pub(crate) async fn forward(
             None => reqwest::Body::wrap_stream(axum::body::Body::empty().into_data_stream()),
         };
 
-        let attempt_headers = headers
-            .take()
-            .unwrap_or_else(|| outbound_headers(&parts));
+        let attempt_headers = headers.take().unwrap_or_else(|| {
+            outbound_headers(
+                &parts,
+                options.upstream_authorization.as_ref(),
+                options.filter_tools.is_some(),
+            )
+        });
 
         let send = route
             .upstream
@@ -151,7 +181,7 @@ pub(crate) async fn forward(
                 )
                 .increment(1);
 
-                return Ok(into_gateway_response(response));
+                return into_gateway_response(response, options).await;
             }
             Ok(Err(error)) => {
                 let transient = error.is_timeout() || error.is_connect();
@@ -222,7 +252,11 @@ fn upstream_url(base: &Url, path: &str, query: Option<&str>) -> Result<Url, AppE
     Ok(url)
 }
 
-fn outbound_headers(parts: &Parts) -> HeaderMap {
+fn outbound_headers(
+    parts: &Parts,
+    upstream_authorization: Option<&HeaderValue>,
+    force_identity_encoding: bool,
+) -> HeaderMap {
     let connection_tokens = connection_tokens(&parts.headers);
     let mut headers = HeaderMap::new();
 
@@ -234,6 +268,19 @@ fn outbound_headers(parts: &Parts) -> HeaderMap {
         }
 
         headers.append(name.clone(), value.clone());
+    }
+
+    // A filtered `tools/list` response must be plain JSON. Ask for it
+    // explicitly and avoid handing the parser compressed bytes.
+    if force_identity_encoding {
+        headers.remove(header::ACCEPT_ENCODING);
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+    }
+
+    // Applied after the caller's headers are gone: this is the only
+    // Authorization value an upstream can see.
+    if let Some(value) = upstream_authorization {
+        headers.insert(header::AUTHORIZATION, value.clone());
     }
 
     if let Some(request_id) = request_context::current()
@@ -278,12 +325,187 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-fn into_gateway_response(upstream: reqwest::Response) -> Response {
+async fn into_gateway_response(
+    upstream: reqwest::Response,
+    options: ForwardOptions,
+) -> Result<Response, AppError> {
     let status = upstream.status();
-    let headers = inbound_headers(upstream.headers());
-    let body = Body::from_stream(upstream.bytes_stream());
+    let mut headers = inbound_headers(upstream.headers());
 
-    (status, headers, body).into_response()
+    if upstream
+        .content_length()
+        .is_some_and(|length| length > options.response_cap)
+    {
+        return Err(AppError::ResponseTooLarge);
+    }
+
+    if let Some(allowed) = options.filter_tools
+        && status.is_success()
+    {
+        let content_type = headers.get(header::CONTENT_TYPE);
+
+        if is_json(content_type) {
+            let body =
+                read_bounded(upstream, options.response_cap, options.stream_idle_timeout).await?;
+            // Fail closed: a response we cannot parse is not passed through
+            // unfiltered, because that would disclose tools outside policy.
+            let body = mcp::filter_tool_list(&body, &allowed).ok_or(AppError::BadGateway)?;
+
+            headers.remove(header::CONTENT_LENGTH);
+            headers.remove(header::TRANSFER_ENCODING);
+            headers.remove(header::CONTENT_ENCODING);
+            if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
+                headers.insert(header::CONTENT_LENGTH, value);
+            }
+
+            return Ok((status, headers, Body::from(body)).into_response());
+        }
+
+        // Policy mode requires a JSON response it can filter. Streaming the
+        // list unfiltered would disclose tools outside policy.
+        return Err(AppError::BadGateway);
+    }
+
+    let body = Body::from_stream(IdleTimeoutStream::new(
+        CappedStream::new(upstream.bytes_stream(), options.response_cap),
+        options.stream_idle_timeout,
+    ));
+
+    Ok((status, headers, body).into_response())
+}
+
+fn is_json(content_type: Option<&HeaderValue>) -> bool {
+    content_type
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json") || value.contains("+json"))
+}
+
+async fn read_bounded(
+    mut upstream: reqwest::Response,
+    cap: u64,
+    idle: Duration,
+) -> Result<Vec<u8>, AppError> {
+    let mut body = Vec::new();
+
+    loop {
+        let chunk = tokio::time::timeout(idle, upstream.chunk())
+            .await
+            .map_err(|_| AppError::UpstreamTimeout)?
+            .map_err(|_| AppError::BadGateway)?;
+
+        let Some(chunk) = chunk else {
+            break;
+        };
+
+        if u64::try_from(body.len() + chunk.len()).unwrap_or(u64::MAX) > cap {
+            return Err(AppError::ResponseTooLarge);
+        }
+
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+/// Streams a response while enforcing a byte cap. Once the cap is crossed the
+/// stream ends with an error, which hyper turns into a truncated connection;
+/// the status has already been sent.
+struct CappedStream<S> {
+    inner: S,
+    remaining: u64,
+}
+
+impl<S> CappedStream<S> {
+    fn new(inner: S, cap: u64) -> Self {
+        Self {
+            inner,
+            remaining: cap,
+        }
+    }
+}
+
+impl<S> Stream for CappedStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let length = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+
+                if length > self.remaining {
+                    self.remaining = 0;
+                    return Poll::Ready(Some(Err(std::io::Error::other(
+                        "response body exceeds the configured limit",
+                    ))));
+                }
+
+                self.remaining -= length;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(std::io::Error::other(error)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Cuts a stream that stops producing bytes. This is the body-side deadline
+/// that the header timeout cannot provide; an SSE stream with keep-alives keeps
+/// resetting it, while a stalled upstream or non-reading client does not.
+struct IdleTimeoutStream<S> {
+    inner: S,
+    idle: Duration,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    fn new(inner: S, idle: Duration) -> Self {
+        Self {
+            inner,
+            idle,
+            sleep: Box::pin(tokio::time::sleep(idle)),
+        }
+    }
+}
+
+impl<S> Stream for IdleTimeoutStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let idle = self.idle;
+
+        if self
+            .sleep
+            .as_mut()
+            .poll(context)
+            .is_ready()
+        {
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream response body was idle for too long",
+            ))));
+        }
+
+        match Pin::new(&mut self.inner).poll_next(context) {
+            Poll::Ready(Some(item)) => {
+                if item.is_ok() {
+                    self.sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle);
+                }
+
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn inbound_headers(headers: &HeaderMap) -> HeaderMap {
@@ -295,6 +517,7 @@ fn inbound_headers(headers: &HeaderMap) -> HeaderMap {
 
         if HOP_BY_HOP.contains(&name_str)
             || GATEWAY_OWNED_RESPONSE.contains(&name_str)
+            || name_str.starts_with("access-control-")
             || connection_tokens
                 .iter()
                 .any(|token| token == name_str)
@@ -786,6 +1009,113 @@ mod tests {
         assert_eq!(url.as_str(), "https://swapi.dev/api/people/1?page=2");
     }
 
+    #[tokio::test]
+    async fn an_idle_response_stream_is_cut() {
+        use futures_util::StreamExt as _;
+
+        let inner = CappedStream::new(
+            futures_util::stream::pending::<Result<Bytes, reqwest::Error>>(),
+            u64::MAX,
+        );
+        let mut stream = IdleTimeoutStream::new(inner, Duration::from_millis(20));
+
+        let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("idle timeout fired")
+            .expect("one item")
+            .expect_err("stream error");
+
+        assert_eq!(item.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn upstream_cors_headers_are_not_relayed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("access-control-allow-origin", "*".parse().unwrap());
+        headers.insert("x-upstream", "yes".parse().unwrap());
+
+        let filtered = inbound_headers(&headers);
+
+        assert!(!filtered.contains_key("access-control-allow-origin"));
+        assert!(filtered.contains_key("x-upstream"));
+    }
+
+    #[test]
+    fn mcp_protocol_headers_pass_through() {
+        let request = Request::builder()
+            .uri("/mcp")
+            .header(header::AUTHORIZATION, "Bearer caller-token")
+            .header("mcp-method", "tools/list")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-session-id", "legacy-session")
+            .header("last-event-id", "42")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+
+        let headers = outbound_headers(&parts, None, false);
+
+        assert_eq!(headers.get("mcp-method").unwrap(), "tools/list");
+        assert_eq!(
+            headers
+                .get("mcp-protocol-version")
+                .unwrap(),
+            "2026-07-28"
+        );
+        assert_eq!(headers.get("mcp-session-id").unwrap(), "legacy-session");
+        assert_eq!(headers.get("last-event-id").unwrap(), "42");
+        assert_eq!(
+            headers.get(header::ACCEPT).unwrap(),
+            "application/json, text/event-stream"
+        );
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn filtering_forces_an_uncompressed_response() {
+        let request = Request::builder()
+            .uri("/mcp")
+            .header(header::ACCEPT_ENCODING, "gzip, br")
+            .body(Body::empty())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+
+        let stripped = outbound_headers(&parts, None, true);
+        assert!(!stripped.contains_key(header::ACCEPT_ENCODING));
+        assert_eq!(stripped.get(header::ACCEPT).unwrap(), "application/json");
+
+        let untouched = outbound_headers(&parts, None, false);
+        assert_eq!(
+            untouched
+                .get(header::ACCEPT_ENCODING)
+                .unwrap(),
+            "gzip, br"
+        );
+    }
+
+    #[test]
+    fn the_exchanged_token_replaces_the_caller_credential() {
+        let request = Request::builder()
+            .uri("/x")
+            .header(header::AUTHORIZATION, "Bearer caller-token")
+            .header("x-keep", "yes")
+            .body(Body::empty())
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let upstream = HeaderValue::from_static("Bearer exchanged-token");
+
+        let headers = outbound_headers(&parts, Some(&upstream), false);
+
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer exchanged-token"
+        );
+        assert_eq!(headers.get("x-keep").unwrap(), "yes");
+    }
+
     #[test]
     fn preserves_percent_encoding() {
         let base = Url::parse("https://swapi.dev/api").unwrap();
@@ -834,7 +1164,7 @@ mod property_tests {
                 .unwrap();
 
             let (parts, _) = request.into_parts();
-            let headers = outbound_headers(&parts);
+            let headers = outbound_headers(&parts, None, false);
 
             prop_assert!(!headers.contains_key(forwarded));
             prop_assert!(!headers.contains_key(header::AUTHORIZATION));

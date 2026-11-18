@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: |
     Administrative API for the gateway. Served on `ADMIN_BIND` (default
-    `127.0.0.1:9090`) and only when `ADMIN_TOKEN` is set. Every operation is
+    `127.0.0.1:9090`) and only when `ADMIN_TOKEN` or `ADMIN_TOKENS` is set. Every operation is
     also available through the `api-gateway admin` CLI, which uses the same
     service layer.
 
@@ -21,6 +21,7 @@ tags:
   - name: keys
   - name: upstreams
   - name: routes
+  - name: audit
 
 paths:
   /healthz:
@@ -58,7 +59,7 @@ paths:
     delete:
       tags: [tenants]
       summary: Delete a tenant
-      description: Fails with 409 while clients still reference it.
+      description: Fails with 409 while clients or tenant-bound routes still reference it.
       parameters:
         - $ref: "#/components/parameters/Id"
       responses:
@@ -232,6 +233,14 @@ paths:
                   default: 10000
                   minimum: 1
                   maximum: 300000
+                audience:
+                  type: [string, "null"]
+                  description: |
+                    RFC 8693 audience for the exchanged upstream token. Requires
+                    `OAUTH_TOKEN_ENDPOINT` and its client credentials.
+                exchange_scope:
+                  type: [string, "null"]
+                  description: Optional scope requested during exchange.
       responses:
         "204":
           description: Stored
@@ -286,6 +295,54 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/AuditEntry"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/data-audit:
+    get:
+      tags: [audit]
+      summary: Read per-call data-plane audit events
+      description: |
+        Requires `audit:read`. Rows carry identifiers and decisions, never
+        payloads, tokens, or verifier material.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+        - name: before_id
+          in: query
+          schema:
+            type: integer
+          description: Keyset paging; return rows older than this id.
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 lower bound on occurred_at.
+        - name: tenant
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Most recent calls first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DataAuditEntry"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /v1/routes/{id}:
     put:
@@ -303,7 +360,11 @@ paths:
           application/json:
             schema:
               type: object
-              required: [path_prefix, upstream_id]
+              required: [path_prefix, upstream_id, methods]
+              description: |
+                Omitted optional fields preserve the stored value; an explicit empty
+                string/array/`0` clears the field. `tenant_id`, `scopes`, and
+                `tool_policy` are security fields and are never cleared by omission.
               properties:
                 path_prefix:
                   type: string
@@ -318,10 +379,27 @@ paths:
                 rewrite_prefix:
                   type: string
                   example: /billing
+                tenant_id:
+                  type: [string, "null"]
+                  description: Bind the route to one tenant; omit for a shared route.
                 scopes:
                   type: array
                   items:
                     type: string
+                tool_policy:
+                  $ref: "#/components/schemas/ToolPolicy"
+                request_timeout_ms:
+                  type: [integer, "null"]
+                  minimum: 0
+                  maximum: 3600000
+                  description: |
+                    Per-route deadline; 0 clears it to the default. The effective
+                    value is bounded by `MAX_REQUEST_TIMEOUT_SECS` (300 s default).
+                max_response_bytes:
+                  type: [integer, "null"]
+                  minimum: 0
+                  maximum: 1073741824
+                  description: Per-route response cap; 0 means unlimited (for streams).
                 enabled:
                   type: boolean
                   default: true
@@ -334,6 +412,10 @@ paths:
           description: Stored
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
@@ -417,6 +499,10 @@ components:
           type: string
         timeout_ms:
           type: integer
+        audience:
+          type: [string, "null"]
+        exchange_scope:
+          type: [string, "null"]
     Route:
       type: object
       required: [id, path_prefix, methods, upstream_id]
@@ -432,6 +518,76 @@ components:
         upstream_id:
           type: string
         rewrite_prefix:
+          type: [string, "null"]
+        tenant_id:
+          type: [string, "null"]
+        scopes:
+          type: array
+          items:
+            type: string
+        tool_policy:
+          $ref: "#/components/schemas/ToolPolicy"
+        request_timeout_ms:
+          type: [integer, "null"]
+        max_response_bytes:
+          type: [integer, "null"]
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+    ToolPolicy:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [off, allow_list]
+          description: |
+            `off` does not inspect MCP bodies. `allow_list` enforces the role map
+            and filters `tools/list`.
+        roles:
+          type: object
+          description: |
+            Role name to tool names. `*` as a role matches every caller; `*` as a
+            tool name allows every tool for that role.
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          example:
+            support: [search_tickets]
+            admin: ["*"]
+    DataAuditEntry:
+      type: object
+      required: [occurred_at, tenant_id, auth_method, decision]
+      properties:
+        occurred_at:
+          type: string
+        tenant_id:
+          type: string
+        subject:
+          type: [string, "null"]
+        assistant:
+          type: [string, "null"]
+        auth_method:
+          type: string
+          enum: [api_key, oauth]
+        mcp_method:
+          type: [string, "null"]
+        route_id:
+          type: [string, "null"]
+        tool_name:
+          type: [string, "null"]
+        decision:
+          type: string
+          enum: [allow, deny]
+        status:
+          type: [integer, "null"]
+        latency_ms:
+          type: [integer, "null"]
+        request_id:
+          type: [string, "null"]
+        token_id:
           type: [string, "null"]
     AuditEntry:
       type: object
@@ -471,6 +627,18 @@ components:
               description: Present when the failure happened inside an HTTP request.
 
   responses:
+    Unauthorized:
+      description: Missing or invalid admin token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The admin token does not hold the required scope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BadRequest:
       description: Invalid input
       content:

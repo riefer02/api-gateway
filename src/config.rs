@@ -42,6 +42,11 @@ impl Config {
                 "RATE_LIMIT_TENANT_PER_MINUTE=0: per-tenant rate limiting is disabled".to_owned(),
             );
         }
+        if self.limits.user_per_minute == 0 {
+            notes.push(
+                "RATE_LIMIT_USER_PER_MINUTE=0: per-user rate limiting is disabled".to_owned(),
+            );
+        }
         if self.retry.max_attempts <= 1 {
             notes.push("RETRY_MAX_ATTEMPTS=1: upstream retries are disabled".to_owned());
         }
@@ -73,6 +78,37 @@ impl Config {
             notes.push(
                 "UPSTREAM_ALLOW_HOSTS is empty: any upstream host is allowed (development only)"
                     .to_owned(),
+            );
+        }
+        if self.oauth.is_none() {
+            notes.push(
+                "OAUTH_ISSUER is unset: only API-key credentials are accepted; \
+                 MCP connectors need OAuth"
+                    .to_owned(),
+            );
+        }
+        if let Some(oauth) = &self.oauth
+            && oauth.token_exchange.is_none()
+        {
+            notes.push(
+                "OAUTH_TOKEN_ENDPOINT is unset: upstreams receive no per-user token; \
+                 only routes with no audience configured can be called"
+                    .to_owned(),
+            );
+        }
+        if self
+            .server
+            .cors_allowed_origins
+            .is_empty()
+        {
+            notes.push(
+                "CORS_ALLOWED_ORIGINS is empty: browser-based MCP clients will be blocked"
+                    .to_owned(),
+            );
+        }
+        if !self.data_audit.enabled {
+            notes.push(
+                "DATA_AUDIT_ENABLED=false: the data plane is not audited per call".to_owned(),
             );
         }
 
@@ -122,6 +158,9 @@ pub struct Config {
     pub routing: RoutingConfig,
     pub limits: LimitsConfig,
     pub retry: RetryConfig,
+    /// `None` disables OAuth. API keys keep working either way.
+    pub oauth: Option<OAuthConfig>,
+    pub data_audit: DataAuditConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -129,7 +168,16 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub request_body_limit_bytes: usize,
+    /// Default deadline for a proxied request that does not override it.
     pub request_timeout: Duration,
+    /// Absolute cap. A route may ask for a longer deadline, but never past this.
+    pub max_request_timeout: Duration,
+    /// Default cap on a proxied response body.
+    pub max_response_bytes: u64,
+    /// A streamed response that produces no bytes for this long is cut.
+    pub stream_idle_timeout: Duration,
+    /// Browser origins allowed to call the gateway. Empty disables CORS.
+    pub cors_allowed_origins: Vec<String>,
     pub shutdown_drain: Duration,
     /// Bound on reading a complete request head. Without it a client can hold
     /// a connection open by trickling headers (slowloris).
@@ -220,11 +268,64 @@ pub struct LimitsConfig {
     pub ip_per_minute: u32,
     /// Requests per minute per tenant. Zero disables the limiter.
     pub tenant_per_minute: u32,
+    /// Requests per minute per authenticated user. Zero disables the limiter.
+    pub user_per_minute: u32,
     /// Consecutive upstream failures before the circuit opens.
     pub circuit_failure_threshold: u32,
     pub circuit_cooldown: Duration,
     /// Only `local` is implemented; `redis` is rejected at startup.
     pub backend: RateLimitBackend,
+}
+
+/// OAuth 2.1 resource-server settings. The gateway validates tokens; it never
+/// issues them. All fields are required when `OAUTH_ISSUER` is set.
+#[derive(Clone, Debug)]
+pub struct OAuthConfig {
+    pub issuer: String,
+    /// Exact `aud` value this gateway accepts. Never a shared placeholder.
+    pub audience: String,
+    /// The authorization server's JWKS endpoint. Fetched and cached.
+    pub jwks_uri: String,
+    /// Accepted signing algorithms, e.g. `RS256,ES256`.
+    pub algorithms: Vec<String>,
+    pub clock_skew: Duration,
+    pub jwks_ttl: Duration,
+    /// The public URL clients connect to, used as RFC 9728 `resource`.
+    pub resource: String,
+    /// Authorization servers advertised in protected-resource metadata.
+    pub authorization_servers: Vec<String>,
+    pub scopes_supported: Vec<String>,
+    /// Tenant assigned to a token that carries no tenant claim. One-org
+    /// deployments usually leave this at `oauth` and keep routes shared.
+    pub default_tenant: String,
+    /// RFC 8693 token exchange. `None` means upstreams receive no gateway token.
+    pub token_exchange: Option<TokenExchangeConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TokenExchangeConfig {
+    pub endpoint: String,
+    pub client_id: SecretString,
+    pub client_secret: SecretString,
+    pub client_auth: ClientAuth,
+}
+
+/// How the gateway authenticates to the authorization server's token endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientAuth {
+    /// HTTP Basic (RFC 6749 §2.3.1). The default.
+    Basic,
+    /// Credentials in the form body (`client_secret_post`).
+    Post,
+}
+
+/// Asynchronous, per-call audit of the data plane.
+#[derive(Clone, Debug)]
+pub struct DataAuditConfig {
+    pub enabled: bool,
+    pub queue_capacity: usize,
+    pub batch_size: usize,
+    pub retention: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +405,18 @@ impl Config {
                 &mut problems,
             ),
             request_timeout: seconds_or(source, "REQUEST_TIMEOUT_SECS", 15, &mut problems),
+            max_request_timeout: seconds_or(source, "MAX_REQUEST_TIMEOUT_SECS", 300, &mut problems),
+            max_response_bytes: number_or(
+                source,
+                "MAX_RESPONSE_BYTES",
+                10_485_760_u64,
+                &mut problems,
+            ),
+            stream_idle_timeout: seconds_or(source, "STREAM_IDLE_TIMEOUT_SECS", 60, &mut problems),
+            cors_allowed_origins: csv(source.get("CORS_ALLOWED_ORIGINS"))
+                .into_iter()
+                .map(|origin| origin.trim_end_matches('/').to_owned())
+                .collect(),
             shutdown_drain: seconds_or(source, "SHUTDOWN_DRAIN_SECS", 25, &mut problems),
             header_read_timeout: seconds_or(source, "HEADER_READ_TIMEOUT_SECS", 10, &mut problems),
             max_connections: number_or(source, "MAX_CONNECTIONS", 1_024_usize, &mut problems),
@@ -339,9 +452,12 @@ impl Config {
             bind: string_or(source, "ADMIN_BIND", "127.0.0.1:9090"),
             tokens: admin_tokens(source, &mut problems),
             timeout: seconds_or(source, "ADMIN_TIMEOUT_SECS", 10, &mut problems),
-            audit_retention: Duration::from_secs(
-                86_400 * number_or(source, "AUDIT_RETENTION_DAYS", 90_u64, &mut problems),
-            ),
+            audit_retention: Duration::from_secs(86_400_u64.saturating_mul(number_or(
+                source,
+                "AUDIT_RETENTION_DAYS",
+                90_u64,
+                &mut problems,
+            ))),
         };
 
         let rate_limit_backend = match source
@@ -377,6 +493,12 @@ impl Config {
                 6_000_u32,
                 &mut problems,
             ),
+            user_per_minute: number_or(
+                source,
+                "RATE_LIMIT_USER_PER_MINUTE",
+                600_u32,
+                &mut problems,
+            ),
             circuit_failure_threshold: number_or(
                 source,
                 "CIRCUIT_FAILURE_THRESHOLD",
@@ -398,6 +520,25 @@ impl Config {
             budget_ratio: ratio_or(source, "RETRY_BUDGET_RATIO", 0.2, &mut problems),
         };
 
+        let oauth = oauth_config(source, &environment, &mut problems);
+
+        let data_audit = DataAuditConfig {
+            enabled: boolean_or(source, "DATA_AUDIT_ENABLED", true, &mut problems),
+            queue_capacity: number_or(
+                source,
+                "DATA_AUDIT_QUEUE_CAPACITY",
+                1_024_usize,
+                &mut problems,
+            ),
+            batch_size: number_or(source, "DATA_AUDIT_BATCH_SIZE", 100_usize, &mut problems),
+            retention: Duration::from_secs(86_400_u64.saturating_mul(number_or(
+                source,
+                "DATA_AUDIT_RETENTION_DAYS",
+                90_u64,
+                &mut problems,
+            ))),
+        };
+
         let config = Self {
             environment,
             server,
@@ -408,6 +549,8 @@ impl Config {
             routing,
             limits,
             retry,
+            oauth,
+            data_audit,
         };
 
         validate(&config, &mut problems);
@@ -437,6 +580,26 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     }
     if server.request_timeout.is_zero() {
         problems.push("REQUEST_TIMEOUT_SECS must be greater than zero".to_owned());
+    }
+    if server.max_request_timeout.is_zero() {
+        problems.push("MAX_REQUEST_TIMEOUT_SECS must be greater than zero".to_owned());
+    }
+    if server.max_request_timeout < server.request_timeout {
+        problems.push("MAX_REQUEST_TIMEOUT_SECS must be at least REQUEST_TIMEOUT_SECS".to_owned());
+    }
+    if server.max_response_bytes < 1024 {
+        problems.push("MAX_RESPONSE_BYTES must be at least 1024".to_owned());
+    }
+    if server.max_response_bytes > 1_073_741_824 {
+        problems.push("MAX_RESPONSE_BYTES must not exceed 1073741824".to_owned());
+    }
+    if server.stream_idle_timeout.is_zero()
+        || server.stream_idle_timeout > Duration::from_secs(3_600)
+    {
+        problems.push("STREAM_IDLE_TIMEOUT_SECS must be between 1 and 3600".to_owned());
+    }
+    for origin in &server.cors_allowed_origins {
+        validate_cors_origin(origin, environment, problems);
     }
     if server.shutdown_drain.is_zero() {
         problems.push("SHUTDOWN_DRAIN_SECS must be greater than zero".to_owned());
@@ -498,6 +661,92 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
         problems.push("ADMIN_TIMEOUT_SECS must be greater than zero".to_owned());
     }
 
+    if let Some(oauth) = &config.oauth {
+        validate_https_url("OAUTH_ISSUER", &oauth.issuer, environment, true, problems);
+        validate_https_url(
+            "OAUTH_JWKS_URI",
+            &oauth.jwks_uri,
+            environment,
+            true,
+            problems,
+        );
+        validate_https_url(
+            "OAUTH_RESOURCE",
+            &oauth.resource,
+            environment,
+            true,
+            problems,
+        );
+
+        if oauth.audience.trim().is_empty() {
+            problems.push("OAUTH_AUDIENCE must not be empty".to_owned());
+        }
+
+        if oauth.audience == "api" || oauth.audience == "*" {
+            problems.push(
+                "OAUTH_AUDIENCE must identify this gateway, not a shared placeholder".to_owned(),
+            );
+        }
+
+        if oauth.default_tenant.trim().is_empty() || oauth.default_tenant.len() > 128 {
+            problems.push("OAUTH_DEFAULT_TENANT must be 1-128 non-blank characters".to_owned());
+        }
+
+        if oauth.jwks_ttl.is_zero() || oauth.jwks_ttl > Duration::from_secs(3_600) {
+            problems.push("OAUTH_JWKS_TTL_SECS must be between 1 and 3600 seconds".to_owned());
+        }
+        if oauth.clock_skew > Duration::from_secs(300) {
+            problems.push("OAUTH_CLOCK_SKEW_SECS must not exceed 300 seconds".to_owned());
+        }
+        if let Some(exchange) = &oauth.token_exchange
+            && exchange.client_id.expose() == oauth.audience
+        {
+            problems.push(
+                "OAUTH_AUDIENCE must not equal OAUTH_CLIENT_ID: an ID token for the \
+                 client could be mistaken for an access token"
+                    .to_owned(),
+            );
+        }
+
+        for server in &oauth.authorization_servers {
+            validate_https_url(
+                "OAUTH_AUTHORIZATION_SERVERS entry",
+                server,
+                environment,
+                true,
+                problems,
+            );
+        }
+
+        if let Some(exchange) = &oauth.token_exchange {
+            validate_https_url(
+                "OAUTH_TOKEN_ENDPOINT",
+                &exchange.endpoint,
+                environment,
+                true,
+                problems,
+            );
+        }
+    }
+
+    if config.data_audit.enabled {
+        if config.data_audit.queue_capacity == 0 {
+            problems.push("DATA_AUDIT_QUEUE_CAPACITY must be at least 1".to_owned());
+        }
+        if config.data_audit.batch_size == 0 {
+            problems.push("DATA_AUDIT_BATCH_SIZE must be at least 1".to_owned());
+        }
+        if config.data_audit.batch_size > config.data_audit.queue_capacity {
+            problems
+                .push("DATA_AUDIT_BATCH_SIZE must not exceed DATA_AUDIT_QUEUE_CAPACITY".to_owned());
+        }
+        if config.data_audit.batch_size > 5_000 {
+            problems.push(
+                "DATA_AUDIT_BATCH_SIZE must not exceed 5000 (Postgres parameter limit)".to_owned(),
+            );
+        }
+    }
+
     if environment.is_production() {
         if auth.dev_api_key_secret.is_some() {
             problems.push("DEV_API_KEY_SECRET must not be set in production".to_owned());
@@ -510,6 +759,24 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
                 .push("AUTH_PEPPER must not be the development default in production".to_owned());
         } else if pepper.len() < 32 {
             problems.push("AUTH_PEPPER must be at least 32 characters in production".to_owned());
+        }
+
+        if pepper.contains("CHANGE_ME") {
+            problems
+                .push("AUTH_PEPPER still contains the example placeholder CHANGE_ME".to_owned());
+        }
+
+        for token in &admin.tokens {
+            if token
+                .token
+                .expose()
+                .contains("CHANGE_ME")
+            {
+                problems.push(format!(
+                    "ADMIN_TOKENS entry for `{}` still contains CHANGE_ME",
+                    token.name
+                ));
+            }
         }
 
         if routing.allow_hosts.is_empty() {
@@ -590,14 +857,211 @@ fn ratio_or(source: &dyn EnvSource, key: &str, default: f64, problems: &mut Vec<
     }
 }
 
+fn boolean_or(
+    source: &dyn EnvSource,
+    key: &str,
+    default: bool,
+    problems: &mut Vec<String>,
+) -> bool {
+    let Some(raw) = non_empty(source.get(key)) else {
+        return default;
+    };
+
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => {
+            problems.push(format!("{key} must be a boolean, got `{raw}`"));
+            default
+        }
+    }
+}
+
+/// Builds the resource-server configuration. A missing issuer disables OAuth;
+/// a partially configured block is an error, never a silent half-state.
+fn oauth_config(
+    source: &dyn EnvSource,
+    environment: &AppEnvironment,
+    problems: &mut Vec<String>,
+) -> Option<OAuthConfig> {
+    let Some(issuer) = non_empty(source.get("OAUTH_ISSUER")) else {
+        // A renamed/typo'd issuer must not silently downgrade an OAuth
+        // deployment to API-key-only.
+        for key in [
+            "OAUTH_AUDIENCE",
+            "OAUTH_JWKS_URI",
+            "OAUTH_RESOURCE",
+            "OAUTH_AUTHORIZATION_SERVERS",
+            "OAUTH_TOKEN_ENDPOINT",
+        ] {
+            if non_empty(source.get(key)).is_some() {
+                problems.push(format!("OAUTH_ISSUER is required when {key} is set"));
+            }
+        }
+
+        return None;
+    };
+
+    let audience = required(source, "OAUTH_AUDIENCE", problems);
+    let jwks_uri = required(source, "OAUTH_JWKS_URI", problems);
+    let resource = required(source, "OAUTH_RESOURCE", problems);
+    let authorization_servers = csv_preserve(source.get("OAUTH_AUTHORIZATION_SERVERS"));
+
+    if authorization_servers.is_empty() {
+        problems.push("OAUTH_AUTHORIZATION_SERVERS must list at least one issuer".to_owned());
+    }
+
+    let mut algorithms = csv(source.get("OAUTH_ALGORITHMS"));
+    if algorithms.is_empty() {
+        algorithms = vec!["rs256".to_owned()];
+    }
+    for algorithm in &algorithms {
+        if !matches!(
+            algorithm.as_str(),
+            "rs256" | "rs384" | "rs512" | "es256" | "es384"
+        ) {
+            problems.push(format!(
+                "OAUTH_ALGORITHMS contains unsupported algorithm `{algorithm}`; \
+                 use RS256/RS384/RS512 or ES256/ES384"
+            ));
+        }
+    }
+
+    match source
+        .get("OAUTH_TOKEN_FORMAT")
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None | Some("jwt") => {}
+        Some(other) => problems.push(format!(
+            "OAUTH_TOKEN_FORMAT=`{other}` is not implemented; use `jwt` (opaque tokens need an introspection step that is deliberately deferred)"
+        )),
+    }
+
+    let token_exchange = token_exchange_config(source, environment, problems);
+
+    Some(OAuthConfig {
+        issuer,
+        audience,
+        jwks_uri,
+        algorithms,
+        clock_skew: seconds_or(source, "OAUTH_CLOCK_SKEW_SECS", 30, problems),
+        jwks_ttl: seconds_or(source, "OAUTH_JWKS_TTL_SECS", 300, problems),
+        resource,
+        authorization_servers,
+        scopes_supported: csv_preserve(source.get("OAUTH_SCOPES_SUPPORTED")),
+        default_tenant: string_or(source, "OAUTH_DEFAULT_TENANT", "oauth"),
+        token_exchange,
+    })
+}
+
+fn token_exchange_config(
+    source: &dyn EnvSource,
+    environment: &AppEnvironment,
+    problems: &mut Vec<String>,
+) -> Option<TokenExchangeConfig> {
+    let endpoint = non_empty(source.get("OAUTH_TOKEN_ENDPOINT"))?;
+    let client_id = required(source, "OAUTH_CLIENT_ID", problems);
+    let client_secret = required(source, "OAUTH_CLIENT_SECRET", problems);
+
+    if environment.is_production() && !endpoint.starts_with("https://") {
+        problems.push("OAUTH_TOKEN_ENDPOINT must be HTTPS in production".to_owned());
+    }
+
+    let client_auth = match source
+        .get("OAUTH_CLIENT_AUTH")
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("basic") => ClientAuth::Basic,
+        Some("post") => ClientAuth::Post,
+        Some(other) => {
+            problems.push(format!(
+                "OAUTH_CLIENT_AUTH must be `basic` or `post`, got `{other}`"
+            ));
+            ClientAuth::Basic
+        }
+    };
+
+    Some(TokenExchangeConfig {
+        endpoint,
+        client_id: SecretString::new(client_id),
+        client_secret: SecretString::new(client_secret),
+        client_auth,
+    })
+}
+
+/// Validates an absolute URL used for an OAuth endpoint or metadata field.
+fn validate_https_url(
+    label: &str,
+    raw: &str,
+    environment: &AppEnvironment,
+    allow_path: bool,
+    problems: &mut Vec<String>,
+) {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        problems.push(format!("{label} must be an absolute URL"));
+        return;
+    };
+
+    if !url.username().is_empty() || url.password().is_some() {
+        problems.push(format!("{label} must not embed credentials"));
+    }
+
+    if environment.is_production() && url.scheme() != "https" {
+        problems.push(format!("{label} must use https in production"));
+    } else if !matches!(url.scheme(), "http" | "https") {
+        problems.push(format!("{label} must use http or https"));
+    }
+
+    if url.query().is_some() || url.fragment().is_some() {
+        problems.push(format!("{label} must not contain a query or fragment"));
+    }
+
+    if !allow_path && url.path() != "/" && !url.path().is_empty() {
+        problems.push(format!("{label} must be an origin, not a path"));
+    }
+}
+
+/// A browser origin: scheme, host, optional port, and nothing else.
+fn validate_cors_origin(raw: &str, environment: &AppEnvironment, problems: &mut Vec<String>) {
+    if raw.contains('*') {
+        problems.push(
+            "CORS_ALLOWED_ORIGINS must list exact origins; wildcards are not allowed".to_owned(),
+        );
+        return;
+    }
+
+    validate_https_url(
+        &format!("CORS_ALLOWED_ORIGINS entry `{raw}`"),
+        raw,
+        environment,
+        false,
+        problems,
+    );
+}
+
 fn csv(value: Option<String>) -> Vec<String> {
+    csv_preserve(value)
+        .into_iter()
+        .map(|item| item.to_ascii_lowercase())
+        .collect()
+}
+
+/// Comma-separated values where case is significant: scopes, issuer URLs, and
+/// anything the identity provider compares exactly.
+fn csv_preserve(value: Option<String>) -> Vec<String> {
     value
         .map(|value| {
             value
                 .split(',')
                 .filter_map(|item| {
                     let item = item.trim();
-                    (!item.is_empty()).then(|| item.to_ascii_lowercase())
+                    (!item.is_empty()).then(|| item.to_owned())
                 })
                 .collect()
         })
@@ -893,6 +1357,16 @@ mod tests {
             ("UPSTREAM_ALLOW_HOSTS", "swapi.dev"),
             ("ADMIN_TOKEN", "admin-token-0123456789"),
             ("METRICS_TOKEN", "metrics-token-0123456789"),
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+            ("OAUTH_SCOPES_SUPPORTED", "mcp:tools"),
+            ("OAUTH_TOKEN_ENDPOINT", "https://auth.example.com/token"),
+            ("OAUTH_CLIENT_ID", "gateway-client"),
+            ("OAUTH_CLIENT_SECRET", "gateway-client-secret"),
+            ("CORS_ALLOWED_ORIGINS", "https://chatgpt.com"),
         ]);
 
         let config = Config::from_source(&values).expect("valid config");
@@ -1014,5 +1488,277 @@ mod tests {
         assert!(!rendered.contains("super-secret-value"));
         assert!(!rendered.contains("gateway:secret"));
         assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn oauth_is_disabled_unless_an_issuer_is_set() {
+        let config = Config::from_source(&valid_development()).expect("valid config");
+
+        assert!(config.oauth.is_none());
+    }
+
+    #[test]
+    fn oauth_requires_every_companion_field() {
+        let mut values = valid_development();
+        values.insert(
+            "OAUTH_ISSUER".to_owned(),
+            "https://auth.example.com".to_owned(),
+        );
+
+        let error = Config::from_source(&values).expect_err("partial OAuth config");
+        let message = error.to_string();
+
+        assert!(message.contains("OAUTH_AUDIENCE"));
+        assert!(message.contains("OAUTH_JWKS_URI"));
+        assert!(message.contains("OAUTH_RESOURCE"));
+        assert!(message.contains("OAUTH_AUTHORIZATION_SERVERS"));
+    }
+
+    #[test]
+    fn oauth_rejects_shared_audience_and_unknown_algorithms() {
+        let mut values = valid_development();
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "api"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+            ("OAUTH_ALGORITHMS", "HS256,RS256"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        let error = Config::from_source(&values).expect_err("invalid OAuth config");
+        let message = error.to_string();
+
+        assert!(message.contains("shared placeholder"));
+        assert!(message.contains("hs256"));
+    }
+
+    #[test]
+    fn oauth_companions_without_an_issuer_fail_closed() {
+        let mut values = valid_development();
+        values.insert(
+            "OAUTH_AUDIENCE".to_owned(),
+            "https://gateway.example.com/mcp".to_owned(),
+        );
+
+        let error = Config::from_source(&values).expect_err("issuer missing");
+        assert!(
+            error
+                .to_string()
+                .contains("OAUTH_ISSUER is required")
+        );
+    }
+
+    #[test]
+    fn oauth_rejects_excessive_skew_and_jwks_ttl() {
+        let mut values = valid_development();
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+            ("OAUTH_CLOCK_SKEW_SECS", "3600"),
+            ("OAUTH_JWKS_TTL_SECS", "86400"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        let error = Config::from_source(&values).expect_err("unsafe OAuth windows");
+        let message = error.to_string();
+
+        assert!(message.contains("OAUTH_CLOCK_SKEW_SECS"));
+        assert!(message.contains("OAUTH_JWKS_TTL_SECS"));
+    }
+
+    #[test]
+    fn production_rejects_example_secret_placeholders() {
+        let values = source(&[
+            ("APP_ENV", "production"),
+            (
+                "DATABASE_URL",
+                "postgres://gateway:secret@127.0.0.1:5432/gateway",
+            ),
+            ("AUTH_PEPPER", "CHANGE_ME_32_CHARACTERS_MINIMUM_VALUE"),
+            ("UPSTREAM_ALLOW_HOSTS", "example.com"),
+            (
+                "ADMIN_TOKENS",
+                "alice:CHANGE_ME_LONG_RANDOM_TOKEN:config:read",
+            ),
+        ]);
+
+        let error = Config::from_source(&values).expect_err("placeholders");
+        assert!(error.to_string().contains("CHANGE_ME"));
+    }
+
+    #[test]
+    fn oauth_rejects_an_unimplemented_token_format() {
+        let mut values = valid_development();
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+            ("OAUTH_TOKEN_FORMAT", "introspection"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        let error = Config::from_source(&values).expect_err("opaque tokens");
+        assert!(
+            error
+                .to_string()
+                .contains("not implemented")
+        );
+    }
+
+    #[test]
+    fn oauth_token_exchange_accepts_client_secret_post() {
+        let mut values = valid_development();
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+            ("OAUTH_TOKEN_ENDPOINT", "https://auth.example.com/token"),
+            ("OAUTH_CLIENT_ID", "gateway-client"),
+            ("OAUTH_CLIENT_SECRET", "gateway-client-secret"),
+            ("OAUTH_CLIENT_AUTH", "post"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        let config = Config::from_source(&values).expect("valid config");
+        let exchange = config
+            .oauth
+            .and_then(|oauth| oauth.token_exchange)
+            .expect("exchange");
+
+        assert_eq!(exchange.client_auth, ClientAuth::Post);
+    }
+
+    #[test]
+    fn oauth_token_exchange_requires_a_client() {
+        let mut values = valid_development();
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+            ("OAUTH_TOKEN_ENDPOINT", "https://auth.example.com/token"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        let error = Config::from_source(&values).expect_err("missing client");
+        let message = error.to_string();
+
+        assert!(message.contains("OAUTH_CLIENT_ID"));
+        assert!(message.contains("OAUTH_CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn cors_requires_exact_origins() {
+        let mut values = valid_development();
+        values.insert(
+            "CORS_ALLOWED_ORIGINS".to_owned(),
+            "https://*.example.com".to_owned(),
+        );
+
+        let error = Config::from_source(&values).expect_err("wildcard origin");
+        assert!(error.to_string().contains("wildcards"));
+
+        let mut values = valid_development();
+        values.insert(
+            "CORS_ALLOWED_ORIGINS".to_owned(),
+            "https://app.example.com/path".to_owned(),
+        );
+
+        let error = Config::from_source(&values).expect_err("origin with a path");
+        assert!(error.to_string().contains("origin"));
+    }
+
+    #[test]
+    fn route_override_cannot_exceed_the_hard_deadline() {
+        let mut values = valid_development();
+        values.insert("REQUEST_TIMEOUT_SECS".to_owned(), "120".to_owned());
+        values.insert("MAX_REQUEST_TIMEOUT_SECS".to_owned(), "60".to_owned());
+
+        let error = Config::from_source(&values).expect_err("deadline ordering");
+        assert!(
+            error
+                .to_string()
+                .contains("MAX_REQUEST_TIMEOUT_SECS")
+        );
+    }
+
+    #[test]
+    fn data_audit_batch_must_fit_the_queue() {
+        let mut values = valid_development();
+        values.insert("DATA_AUDIT_QUEUE_CAPACITY".to_owned(), "10".to_owned());
+        values.insert("DATA_AUDIT_BATCH_SIZE".to_owned(), "20".to_owned());
+
+        let error = Config::from_source(&values).expect_err("batch larger than queue");
+        assert!(
+            error
+                .to_string()
+                .contains("DATA_AUDIT_BATCH_SIZE")
+        );
+    }
+
+    #[test]
+    fn oauth_scopes_and_authorization_servers_preserve_case() {
+        let mut values = valid_development();
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com/Tenant"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/Tenant/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            (
+                "OAUTH_AUTHORIZATION_SERVERS",
+                "https://auth.example.com/Tenant",
+            ),
+            ("OAUTH_SCOPES_SUPPORTED", "Mcp:Tools,ReadAll"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        let config = Config::from_source(&values).expect("valid config");
+        let oauth = config.oauth.expect("oauth");
+
+        assert_eq!(
+            oauth.authorization_servers,
+            vec!["https://auth.example.com/Tenant"]
+        );
+        assert_eq!(oauth.scopes_supported, vec!["Mcp:Tools", "ReadAll"]);
+    }
+
+    #[test]
+    fn stream_idle_timeout_is_bounded() {
+        let mut values = valid_development();
+        values.insert("STREAM_IDLE_TIMEOUT_SECS".to_owned(), "0".to_owned());
+
+        assert!(Config::from_source(&values).is_err());
+
+        values.insert("STREAM_IDLE_TIMEOUT_SECS".to_owned(), "3601".to_owned());
+        assert!(Config::from_source(&values).is_err());
+
+        values.insert("STREAM_IDLE_TIMEOUT_SECS".to_owned(), "90".to_owned());
+        let config = Config::from_source(&values).expect("valid config");
+        assert_eq!(config.server.stream_idle_timeout, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn per_user_limit_is_configurable() {
+        let mut values = valid_development();
+        values.insert("RATE_LIMIT_USER_PER_MINUTE".to_owned(), "42".to_owned());
+
+        let config = Config::from_source(&values).expect("valid config");
+        assert_eq!(config.limits.user_per_minute, 42);
     }
 }
