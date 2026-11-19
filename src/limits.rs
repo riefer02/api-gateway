@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -385,6 +385,67 @@ mod tests {
         }
     }
 
+    fn routing(max_concurrency: usize, queue_timeout: Duration) -> crate::config::RoutingConfig {
+        crate::config::RoutingConfig {
+            allow_hosts: Vec::new(),
+            refresh_interval: Duration::from_secs(2),
+            egress: crate::net::Egress::AllowAll,
+            pool_max_idle_per_host: 64,
+            max_concurrency,
+            queue_timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bulkhead_admits_its_limit_and_then_sheds() {
+        let bulkhead = BulkheadRegistry::new(&routing(1, Duration::ZERO)).expect("enabled");
+
+        let first = bulkhead
+            .acquire("upstream")
+            .await
+            .expect("first permit");
+
+        assert!(
+            bulkhead
+                .acquire("upstream")
+                .await
+                .is_err(),
+            "the second request must be refused while the first is in flight"
+        );
+
+        drop(first);
+
+        assert!(
+            bulkhead
+                .acquire("upstream")
+                .await
+                .is_ok(),
+            "the permit must be reusable once released"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bulkhead_queues_for_at_most_its_timeout() {
+        let bulkhead =
+            BulkheadRegistry::new(&routing(1, Duration::from_millis(20))).expect("enabled");
+        let _held = bulkhead
+            .acquire("upstream")
+            .await
+            .expect("first permit");
+
+        assert!(
+            bulkhead
+                .acquire("upstream")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_zero_concurrency_bulkhead_is_disabled() {
+        assert!(BulkheadRegistry::new(&routing(0, Duration::ZERO)).is_none());
+    }
+
     #[test]
     fn the_tool_limiter_exists_only_when_configured() {
         let mut config = limits();
@@ -491,4 +552,73 @@ mod tests {
         registry.record_failure("upstream");
         assert!(registry.check("upstream").is_ok(), "counter restarted");
     }
+}
+
+/// Per-upstream concurrency, the sibling of the circuit breaker.
+///
+/// The breaker reacts to an upstream that is already failing; a bulkhead keeps
+/// one slow upstream from consuming the whole replica's connection budget while
+/// it fails slowly. Permits are held until the response body finishes, not just
+/// until the headers arrive, so a long stream counts as the concurrency it is.
+pub(crate) struct BulkheadRegistry {
+    bulkheads: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    permits: usize,
+    queue_timeout: Duration,
+}
+
+impl BulkheadRegistry {
+    pub(crate) fn new(config: &crate::config::RoutingConfig) -> Option<Self> {
+        (config.max_concurrency > 0).then(|| Self {
+            bulkheads: Mutex::new(HashMap::new()),
+            permits: config.max_concurrency,
+            queue_timeout: config.queue_timeout,
+        })
+    }
+
+    /// Acquires a permit for one upstream, waiting up to the configured queue
+    /// timeout. The returned permit must be held for the life of the response.
+    pub(crate) async fn acquire(
+        &self,
+        upstream: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, BulkheadRejection> {
+        let semaphore = {
+            let mut bulkheads = self
+                .bulkheads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            Arc::clone(
+                bulkheads
+                    .entry(upstream.to_owned())
+                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.permits))),
+            )
+        };
+
+        if self.queue_timeout.is_zero() {
+            return semaphore
+                .try_acquire_owned()
+                .map_err(|_| BulkheadRejection {
+                    retry_after: Duration::from_secs(1),
+                });
+        }
+
+        match tokio::time::timeout(self.queue_timeout, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // Closed means the registry was dropped; treat it as saturated
+            // rather than as a panic.
+            Ok(Err(_)) => Err(BulkheadRejection {
+                retry_after: Duration::from_secs(1),
+            }),
+            Err(_) => Err(BulkheadRejection {
+                retry_after: self
+                    .queue_timeout
+                    .max(Duration::from_secs(1)),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BulkheadRejection {
+    pub(crate) retry_after: Duration,
 }

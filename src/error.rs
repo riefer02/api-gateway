@@ -52,6 +52,8 @@ pub enum AppError {
     },
     #[error("upstream circuit is open for {retry_after_secs}s")]
     CircuitOpen { retry_after_secs: u64 },
+    #[error("upstream is at its concurrency limit")]
+    UpstreamSaturated { retry_after_secs: u64 },
     #[error("upstream timed out")]
     UpstreamTimeout,
     #[error("upstream authentication failed")]
@@ -103,7 +105,9 @@ impl AppError {
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::UpstreamAuthFailed => StatusCode::BAD_GATEWAY,
             Self::BadGateway => StatusCode::BAD_GATEWAY,
-            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ServiceUnavailable | Self::UpstreamSaturated { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -125,6 +129,7 @@ impl AppError {
             Self::UpstreamAuthFailed => "upstream_auth_failed",
             Self::BadGateway => "bad_gateway",
             Self::ServiceUnavailable => "service_unavailable",
+            Self::UpstreamSaturated { .. } => "upstream_saturated",
             Self::Internal { .. } => "internal_error",
         }
     }
@@ -150,6 +155,7 @@ impl AppError {
             Self::UpstreamAuthFailed => "the upstream credential exchange failed".into(),
             Self::BadGateway => "the upstream returned an invalid response".into(),
             Self::ServiceUnavailable => "the service is temporarily unavailable".into(),
+            Self::UpstreamSaturated { .. } => "the upstream is at its concurrency limit".into(),
             Self::Internal { .. } => "an internal error occurred".into(),
         }
     }
@@ -190,6 +196,7 @@ impl IntoResponse for AppError {
                 retry_after_secs, ..
             } => Some(retry_after_secs),
             Self::CircuitOpen { retry_after_secs } => Some(retry_after_secs),
+            Self::UpstreamSaturated { retry_after_secs } => Some(retry_after_secs),
             _ => None,
         };
 

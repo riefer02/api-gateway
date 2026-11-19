@@ -168,6 +168,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         routes: routes.clone(),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        bulkheads: crate::limits::BulkheadRegistry::new(&config.routing).map(Arc::new),
         retry: Arc::new(RetryPolicy::new(&config.retry)),
         audit: audit_sink,
         mcp_schemas,

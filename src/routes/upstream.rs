@@ -158,6 +158,31 @@ async fn handle(
         .extensions_mut()
         .insert(identity);
 
+    // One permit per upstream, held until the response body is finished. A
+    // slow upstream then sheds load instead of consuming the replica's whole
+    // connection budget while it struggles.
+    let permit = match state.bulkheads.as_ref() {
+        Some(bulkheads) => match bulkheads
+            .acquire(&route.upstream.id)
+            .await
+        {
+            Ok(permit) => Some(permit),
+            Err(rejection) => {
+                audit.deny();
+                metrics::counter!(
+                    "gateway_upstream_saturated_total",
+                    "upstream" => route.upstream.id.clone(),
+                )
+                .increment(1);
+
+                return Err(AppError::UpstreamSaturated {
+                    retry_after_secs: rejection.retry_after.as_secs().max(1),
+                });
+            }
+        },
+        None => None,
+    };
+
     let forwarded = tokio::time::timeout(
         timeout,
         proxy::forward(
@@ -176,8 +201,44 @@ async fn handle(
     .await;
 
     match forwarded {
-        Ok(response) => response,
+        Ok(Ok(response)) => match permit {
+            Some(permit) => Ok(hold_permit(permit, response)),
+            None => Ok(response),
+        },
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(AppError::RequestTimeout),
+    }
+}
+
+/// Ties a bulkhead permit to the response body's lifetime. Releasing it when
+/// the headers arrived would count a two-minute stream as one instant of
+/// concurrency, which is the opposite of what a bulkhead is for.
+fn hold_permit(permit: tokio::sync::OwnedSemaphorePermit, response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream();
+
+    Response::from_parts(
+        parts,
+        Body::from_stream(PermitStream {
+            inner: Box::pin(stream),
+            _permit: permit,
+        }),
+    )
+}
+
+struct PermitStream {
+    inner: std::pin::Pin<Box<axum::body::BodyDataStream>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl futures_core::Stream for PermitStream {
+    type Item = Result<axum::body::Bytes, axum::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
     }
 }
 

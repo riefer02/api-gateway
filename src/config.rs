@@ -271,6 +271,13 @@ pub struct RoutingConfig {
     pub refresh_interval: Duration,
     /// What an allowlisted upstream hostname is allowed to resolve to.
     pub egress: crate::net::Egress,
+    /// Concurrent requests allowed in flight to one upstream, per replica.
+    /// Zero disables the bulkhead: a bound that *rejects* traffic is opt-in,
+    /// unlike the pool bound which only decides what is kept.
+    pub max_concurrency: usize,
+    /// How long a request waits for a permit before it is refused. Zero means
+    /// refuse immediately rather than queue.
+    pub queue_timeout: Duration,
     /// Idle sockets kept per upstream client, per replica. It is per client,
     /// not per host: routes that differ in timeout, audience or exchange
     /// scope get their own client, and each keeps up to this many sockets to
@@ -525,6 +532,13 @@ impl Config {
                 64_usize,
                 &mut problems,
             ),
+            max_concurrency: number_or(source, "UPSTREAM_MAX_CONCURRENCY", 0_usize, &mut problems),
+            queue_timeout: Duration::from_millis(number_or(
+                source,
+                "UPSTREAM_QUEUE_TIMEOUT_MS",
+                0_u64,
+                &mut problems,
+            )),
         };
 
         let limits = LimitsConfig {
@@ -682,6 +696,12 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
 
     if routing.refresh_interval.is_zero() {
         problems.push("ROUTE_REFRESH_INTERVAL_MS must be greater than zero".to_owned());
+    }
+    if routing.max_concurrency > 65_536 {
+        problems.push("UPSTREAM_MAX_CONCURRENCY must not exceed 65536".to_owned());
+    }
+    if routing.queue_timeout > Duration::from_secs(30) {
+        problems.push("UPSTREAM_QUEUE_TIMEOUT_MS must not exceed 30000".to_owned());
     }
     if !(1..=1_024).contains(&routing.pool_max_idle_per_host) {
         // 0 would turn keep-alive off entirely; the ceiling exists to catch a

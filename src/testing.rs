@@ -191,6 +191,7 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         routes: RouteTableHandle::new(RouteTable::for_tests(1, vec![route])),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        bulkheads: crate::limits::BulkheadRegistry::new(&config.routing).map(Arc::new),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
         audit: Arc::new(crate::audit::DisabledAudit),
         mcp_schemas: (!config.mcp.tool_schema_ttl.is_zero()).then(|| {
@@ -233,6 +234,7 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
         routes: RouteTableHandle::new(RouteTable::for_tests(1, Vec::new())),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
+        bulkheads: crate::limits::BulkheadRegistry::new(&config.routing).map(Arc::new),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
         audit: Arc::new(crate::audit::DisabledAudit),
         mcp_schemas: (!config.mcp.tool_schema_ttl.is_zero()).then(|| {

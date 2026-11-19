@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 245 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 249 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -38,12 +38,14 @@ The guarantees are structural where they can be:
 - **Egress is resolved, not just parsed.** An allowlisted hostname is filtered by address
   when it resolves, and the client connects to exactly what survived, so the metadata
   service and the gateway's own loopback are unreachable by default.
+- **An overloaded upstream sheds load.** With `UPSTREAM_MAX_CONCURRENCY` set, a permit is
+  held for the life of the response body — so a long stream counts as the concurrency it
+  is — and saturation answers `503` with `Retry-After` rather than queueing without bound.
 
 Known limits, stated rather than discovered:
 
 - Rate limits, retry budgets and circuit breakers are per replica: N replicas enforce
   N × the configured rate.
-- Idle upstream sockets are bounded; peak concurrency is not (no per-upstream bulkhead yet).
 - Not independently audited. The threat model, the controls it claims, and the tests that
   enforce them live in [`docs/threat-model.md`](docs/threat-model.md) and
   [`SECURITY.md`](SECURITY.md).
@@ -398,6 +400,8 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `DEV_API_KEY_SCOPES` | `read` | Scopes for the seeded key |
 | `UPSTREAM_ALLOW_HOSTS` | — | Comma-separated allowlist; required in production |
 | `UPSTREAM_EGRESS` | `deny-link-local` | What an allowed host may resolve to: `deny-link-local`, `deny-private`, `allow-all` |
+| `UPSTREAM_MAX_CONCURRENCY` | `0` | In-flight requests per upstream, per replica; `0` disables the bulkhead |
+| `UPSTREAM_QUEUE_TIMEOUT_MS` | `0` | How long to wait for a bulkhead permit; `0` sheds immediately |
 | `ROUTE_REFRESH_INTERVAL_MS` | `2000` | Route table poll interval |
 | `UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `64` | Idle sockets kept per upstream client, per replica; bounds idle accumulation, not peak concurrency |
 | `MCP_TOOL_SCHEMA_TTL_SECS` | `300` | How long a learned tool schema is trusted; `0` disables argument validation |

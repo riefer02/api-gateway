@@ -1116,6 +1116,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_saturated_upstream_sheds_load_with_retry_after() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[("UPSTREAM_MAX_CONCURRENCY", "1")]);
+        let (app, token) =
+            app_with_policy_and_config(&upstream.uri(), crate::mcp::ToolPolicy::default(), &config);
+
+        let request = || {
+            Request::builder()
+                .uri("/swapi")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(request()),
+            app.clone().oneshot(request())
+        );
+
+        let responses = [first.unwrap(), second.unwrap()];
+        let saturations: Vec<_> = responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::SERVICE_UNAVAILABLE)
+            .collect();
+
+        assert_eq!(saturations.len(), 1, "exactly one request must be shed");
+        assert!(
+            saturations[0]
+                .headers()
+                .contains_key("retry-after"),
+            "a shed request must say when to try again"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status() == StatusCode::OK)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn cors_preflight_is_answered_before_auth_and_other_origins_are_refused() {
         let config = testing::config_with(&[("CORS_ALLOWED_ORIGINS", "https://app.example.com")]);
         let app = crate::app::build_app(&config, testing::empty_state_with(&config));

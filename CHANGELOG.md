@@ -7,6 +7,12 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Per-upstream bulkhead.** `UPSTREAM_MAX_CONCURRENCY` bounds in-flight requests to one
+  upstream per replica, with `UPSTREAM_QUEUE_TIMEOUT_MS` deciding whether to queue or shed.
+  The permit is held until the response body finishes, so a long stream counts as the
+  concurrency it is, and saturation returns `503` with `Retry-After` plus
+  `gateway_upstream_saturated_total`. Off by default: bounds that reject traffic are
+  opt-in, unlike the pool bound which only decides what is kept.
 - **Egress policy.** `UPSTREAM_EGRESS` decides what an allowlisted upstream hostname may
   resolve to, applied by a filtering DNS resolver so the client connects to exactly the
   addresses that passed: `deny-link-local` (default; blocks loopback, link-local, the IPv4

@@ -85,6 +85,8 @@ pub(crate) struct AppState {
     pub(crate) routes: RouteTableHandle,
     pub(crate) limits: Arc<RateLimits>,
     pub(crate) breakers: Arc<BreakerRegistry>,
+    /// `None` disables the per-upstream concurrency bulkhead.
+    pub(crate) bulkheads: Option<Arc<crate::limits::BulkheadRegistry>>,
     pub(crate) retry: Arc<RetryPolicy>,
     pub(crate) audit: Arc<dyn crate::audit::AuditSink>,
     /// Tool schemas learned from `tools/list`. `None` disables input
