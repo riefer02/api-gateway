@@ -163,7 +163,10 @@ pub(crate) struct SchemaSink {
 /// Response filtering instructions for a `tools/list` request.
 #[derive(Clone)]
 pub(crate) struct ToolFilter {
-    pub(crate) allowed: AllowedTools,
+    /// Shared, not cloned: building the set is already per request, and a
+    /// second copy of up to a thousand names for the response path is pure
+    /// overhead.
+    pub(crate) allowed: std::sync::Arc<AllowedTools>,
     /// `tools/list` must return a `result.tools` array; discovery and error
     /// envelopes must pass through unchanged.
     pub(crate) require_tools: bool,
@@ -712,7 +715,7 @@ mod tests {
         .into_bytes();
 
         let filter = ToolFilter {
-            allowed,
+            allowed: std::sync::Arc::new(allowed),
             require_tools: true,
             schemas: None,
         };
@@ -732,7 +735,7 @@ mod tests {
     #[test]
     fn discovery_and_error_envelopes_pass_through() {
         let filter = ToolFilter {
-            allowed: AllowedTools::Set(HashSet::from(["search".to_owned()])),
+            allowed: std::sync::Arc::new(AllowedTools::Set(HashSet::from(["search".to_owned()]))),
             require_tools: false,
             schemas: None,
         };
@@ -746,7 +749,7 @@ mod tests {
     #[test]
     fn a_batch_filters_every_tool_list_element() {
         let filter = ToolFilter {
-            allowed: AllowedTools::Set(HashSet::from(["search".to_owned()])),
+            allowed: std::sync::Arc::new(AllowedTools::Set(HashSet::from(["search".to_owned()]))),
             require_tools: true,
             schemas: None,
         };
@@ -780,7 +783,7 @@ mod tests {
     #[test]
     fn leaves_unknown_response_shapes_alone() {
         let filter = ToolFilter {
-            allowed: AllowedTools::Set(HashSet::new()),
+            allowed: std::sync::Arc::new(AllowedTools::Set(HashSet::new())),
             require_tools: true,
             schemas: None,
         };

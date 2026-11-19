@@ -308,9 +308,13 @@ async fn apply_tool_policy(
         return Ok(PolicyOutcome::Forward(request, None));
     }
 
-    let allowed = route
-        .tool_policy
-        .allowed_tools(&identity.roles);
+    // Built once per request and shared into the response path; the set is
+    // immutable for the life of the snapshot.
+    let allowed = Arc::new(
+        route
+            .tool_policy
+            .allowed_tools(&identity.roles),
+    );
     let claimed_method = single_header(request.headers(), "mcp-method")?;
     let claimed_name = single_header(request.headers(), "mcp-name")?;
     let claimed_version = single_header(request.headers(), "mcp-protocol-version")?;
@@ -379,7 +383,7 @@ async fn apply_tool_policy(
             }
 
             let filter = (evaluated.wants_tools_list && !allowed.is_all()).then(|| ToolFilter {
-                allowed: allowed.clone(),
+                allowed: Arc::clone(&allowed),
                 require_tools: true,
                 schemas: state
                     .mcp_schemas
