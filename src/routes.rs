@@ -1213,6 +1213,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_run_id_still_consumes_the_ip_limit() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[("RATE_LIMIT_IP_PER_MINUTE", "1")]);
+        let (app, token) =
+            app_with_policy_and_config(&upstream.uri(), crate::mcp::ToolPolicy::default(), &config);
+
+        let request = || {
+            Request::builder()
+                .uri("/swapi")
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-run-id", "bad value")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+
+        // Validation happens below the IP limiter, so the refusal above was
+        // charged. An early return would answer 400 forever and let a caller
+        // use the header to avoid the only pre-auth control.
+        let second = app.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
     async fn cors_preflight_is_answered_before_auth_and_other_origins_are_refused() {
         let config = testing::config_with(&[("CORS_ALLOWED_ORIGINS", "https://app.example.com")]);
         let app = crate::app::build_app(&config, testing::empty_state_with(&config));

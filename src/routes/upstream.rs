@@ -28,39 +28,13 @@ pub(crate) async fn dispatch(State(state): State<AppState>, request: Request) ->
     let mut rate_headers = HeaderMap::new();
     let mut audit = AuditDraft::default();
 
-    // A malformed correlation id is a client bug, so it is refused rather than
-    // ignored: silently dropping it makes the client's logs wrong without
-    // telling anyone.
-    let run_id = match run_id_header(request.headers()) {
-        Ok(run_id) => run_id,
-        Err(error) => return error.into_response(),
-    };
-
-    let mut response = match handle(
-        &state,
-        request,
-        &mut rate_headers,
-        &mut audit,
-        run_id.as_deref(),
-    )
-    .await
-    {
+    let mut response = match handle(&state, request, &mut rate_headers, &mut audit).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
 
     if let Some(event) = audit.finish(response.status().as_u16(), started.elapsed()) {
         state.audit.record(event);
-    }
-
-    // Echo the caller's correlation id, including on failures: the error is
-    // exactly when the client most needs to join its log to ours.
-    if let Some(run_id) = &run_id
-        && let Ok(value) = HeaderValue::from_str(run_id)
-    {
-        response
-            .headers_mut()
-            .insert("x-run-id", value);
     }
 
     // Rate-limit headers belong on failures too, but never overwrite the ones a
@@ -87,7 +61,6 @@ async fn handle(
     mut request: Request,
     rate_headers: &mut HeaderMap,
     audit: &mut AuditDraft,
-    run_id: Option<&str>,
 ) -> Result<Response, AppError> {
     let path = request.uri().path().to_owned();
 
@@ -106,6 +79,17 @@ async fn handle(
         check_limit(limiter, &format!("ip:{client}"), rate_headers)?;
     }
 
+    // After the IP limiter, never before it: an early refusal would let a
+    // malformed correlation id skip the one control that applies to
+    // unauthenticated callers. The echo rides back on `rate_headers`, which is
+    // merged into the response whether the request succeeded or failed.
+    let run_id = run_id_header(request.headers())?;
+    if let Some(run_id) = &run_id
+        && let Ok(value) = HeaderValue::from_str(run_id)
+    {
+        rate_headers.insert("x-run-id", value);
+    }
+
     let identity = auth::authenticate(state, request.headers()).await?;
 
     audit.identity(
@@ -116,7 +100,7 @@ async fn handle(
         identity.token_id.as_deref(),
     );
     audit.asserted(&identity.asserted);
-    audit.run_id(run_id);
+    audit.run_id(run_id.as_deref());
 
     // Resolve before the tenant/user limiters so a limit rejection is still
     // attributed to a route and can be audited meaningfully.
