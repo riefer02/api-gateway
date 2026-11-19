@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 280 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 281 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned

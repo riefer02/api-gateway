@@ -257,35 +257,36 @@ impl Egress {
     }
 }
 
-/// `::ffff:169.254.169.254` must be judged as the IPv4 address it is, not as
-/// an arbitrary IPv6 address that happens to be unique-local.
-fn unmapped(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(address, IpAddr::V4),
-        IpAddr::V4(_) => address,
-    }
-}
-
+/// `::ffff:169.254.169.254` must be judged as the IPv4 address it is, and the
+/// deprecated IPv4-compatible `::a.b.c.d` form must not be a way around it.
+/// `::1` is checked as IPv6 first: it is loopback, not mapped `0.0.0.1`.
 fn is_local_or_metadata(address: IpAddr) -> bool {
-    match unmapped(address) {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-        }
+    match address {
+        IpAddr::V4(v4) => is_forbidden_v4(v4),
         IpAddr::V6(v6) => {
-            v6.is_loopback()
+            if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || v6.is_unicast_link_local()
                 || v6 == METADATA_V6
+            {
+                return true;
+            }
+
+            v6.to_ipv4()
+                .is_some_and(is_forbidden_v4)
         }
     }
+}
+
+fn is_forbidden_v4(address: std::net::Ipv4Addr) -> bool {
+    address.is_loopback()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        || address.is_multicast()
+        || address.is_documentation()
+        || is_public_cloud_metadata(address)
 }
 
 fn is_public(address: IpAddr) -> bool {
@@ -293,10 +294,20 @@ fn is_public(address: IpAddr) -> bool {
         return false;
     }
 
-    match unmapped(address) {
+    match address {
         IpAddr::V4(v4) => !v4.is_private() && !is_carrier_grade_nat(v4),
-        IpAddr::V6(v6) => !v6.is_unique_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4() {
+            Some(v4) => !v4.is_private() && !is_carrier_grade_nat(v4),
+            None => !v6.is_unique_local(),
+        },
     }
+}
+
+/// Metadata endpoints that do not live in link-local and would otherwise be
+/// reachable under `DenyLinkLocal`: Alibaba Cloud and Oracle Cloud.
+fn is_public_cloud_metadata(address: std::net::Ipv4Addr) -> bool {
+    address == std::net::Ipv4Addr::new(100, 100, 100, 200)
+        || address == std::net::Ipv4Addr::new(192, 0, 0, 192)
 }
 
 /// 100.64.0.0/10, the carrier-grade NAT range. `Ipv4Addr::is_shared` is still
@@ -373,7 +384,11 @@ mod egress_tests {
         for blocked in [
             "169.254.169.254",
             "::ffff:169.254.169.254",
+            "::169.254.169.254",
+            "100.100.100.200",
+            "192.0.0.192",
             "fd00:ec2::254",
+            "::127.0.0.1",
             "127.0.0.1",
             "::1",
             "0.0.0.0",

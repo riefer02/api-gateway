@@ -35,6 +35,12 @@ pub(crate) struct ToolShape {
 
 impl ToolShape {
     fn from_schema(schema: &Value) -> Self {
+        const MAX_REQUIRED: usize = 64;
+        const MAX_NAME: usize = 128;
+
+        // A shape is retained for the cache TTL, and an upstream chooses how
+        // large one is. Bounding both keeps a hostile or merely enormous
+        // `required` list from becoming resident memory.
         let required = schema
             .get("required")
             .and_then(Value::as_array)
@@ -42,6 +48,8 @@ impl ToolShape {
                 names
                     .iter()
                     .filter_map(Value::as_str)
+                    .filter(|name| !name.is_empty() && name.len() <= MAX_NAME)
+                    .take(MAX_REQUIRED)
                     .map(str::to_owned)
                     .collect()
             })
@@ -224,6 +232,25 @@ mod tests {
                 .get("u", "search_tickets")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_hostile_schema_cannot_retain_an_unbounded_field_list() {
+        let cache = cache();
+        let required: Vec<String> = (0..1_000)
+            .map(|index| format!("field_{index}"))
+            .collect();
+        let list = json!({
+            "result": {"tools": [{
+                "name": "big",
+                "inputSchema": {"type": "object", "required": required}
+            }]}
+        });
+
+        learn(&list, "u", &cache);
+
+        let shape = cache.get("u", "big").expect("learned");
+        assert_eq!(shape.required.len(), 64);
     }
 
     #[test]

@@ -1170,14 +1170,18 @@ fn claim_names(value: Option<String>, problems: &mut Vec<String>) -> Vec<String>
             continue;
         }
 
-        let valid = name.len() <= 32
+        // Namespaced and hyphenated claims are common (Keycloak emits URLs);
+        // anything safe as a JSON key and a header-adjacent identifier is
+        // accepted. No whitespace or control characters.
+        let valid = name.len() <= 64
             && name
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/'));
 
         if !valid {
             problems.push(format!(
-                "AUDIT_CLAIMS: `{name}` must be 1-32 characters of a-z, 0-9 or _"
+                "AUDIT_CLAIMS: `{name}` must be 1-64 characters of letters, digits, \
+                 `_`, `-`, `.`, `:` or `/`"
             ));
             continue;
         }
@@ -1830,7 +1834,7 @@ mod tests {
     #[test]
     fn audit_claim_names_are_validated() {
         let mut values = oauth_environment();
-        values.insert("AUDIT_CLAIMS".to_owned(), "Project-ID".to_owned());
+        values.insert("AUDIT_CLAIMS".to_owned(), "has space".to_owned());
 
         let error = Config::from_source(&values).expect_err("invalid claim name");
 

@@ -31,6 +31,18 @@ versions follow [Semantic Versioning](https://semver.org).
   per-tool quota shares one bucket instead of one per invented name.
 - **An upstream cannot choose the `X-Run-Id` echo.** It is a gateway-owned response header,
   and a duplicate request header is refused rather than first-wins.
+- **Egress covers more than the two obvious metadata addresses.** Alibaba Cloud
+  (`100.100.100.200`) and Oracle Cloud (`192.0.0.192`) metadata endpoints are blocked under
+  the default policy, and IPv4-compatible IPv6 (`::a.b.c.d`) is judged as the address it
+  embeds without mistaking `::1` for `0.0.0.1`.
+- **A learned schema cannot retain unbounded memory.** `required` is capped at 64 fields of
+  128 bytes, because the shape lives for the cache TTL and an upstream chooses its size.
+- **`AUDIT_CLAIMS` accepts namespaced names.** Up to 64 characters of letters, digits and
+  `_ - . : /`, so a URL-shaped Keycloak claim can be recorded; whitespace and control
+  characters remain refused.
+- **The example environment ships the safe egress default.** `.env.example` now sets
+  `deny-link-local`; running the MCP stub on host loopback needs an explicit local
+  override, and `allow-all` produces a startup advisory in any environment.
 - **`tools/list` buffering is bounded and configurable.** Filtering parses the whole
   catalogue into a `serde_json::Value`, which costs several times the raw bytes; the
   hard-coded 4 MiB ceiling could turn one legitimate large catalogue into an
