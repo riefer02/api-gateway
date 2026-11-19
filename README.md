@@ -368,8 +368,9 @@ The metrics endpoint shares the public listener — keep it off the edge with ne
 
 ## Performance
 
-Measured with `just bench` on the development machine over loopback: release build, 50
-concurrent connections, 10 s, warm credential cache, rate limits disabled, `LOG_LEVEL=warn`.
+Measured 2026-11-19 with `just bench` on the development machine over loopback: release
+build, 50 concurrent connections, 10 s, warm credential cache, rate limits disabled,
+`LOG_LEVEL=warn`.
 
 | Path | Throughput | p50 | p99 |
 |---|---:|---:|---:|
@@ -386,7 +387,9 @@ Two things the same harness taught us:
   produced `429`s at the configured rate rather than timeouts.
 
 These are loopback numbers: they measure gateway overhead, not your network or upstreams.
-Reproduce with `just bench`.
+Reproduce with `just bench`. Replicated behaviour — per-replica limits, failover,
+revocation, breaker and bulkhead — is measured separately with the local cluster; see
+[`deploy/local/README.md`](deploy/local/README.md).
 
 ## Configuration
 
@@ -482,7 +485,7 @@ as you like behind one load balancer, all pointing at the same Postgres.
 |---|---|---|
 | Route table | per replica | each replica polls `route_table_state.version` and swaps its snapshot |
 | Credential cache | per replica | revocations publish `pg_notify`; every replica invalidates on `LISTEN` |
-| Rate limits | **per replica** | deliberately not shared — N replicas allow N × the configured rate |
+| Rate limits | **per replica** | deliberately not shared — N replicas allow N × the configured rate; measured at 15/24 round-robin against 5/24 sticky in `deploy/local` |
 | Retry budget | **per replica** | same arithmetic |
 | Circuit breakers | per replica | each replica learns an upstream's health independently |
 | JWKS cache | per replica | each replica fetches and refreshes the issuer's keys independently |
@@ -490,6 +493,11 @@ as you like behind one load balancer, all pointing at the same Postgres.
 | Data audit | per replica queue, shared table | batched inserts; a full queue drops with a metric |
 | Upstream connections | per replica | one pooled client per upstream config; idle sockets bounded by `UPSTREAM_POOL_MAX_IDLE_PER_HOST` |
 | Migrations | global | sqlx takes an advisory lock, so concurrent starters serialise |
+
+Every in-process structure is bounded: limiter buckets are swept and capped per shard,
+the credential and schema caches have per-shard caps and TTLs, a full audit queue drops
+with a metric, and the breaker and bulkhead registries reset at 4096 tracked upstreams
+rather than growing with the history of the control plane.
 
 Prove the interesting half locally, with no cluster:
 
@@ -654,19 +662,18 @@ api-gateway admin route put mcp \
 
 - Record-level authorization. The MCP server or data API decides which records a
   user may read; the gateway decides which tools they may call.
-- Prompt-injection and tool-poisoning defence beyond tool allow-lists, output caps,
-  and the planned schema pinning. Do not claim the gateway makes an unsafe tool
-  safe.
+- Prompt-injection and tool-poisoning defence beyond tool allow-lists, output caps
+  and argument shapes. Do not claim the gateway makes an unsafe tool safe.
 - Full JSON Schema validation. The gateway checks that arguments are an object and
   that advertised `required` fields are present; types, formats, `oneOf` and the
-  rest are the tool's business. Schema *pinning* — refusing a tool whose definition
-  changed after approval — is not built either, so a poisoned `tools/list` is
-  filtered for authorization but not for intent.
+  rest are the tool's business.
+- Schema *pinning* — refusing a tool whose definition changed after approval — so a
+  poisoned `tools/list` is filtered for authorization but not for intent.
 - Opaque-token introspection. JWT access tokens are supported; introspection is a
   deliberate seam, not a silent fallback.
 - A static upstream credential store. Token exchange is the supported path; a
   service credential is a documented residual risk, not a default.
-- Tool-schema pinning/drift alerts and a human approval workflow for write tools.
+- Drift alerts for a pinned schema, and a human approval workflow for write tools.
 - DLP/PII inspection of tool output.
 - Virtual MCP aggregation across multiple upstream servers.
 - Multi-tenant admin and shared deployments. v1 is one organization per deployment.

@@ -589,6 +589,12 @@ components:
           type: [string, "null"]
         token_id:
           type: [string, "null"]
+        detail:
+          type: object
+          description: |
+            Configured token claims (`AUDIT_CLAIMS`) and the caller's `X-Run-Id`.
+            Identifiers only, never payloads.
+          additionalProperties: true
     AuditEntry:
       type: object
       required: [occurred_at, actor, action, subject]

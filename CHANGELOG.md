@@ -187,7 +187,7 @@ versions follow [Semantic Versioning](https://semver.org).
   insert time; pruning is advisory-locked and batched; shutdown drain uses the
   process budget and reports a timeout.
 - **Streaming.** Response bodies have an idle timeout; `max_response_bytes: 0` means
-  unlimited; filtered policy responses are capped at 4 MiB.
+  unlimited; filtered policy responses are capped by `MCP_FILTER_MAX_BYTES`.
 - **Demo stub binding.** `examples/mcp_stub.rs` now honors `MCP_STUB_HOST` (default
   loopback). It previously bound `127.0.0.1` unconditionally, so the gateway container
   could not reach it in the compose demo.

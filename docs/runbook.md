@@ -12,14 +12,16 @@ from your environment; define them from `ADMIN_TOKENS`/`METRICS_TOKEN` first.
 
 ```bash
 curl -sf localhost:8080/health   # process alive
-curl -sf localhost:8080/ready    # database + route table healthy
+curl -sf localhost:8080/ready    # route table fresh; database reachable (or cached)
 curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics \
   | grep -E 'gateway_(requests|circuit|upstream)'
 ```
 
-`/ready` fails when Postgres is unreachable **or** the route table has not refreshed within
-its staleness window. It does **not** mean the process is unhealthy: keep it running so it
-can recover, but take it out of rotation.
+`/ready` fails when the route table has not refreshed within its staleness window, when the
+compiler rejected the current configuration, or when Postgres has been unreachable for
+longer than the credential cache can cover. A short database blip is tolerated on purpose:
+the process can still serve from cache, and draining the fleet would turn the blip into an
+outage. It does **not** mean the process is unhealthy: keep it running so it can recover.
 
 ## Rotate a customer's key
 
@@ -111,6 +113,19 @@ curl -s "$ADMIN/v1/audit?limit=50" -H "Authorization: Bearer $TOKEN"
 Rows carry the actor bound to the admin token, the action, the subject, the source IP, and
 the request id from the response. Tokens can be scoped (`config:read`, `keys:write`, …), so
 `actor` answers *who* and the token's scopes bound *what they could do*.
+
+## Audit integrity
+
+```bash
+api-gateway admin audit verify
+```
+
+Walks the control-plane chain from the oldest retained row and exits non-zero at the first
+row that does not verify. Rows written before the chain (or by a replica that had not been
+upgraded) are counted as outside the chain, not trusted. A mixed-version rollout can
+therefore look like a break until every replica runs the current version: verify after the
+upgrade, not during it. The chain is unkeyed and anchored at the oldest retained row, so it
+detects edits and reordering, not a writer who recomputes the suffix or prunes the head.
 
 ## Decommission
 
