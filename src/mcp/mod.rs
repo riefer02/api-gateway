@@ -148,6 +148,18 @@ impl AllowedTools {
     }
 }
 
+/// Where a learned tool schema is recorded.
+///
+/// A named pair rather than a tuple so the call site says which string is the
+/// upstream, and so schema pinning can be added here without changing the
+/// filter's shape again.
+#[derive(Clone)]
+pub(crate) struct SchemaSink {
+    pub(crate) cache: std::sync::Arc<schema::SchemaCache>,
+    /// The upstream the listed tools belong to; schemas are scoped by it.
+    pub(crate) upstream: String,
+}
+
 /// Response filtering instructions for a `tools/list` request.
 #[derive(Clone)]
 pub(crate) struct ToolFilter {
@@ -155,9 +167,8 @@ pub(crate) struct ToolFilter {
     /// `tools/list` must return a `result.tools` array; discovery and error
     /// envelopes must pass through unchanged.
     pub(crate) require_tools: bool,
-    /// Where learned tool schemas go, and the upstream they belong to. `None`
-    /// disables schema learning, and therefore input validation.
-    pub(crate) schemas: Option<(std::sync::Arc<schema::SchemaCache>, String)>,
+    /// `None` disables schema learning, and therefore input validation.
+    pub(crate) schemas: Option<SchemaSink>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -362,8 +373,8 @@ pub(crate) fn filter_tool_list(body: &[u8], filter: &ToolFilter) -> Option<Vec<u
     // Learn before filtering: the shapes belong to the tools that were listed,
     // whether or not this caller may see them, and a filtered list still tells
     // the gateway what a permitted tool requires.
-    if let Some((cache, upstream)) = &filter.schemas {
-        schema::learn(&value, upstream, cache);
+    if let Some(sink) = &filter.schemas {
+        schema::learn(&value, &sink.upstream, &sink.cache);
     }
 
     if !filter_value(&mut value, filter) {

@@ -391,7 +391,10 @@ async fn apply_tool_policy(
                 schemas: state
                     .mcp_schemas
                     .as_ref()
-                    .map(|cache| (Arc::clone(cache), route.upstream.id.clone())),
+                    .map(|cache| mcp::SchemaSink {
+                        cache: Arc::clone(cache),
+                        upstream: route.upstream.id.clone(),
+                    }),
             });
 
             // Per-tool quota. Only calls the policy already allowed reach
