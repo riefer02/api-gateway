@@ -209,7 +209,61 @@ fn chain_hash(
         "detail": detail,
     });
 
-    hex::encode(sha2::Sha256::digest(material.to_string().as_bytes()))
+    hex::encode(sha2::Sha256::digest(canonical_json(&material).as_bytes()))
+}
+
+/// Serialises a value with object keys in byte order, at every depth.
+///
+/// `serde_json` happens to sort keys because its map is a `BTreeMap`, but that
+/// is a property of a feature flag: enabling `preserve_order` anywhere in the
+/// dependency graph would make serialisation follow insertion order. `detail`
+/// is stored as `jsonb`, which returns keys in its own order (length first,
+/// then bytes), so the write and the verify would then disagree and every hash
+/// would silently stop matching. Canonicalising here removes the dependency on
+/// how the map happens to be implemented.
+fn canonical_json(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+
+            out.push('{');
+
+            for (index, (key, value)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+
+                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push(':');
+                write_canonical(value, out);
+            }
+
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+
+                write_canonical(item, out);
+            }
+
+            out.push(']');
+        }
+        scalar => out.push_str(&serde_json::to_string(scalar).unwrap_or_default()),
+    }
 }
 
 /// Walks the control-plane audit chain and reports the first row that does not
@@ -349,6 +403,17 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_sorts_keys_at_every_depth() {
+        let nested: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":{"z":2,"y":[{"d":4,"c":3}]}}"#).expect("json");
+
+        assert_eq!(
+            canonical_json(&nested),
+            r#"{"a":{"y":[{"c":3,"d":4}],"z":2},"b":1}"#
+        );
+    }
+
+    #[test]
     fn a_valid_chain_verifies() {
         let report = verify_rows(&chain_of_two());
 
@@ -469,14 +534,14 @@ mod tests {
 
         let actor = Actor::local("chain-test");
 
-        for _ in 0..2 {
+        for detail in [
+            serde_json::json!({"n": 1}),
+            // Keys whose jsonb order (length, then bytes) differs from their
+            // lexical order, so a hash that followed storage order would fail.
+            serde_json::json!({"zeta": 1, "alpha": 2, "mid": "x"}),
+        ] {
             service
-                .audit_best_effort(
-                    &actor,
-                    "chain.test",
-                    &unique("chain"),
-                    serde_json::json!({"n": 1}),
-                )
+                .audit_best_effort(&actor, "chain.test", &unique("chain"), detail)
                 .await;
         }
 
