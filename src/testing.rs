@@ -129,6 +129,7 @@ pub(crate) fn route(
             .expect("client"),
         timeout,
         pool_max_idle_per_host: 64,
+        egress: crate::net::Egress::AllowAll,
         audience: None,
         exchange_scope: None,
     });

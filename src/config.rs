@@ -269,6 +269,8 @@ pub struct RoutingConfig {
     /// Empty means "allow any host"; production requires a non-empty list.
     pub allow_hosts: Vec<String>,
     pub refresh_interval: Duration,
+    /// What an allowlisted upstream hostname is allowed to resolve to.
+    pub egress: crate::net::Egress,
     /// Idle sockets kept per upstream client, per replica. It is per client,
     /// not per host: routes that differ in timeout, audience or exchange
     /// scope get their own client, and each keeps up to this many sockets to
@@ -503,6 +505,20 @@ impl Config {
                 2_000_u64,
                 &mut problems,
             )),
+            egress: match source
+                .get("UPSTREAM_EGRESS")
+                .as_deref()
+                .map(str::trim)
+            {
+                None | Some("") => crate::net::Egress::default(),
+                Some(raw) => crate::net::Egress::parse(raw).unwrap_or_else(|| {
+                    problems.push(format!(
+                        "UPSTREAM_EGRESS must be `allow-all`, `deny-link-local` or \
+                         `deny-private` (got `{raw}`)"
+                    ));
+                    crate::net::Egress::default()
+                }),
+            },
             pool_max_idle_per_host: number_or(
                 source,
                 "UPSTREAM_POOL_MAX_IDLE_PER_HOST",
@@ -1268,6 +1284,32 @@ mod tests {
         assert!(config.auth.dev_api_key_secret.is_none());
         assert!(config.routing.allow_hosts.is_empty());
         assert_eq!(config.auth.pepper.expose(), DEVELOPMENT_PEPPER);
+    }
+
+    #[test]
+    fn egress_defaults_to_blocking_link_local_and_parses_overrides() {
+        let config = Config::from_source(&valid_development()).expect("valid config");
+        assert_eq!(config.routing.egress, crate::net::Egress::DenyLinkLocal);
+
+        let mut env = valid_development();
+        env.insert("UPSTREAM_EGRESS".to_owned(), "deny-private".to_owned());
+        assert_eq!(
+            Config::from_source(&env)
+                .expect("valid config")
+                .routing
+                .egress,
+            crate::net::Egress::DenyPrivate
+        );
+
+        let mut env = valid_development();
+        env.insert("UPSTREAM_EGRESS".to_owned(), "anything".to_owned());
+        let error = Config::from_source(&env).expect_err("invalid egress policy");
+
+        assert!(
+            error
+                .to_string()
+                .contains("UPSTREAM_EGRESS must be")
+        );
     }
 
     #[test]

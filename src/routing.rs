@@ -41,6 +41,10 @@ pub(crate) struct Upstream {
     /// assert the configured value reached the builder.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) pool_max_idle_per_host: usize,
+    /// The egress policy this client was built with, recorded for the same
+    /// reason: `reqwest` exposes no way to read a resolver back.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) egress: crate::net::Egress,
     /// RFC 8693 `audience` for the exchanged upstream token.
     pub(crate) audience: Option<String>,
     /// Optional scope to request during exchange.
@@ -151,6 +155,7 @@ impl RouteTable {
         allow_hosts: &[String],
         token_exchange_enabled: bool,
         pool_max_idle_per_host: usize,
+        egress: crate::net::Egress,
     ) -> Result<Self, Vec<String>> {
         let mut problems = Vec::new();
         let mut routes = Vec::with_capacity(rows.len());
@@ -184,6 +189,7 @@ impl RouteTable {
                 allow_hosts,
                 token_exchange_enabled,
                 pool_max_idle_per_host,
+                egress,
                 &mut upstreams,
                 &mut problems,
             );
@@ -497,6 +503,7 @@ fn compile_upstream(
     allow_hosts: &[String],
     token_exchange_enabled: bool,
     pool_max_idle_per_host: usize,
+    egress: crate::net::Egress,
     cache: &mut HashMap<UpstreamKey, Arc<Upstream>>,
     problems: &mut Vec<String>,
 ) -> Option<Arc<Upstream>> {
@@ -555,6 +562,9 @@ fn compile_upstream(
         // connections the upstream still counts against its own limit.
         .pool_max_idle_per_host(pool_max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(30))
+        // The allowlist approved a name; this decides which addresses that
+        // name may become, at the moment it is resolved.
+        .dns_resolver(Arc::new(crate::net::EgressResolver::new(egress)))
         .user_agent(concat!("api-gateway/", env!("CARGO_PKG_VERSION")))
         .build()
     {
@@ -574,6 +584,7 @@ fn compile_upstream(
         client,
         timeout,
         pool_max_idle_per_host,
+        egress,
         audience: row.audience.clone(),
         exchange_scope: row.exchange_scope.clone(),
     });
@@ -734,6 +745,7 @@ pub(crate) struct RouteSource {
     allow_hosts: Vec<String>,
     token_exchange_enabled: bool,
     pool_max_idle_per_host: usize,
+    egress: crate::net::Egress,
 }
 
 impl RouteSource {
@@ -742,12 +754,14 @@ impl RouteSource {
         allow_hosts: Vec<String>,
         token_exchange_enabled: bool,
         pool_max_idle_per_host: usize,
+        egress: crate::net::Egress,
     ) -> Self {
         Self {
             pool,
             allow_hosts,
             token_exchange_enabled,
             pool_max_idle_per_host,
+            egress,
         }
     }
 
@@ -808,6 +822,7 @@ impl RouteSource {
             &self.allow_hosts,
             self.token_exchange_enabled,
             self.pool_max_idle_per_host,
+            self.egress,
         )
         .map_err(RouteTableError::Invalid)
     }
@@ -956,24 +971,30 @@ mod tests {
     }
 
     fn table(rows: Vec<RouteRow>) -> RouteTable {
-        RouteTable::compile(1, rows, &[], false, 64).expect("valid route table")
+        RouteTable::compile(1, rows, &[], false, 64, crate::net::Egress::AllowAll)
+            .expect("valid route table")
     }
 
     #[test]
     fn compiles_upstreams_with_the_configured_idle_pool_bound() {
-        let table = RouteTable::compile(1, vec![row("api", "/api", &["GET"])], &[], false, 7)
-            .expect("valid route table");
+        let table = RouteTable::compile(
+            1,
+            vec![row("api", "/api", &["GET"])],
+            &[],
+            false,
+            7,
+            crate::net::Egress::AllowAll,
+        )
+        .expect("valid route table");
 
         // The closest observable proxy: reqwest exposes no way to read a
         // pool's configuration back, so the builder and this record have to be
         // changed together. It still catches the value being dropped between
         // config and compile.
-        assert_eq!(
-            found(&table, HttpMethod::GET, "/api")
-                .upstream
-                .pool_max_idle_per_host,
-            7
-        );
+        let upstream = &found(&table, HttpMethod::GET, "/api").upstream;
+
+        assert_eq!(upstream.pool_max_idle_per_host, 7);
+        assert_eq!(upstream.egress, crate::net::Egress::AllowAll);
     }
 
     fn found<'a>(table: &'a RouteTable, method: HttpMethod, path: &str) -> &'a CompiledRoute {
@@ -1097,6 +1118,7 @@ mod tests {
             &[],
             false,
             64,
+            crate::net::Egress::AllowAll,
         )
         .expect_err("ambiguous table");
 
@@ -1115,6 +1137,7 @@ mod tests {
             &["allowed.example".to_owned()],
             false,
             64,
+            crate::net::Egress::AllowAll,
         )
         .expect_err("host not allowed");
 
@@ -1240,7 +1263,8 @@ mod tests {
         route.tool_policy = serde_json::json!({"mode": "allow_list", "roles": {}});
 
         let problems =
-            RouteTable::compile(1, vec![route], &[], false, 64).expect_err("invalid policy");
+            RouteTable::compile(1, vec![route], &[], false, 64, crate::net::Egress::AllowAll)
+                .expect_err("invalid policy");
         assert!(problems[0].contains("at least one role"));
     }
 
@@ -1456,7 +1480,13 @@ mod behaviour_tests {
             return;
         };
 
-        let source = RouteSource::new(pool.clone(), Vec::new(), false, 64);
+        let source = RouteSource::new(
+            pool.clone(),
+            Vec::new(),
+            false,
+            64,
+            crate::net::Egress::AllowAll,
+        );
 
         let before = source.version().await.expect("version");
 

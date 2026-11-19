@@ -211,3 +211,229 @@ mod property_tests {
         }
     }
 }
+
+/// Which outbound addresses an upstream may resolve to.
+///
+/// The hostname allowlist decides *what the gateway is allowed to talk to*;
+/// this decides *what that name is allowed to become*. Without it, an
+/// allowlisted hostname that resolves to the instance metadata service, or to
+/// the gateway's own admin listener, is reachable — the check validated a
+/// string, not a socket.
+///
+/// Filtering happens when the address is resolved, and the filtered addresses
+/// are what the client connects to, so there is no window between the check
+/// and the connection for DNS to change its answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Egress {
+    /// No address filtering. Correct only when upstreams legitimately live on
+    /// loopback, which is a development shape, not a deployed one.
+    AllowAll,
+    /// Public, private and unique-local addresses are allowed; loopback,
+    /// link-local, unspecified, multicast and the cloud metadata endpoints are
+    /// not. The default: a VPC upstream works, `169.254.169.254` does not.
+    #[default]
+    DenyLinkLocal,
+    /// Public unicast only. For deployments whose upstreams are all on the
+    /// internet and which want to be unable to reach internal networks.
+    DenyPrivate,
+}
+
+impl Egress {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "allow-all" => Some(Self::AllowAll),
+            "deny-link-local" => Some(Self::DenyLinkLocal),
+            "deny-private" => Some(Self::DenyPrivate),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn allows(self, address: IpAddr) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::DenyLinkLocal => !is_local_or_metadata(address),
+            Self::DenyPrivate => is_public(address),
+        }
+    }
+}
+
+/// `::ffff:169.254.169.254` must be judged as the IPv4 address it is, not as
+/// an arbitrary IPv6 address that happens to be unique-local.
+fn unmapped(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(address, IpAddr::V4),
+        IpAddr::V4(_) => address,
+    }
+}
+
+fn is_local_or_metadata(address: IpAddr) -> bool {
+    match unmapped(address) {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6 == METADATA_V6
+        }
+    }
+}
+
+fn is_public(address: IpAddr) -> bool {
+    if is_local_or_metadata(address) {
+        return false;
+    }
+
+    match unmapped(address) {
+        IpAddr::V4(v4) => !v4.is_private() && !is_carrier_grade_nat(v4),
+        IpAddr::V6(v6) => !v6.is_unique_local(),
+    }
+}
+
+/// 100.64.0.0/10, the carrier-grade NAT range. `Ipv4Addr::is_shared` is still
+/// unstable, so the prefix is spelled out.
+fn is_carrier_grade_nat(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+/// The IPv6 instance metadata endpoint, which lives in the unique-local range
+/// and would otherwise pass the `DenyLinkLocal` rule.
+const METADATA_V6: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254);
+
+/// Resolves a name and keeps only the addresses the policy allows.
+///
+/// A resolver rather than a one-time check: reqwest connects to exactly what
+/// this returns, so a second lookup cannot return a different answer, and a
+/// multi-address upstream keeps its failover instead of being pinned to one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EgressResolver {
+    policy: Egress,
+}
+
+impl EgressResolver {
+    pub(crate) fn new(policy: Egress) -> Self {
+        Self { policy }
+    }
+}
+
+impl reqwest::dns::Resolve for EgressResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let policy = self.policy;
+
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("could not resolve `{host}`: {error}").into()
+                })?;
+
+            let allowed: Vec<std::net::SocketAddr> = resolved
+                .filter(|socket| policy.allows(socket.ip()))
+                .collect();
+
+            if allowed.is_empty() {
+                // Fail closed and say why, without echoing an address that may
+                // be internal: the message names the host, not the target.
+                return Err(format!(
+                    "`{host}` resolves only to addresses the egress policy forbids"
+                )
+                .into());
+            }
+
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    fn ip(raw: &str) -> IpAddr {
+        raw.parse().expect("valid address")
+    }
+
+    #[test]
+    fn link_local_policy_blocks_metadata_and_loopback_but_not_internal_upstreams() {
+        let policy = Egress::DenyLinkLocal;
+
+        for blocked in [
+            "169.254.169.254",
+            "::ffff:169.254.169.254",
+            "fd00:ec2::254",
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "fe80::1",
+            "224.0.0.1",
+        ] {
+            assert!(!policy.allows(ip(blocked)), "{blocked} should be refused");
+        }
+
+        for allowed in [
+            "10.1.2.3",
+            "172.16.0.5",
+            "192.168.1.10",
+            "fd12:3456::1",
+            "93.184.216.34",
+        ] {
+            assert!(policy.allows(ip(allowed)), "{allowed} should be allowed");
+        }
+    }
+
+    #[test]
+    fn private_policy_allows_public_unicast_only() {
+        let policy = Egress::DenyPrivate;
+
+        for blocked in ["10.0.0.1", "100.64.1.1", "fd00::1", "192.168.0.1"] {
+            assert!(!policy.allows(ip(blocked)), "{blocked} should be refused");
+        }
+
+        assert!(policy.allows(ip("93.184.216.34")));
+        assert!(policy.allows(ip("2606:2800:220:1::1")));
+    }
+
+    #[test]
+    fn allow_all_filters_nothing() {
+        let policy = Egress::AllowAll;
+
+        assert!(policy.allows(ip("127.0.0.1")));
+        assert!(policy.allows(ip("169.254.169.254")));
+    }
+
+    #[tokio::test]
+    async fn the_resolver_drops_forbidden_addresses() {
+        use reqwest::dns::{Name, Resolve};
+
+        let name: Name = "localhost".parse().expect("valid name");
+
+        let refused = EgressResolver::new(Egress::DenyLinkLocal)
+            .resolve(name)
+            .await;
+
+        assert!(
+            refused.is_err(),
+            "localhost must not resolve under the default policy"
+        );
+
+        let name: Name = "localhost".parse().expect("valid name");
+        let allowed = EgressResolver::new(Egress::AllowAll)
+            .resolve(name)
+            .await;
+
+        assert!(allowed.is_ok(), "allow-all must still resolve localhost");
+    }
+}

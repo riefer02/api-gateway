@@ -7,6 +7,12 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Egress policy.** `UPSTREAM_EGRESS` decides what an allowlisted upstream hostname may
+  resolve to, applied by a filtering DNS resolver so the client connects to exactly the
+  addresses that passed: `deny-link-local` (default; blocks loopback, link-local, the IPv4
+  and IPv6 metadata endpoints, multicast and unspecified, while allowing VPC addresses),
+  `deny-private` (public unicast only), or `allow-all`. Previously the allowlist validated
+  a string at compile time and any address the name resolved to was reachable.
 - **MCP argument validation.** On a tool-policy route the gateway learns each
   tool's `inputSchema` from `tools/list` and refuses a `tools/call` whose arguments
   are not an object, or that omits an advertised `required` field, with JSON-RPC
