@@ -7,6 +7,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The one experiment that needs a small limit; the others disable it so their
+# own measurements are not dominated by 429s.
+export TENANT_LIMIT="${TENANT_LIMIT:-6}"
+
 COMPOSE=(docker compose -f deploy/local/compose.yml)
 BASE="http://127.0.0.1:${CLUSTER_PORT:-8000}"
 TOKEN="dev-local.local-secret"

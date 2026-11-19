@@ -30,6 +30,12 @@ pub(crate) enum Command {
     Admin(AdminArgs),
     /// Probe the local gateway (container healthcheck)
     Healthcheck,
+    /// Wait, then exit. Used as a Kubernetes preStop hook so the endpoint is
+    /// removed from rotation before the process is asked to drain.
+    Prestop {
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+    },
 }
 
 #[derive(Debug, Args)]

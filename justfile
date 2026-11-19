@@ -69,6 +69,15 @@ cluster-down:
 cluster-limit:
     ./scripts/cluster-limit-demo.sh
 
+cluster-failover:
+    ./scripts/cluster-failover-demo.sh
+
+cluster-revocation:
+    ./scripts/cluster-revocation-demo.sh
+
+cluster-fault:
+    ./scripts/cluster-fault-demo.sh
+
 # Measures gateway overhead against a local stub upstream
 bench:
     ./scripts/bench.sh

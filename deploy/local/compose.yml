@@ -22,7 +22,13 @@ x-gateway: &gateway
     DEV_API_KEY_SECRET: local-secret
     DEV_API_KEY_SCOPES: read
     ADMIN_BIND: 0.0.0.0:9090
-    UPSTREAM_ALLOW_HOSTS: stub
+    UPSTREAM_ALLOW_HOSTS: stub,toxiproxy
+    # Long enough that a revocation cannot be explained by cache expiry: the
+    # revocation experiment measures the pg_notify path, not the TTL.
+    AUTH_CACHE_TTL_SECS: "300"
+    # Small values so a fault experiment finishes in seconds.
+    CIRCUIT_FAILURE_THRESHOLD: "3"
+    CIRCUIT_COOLDOWN_SECS: "2"
     # The stub is a compose service, so it is on a private network address:
     # the strict default allows that and still refuses metadata and loopback.
     UPSTREAM_EGRESS: deny-link-local
@@ -30,7 +36,7 @@ x-gateway: &gateway
     TRUSTED_PROXIES: 172.16.0.0/12
     ROUTE_REFRESH_INTERVAL_MS: "1000"
     # Small and deliberately awkward: the demo measures the N x effect.
-    RATE_LIMIT_TENANT_PER_MINUTE: "6"
+    RATE_LIMIT_TENANT_PER_MINUTE: ${TENANT_LIMIT:-6}
     RATE_LIMIT_IP_PER_MINUTE: "0"
     RATE_LIMIT_USER_PER_MINUTE: "0"
   expose:
@@ -77,6 +83,14 @@ services:
     <<: *gateway
     deploy:
       replicas: 3
+
+  # Fault injection for the flaky route. TCP-level, so it works on macOS
+  # where `tc netem` does not.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${TOXIPROXY_PORT:-8474}:8474"
 
   proxy:
     image: traefik:v3

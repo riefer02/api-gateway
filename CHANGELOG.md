@@ -5,8 +5,21 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- **Local cluster harness and experiments.** `deploy/local` runs three replicas behind
+  Traefik with Toxiproxy for fault injection, and four scripts measure the behaviours the
+  documentation asserts: per-replica limits (15/24 round-robin against 5/24 sticky), a
+  replica leaving under load, revocation propagation (12 ms against a 300 s cache), and a
+  slow upstream tripping the circuit breaker.
+- **`api-gateway prestop`.** A `preStop` hook for Kubernetes: the endpoint has to leave
+  rotation before the drain starts, which the experiment showed is not optional.
+
 ### Fixed
 
+- **A request deadline now charges the circuit breaker.** The timeout wrapped the proxied
+  call, so the call never returned and the breaker never saw a failure — it protected
+  against fast failures but not slow ones.
 - **Clearing a row's chain marker is detected.** An unchained row after the chain has
   started is a break, not a gap: otherwise clearing `chained` on a suffix would present an
   edited log as intact. The cost is stated: a mixed-version rollout produces a break until

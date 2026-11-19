@@ -66,6 +66,14 @@ spec:
               memory: 128Mi
             limits:
               memory: 512Mi
+          lifecycle:
+            # kube-proxy removes the endpoint on the same signal that starts
+            # the drain, so a request can arrive between the two. Waiting first
+            # lets routing settle; the 25s drain budget still fits inside the
+            # 30s grace period.
+            preStop:
+              exec:
+                command: ["/usr/local/bin/api-gateway", "prestop", "--seconds", "5"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

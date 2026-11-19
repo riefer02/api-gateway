@@ -37,6 +37,11 @@ async fn main() -> ExitCode {
         Command::Serve(args) => serve::run(args).await,
         Command::Admin(args) => admin::cli::run(args).await,
         Command::Healthcheck => admin::cli::healthcheck().await,
+        Command::Prestop { seconds } => {
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+
+            Ok(())
+        }
     };
 
     match outcome {

@@ -213,7 +213,16 @@ async fn handle(
             None => Ok(response),
         },
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(AppError::RequestTimeout),
+        Err(_) => {
+            // A deadline is a failure of the upstream too. Without this the
+            // breaker never protects against the slowest failure mode — the
+            // request never returns, so `forward` never records anything.
+            state
+                .breakers
+                .record_failure(&route.upstream.id);
+
+            Err(AppError::RequestTimeout)
+        }
     }
 }
 
