@@ -1213,6 +1213,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_run_id_is_echoed_on_an_unauthorized_response() {
+        let config = testing::config();
+        let app = crate::app::build_app(&config, testing::empty_state_with(&config));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api")
+                    .header("x-run-id", "run-401")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-run-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("run-401"),
+            "an unauthenticated failure must still carry the caller's correlation id"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upstream_cannot_choose_the_run_id_echo() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-run-id", "upstream-chose-this"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config();
+        let (app, token) =
+            app_with_policy_and_config(&upstream.uri(), crate::mcp::ToolPolicy::default(), &config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/swapi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-run-id", "caller-chose-this")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .headers()
+                .get("x-run-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("caller-chose-this"),
+            "the echo must be the id that was audited, not the upstream's"
+        );
+    }
+
+    #[tokio::test]
     async fn a_malformed_run_id_still_consumes_the_ip_limit() {
         let upstream = wiremock::MockServer::start().await;
 

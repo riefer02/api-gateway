@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 269 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 280 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -28,18 +28,25 @@ The guarantees are structural where they can be:
 
 - **Configuration fails closed.** A production deployment cannot start with a development
   secret, an empty upstream allowlist, or a missing pepper.
-- **Postgres is never on the request path.** Policy is compiled to memory and swapped
-  atomically, so a database outage cannot stop traffic the credential cache can still
-  serve — and readiness reflects that, rather than draining every replica on a blip.
-- **Every failure carries the request id**, and every tool call is attributable to a tenant
-  and a subject whether it was allowed or denied.
+- **Postgres is not on the steady-state request path.** Policy is compiled to memory and
+  swapped atomically. A credential-cache miss is one bounded read, and readiness keeps the
+  last good snapshot while that cache can still serve — the readiness window is never
+  shorter than the cache lifetime, so a database blip does not drain the fleet first.
+- **Every failure carries the request id.** Every request that reaches a route is audited
+  with its tenant and subject, whether allowed or denied, and with any claims the operator
+  configured. A JSON-RPC batch is one audited request naming its first tool.
 - **Header hygiene in both directions.** Hop-by-hop, `Connection`-named, forwarded,
   credential, trace and gateway-owned headers are stripped; redirects are never followed.
 - **Egress is resolved, not just parsed.** An allowlisted hostname is filtered by address
-  when it resolves, and the client connects to exactly what survived, so the metadata
-  service and the gateway's own loopback are unreachable by default.
-- **The control-plane audit is chained.** An edit, insertion or reordering breaks it at
-  a named row, and `admin audit verify` proves it rather than asserting it.
+  when it resolves, and the client connects to exactly what survived; IP literals are
+  checked at compile time. Loopback, link-local and the common cloud metadata endpoints
+  are unreachable under the default policy. `allow-all` exists for development on
+  loopback, and `UPSTREAM_EGRESS` cannot block every provider's metadata address.
+- **The control-plane audit is chained.** Every chained row carries its predecessor's hash
+  and its own; an edit or reordering breaks the chain at a named row, and
+  `admin audit verify` proves it rather than asserting it. The chase begins at the oldest
+  retained row, so retention is not mistaken for tampering, and rows written outside the
+  chain are marked and counted rather than trusted.
 - **An overloaded upstream sheds load.** With `UPSTREAM_MAX_CONCURRENCY` set, a permit is
   held for the life of the response body — so a long stream counts as the concurrency it
   is — and saturation answers `503` with `Retry-After` rather than queueing without bound.

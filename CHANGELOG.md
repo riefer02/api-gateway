@@ -7,6 +7,30 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- **The audit chain no longer trusts a missing hash.** A row is chained because
+  `audit_events.chained` says so, not because its hash happens to be present. Blanking
+  `row_hash` on a chained row is a break; a row written before the chain, or by a replica
+  that had not been upgraded, is a counted gap and does not invalidate the rows around it.
+  New rows link to the last chained row, so an un-upgraded writer cannot restart the chain
+  at genesis.
+- **Verification starts where the chain starts.** Retention deletes the oldest rows, so the
+  walk begins at the oldest surviving chained row instead of requiring genesis; `admin
+  audit verify` names that row, and exits non-zero when there are unhashed rows but nothing
+  chained to prove.
+- **Readiness no longer drains the fleet before the cache does.** The route-table staleness
+  window is now at least the credential-cache lifetime; previously it was 11 s against a
+  30 s cache, so a database outage took every replica out of rotation long before the
+  mechanism built to survive one was exhausted.
+- **The admin write path applies the egress policy.** An upstream literal the compiler
+  would reject is refused when it is stored, instead of being accepted and then failing
+  every route reload. Upgrade note: a literal loopback upstream now fails to compile under
+  the default `deny-link-local`; set `UPSTREAM_EGRESS=allow-all` for sidecar or local-stub
+  deployments.
+- **A wildcard tool grant no longer mints metric series.** When a role grants `"*"` every
+  tool name is caller-chosen, so `gateway_mcp_tool_calls_total` labels it `unlisted` and the
+  per-tool quota shares one bucket instead of one per invented name.
+- **An upstream cannot choose the `X-Run-Id` echo.** It is a gateway-owned response header,
+  and a duplicate request header is refused rather than first-wins.
 - **`tools/list` buffering is bounded and configurable.** Filtering parses the whole
   catalogue into a `serde_json::Value`, which costs several times the raw bytes; the
   hard-coded 4 MiB ceiling could turn one legitimate large catalogue into an
@@ -18,7 +42,8 @@ versions follow [Semantic Versioning](https://semver.org).
 - **Claim attribution and caller correlation.** `AUDIT_CLAIMS` copies named token claims
   (`project_id`, `agent_id`, …) into the data-plane audit's `detail`; only scalars pass,
   control characters and values over 128 bytes are refused rather than truncated, and a
-  refused claim increments `gateway_claim_rejected_total`. `X-Run-Id` is validated
+  refused claim increments `gateway_claim_rejected_total`. `GET /v1/data-audit` and
+  `admin audit data` return the `detail`, so the attribution is readable. `X-Run-Id` is validated
   (`[A-Za-z0-9._:-]{1,128}`), audited and echoed on the response including errors, so a
   client can join its logs to ours. Neither is used for authorization.
 - **Tamper-evident control-plane audit chain.** `audit_events` gains `prev_hash` and

@@ -923,6 +923,22 @@ IBtZQ7lereVwJCPn4Be5FQ==
         ));
     }
 
+    #[tokio::test]
+    async fn a_token_signed_with_an_unlisted_algorithm_is_rejected() {
+        let server = issuer(200).await;
+        let oauth = oauth(&server).await;
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test-key".to_owned());
+        let key = EncodingKey::from_secret(b"a-shared-secret").expect("hmac key");
+        let token = encode(&header, &valid_claims(), &key).expect("token");
+
+        assert!(matches!(
+            oauth.authenticate(&token).await,
+            Err(OAuthError::Invalid)
+        ));
+    }
+
     #[test]
     fn configured_claims_are_copied_and_the_rest_are_not() {
         let mut extra = std::collections::BTreeMap::new();

@@ -155,16 +155,11 @@ async fn handle(
     let requested_cap = route
         .max_response_bytes
         .unwrap_or(state.max_response_bytes);
-    let response_cap = if requested_cap == 0 {
-        u64::MAX
-    } else {
-        requested_cap
-    };
-    let response_cap = if filter_tools.is_some() {
-        response_cap.min(state.mcp_filter_max_bytes)
-    } else {
-        response_cap
-    };
+    let response_cap = buffered_cap(
+        requested_cap,
+        filter_tools.is_some(),
+        state.mcp_filter_max_bytes,
+    );
 
     request
         .extensions_mut()
@@ -396,16 +391,23 @@ async fn apply_tool_policy(
             // here, so a caller cannot mint buckets by inventing names.
             if let Some(limiter) = state.limits.tool.as_ref() {
                 for call in &evaluated.calls {
+                    // A wildcard grant has no bounded set of tool names, so
+                    // every call shares one bucket instead of minting a bucket
+                    // per invented name.
+                    let tool = if allowed.is_all() { "*" } else { &call.name };
+
                     check_limit(
                         limiter,
-                        &format!("tool:{}:{}", identity.tenant_id.as_str(), call.name),
+                        &format!("tool:{}:{tool}", identity.tenant_id.as_str()),
                         rate_headers,
                     )?;
                 }
             }
 
+            let named_tools = !allowed.is_all();
+
             for call in &evaluated.calls {
-                count_tool_call(identity, &call.name, "allow");
+                count_tool_call(identity, &call.name, "allow", named_tools);
             }
 
             if let Ok(length) = HeaderValue::from_str(&bytes.len().to_string()) {
@@ -424,7 +426,7 @@ async fn apply_tool_policy(
             audit.deny();
             metrics::counter!("gateway_mcp_invalid_params_total", "route" => route.id.clone())
                 .increment(1);
-            count_tool_call(identity, &tool, "invalid");
+            count_tool_call(identity, &tool, "invalid", !allowed.is_all());
 
             // A protocol error, not a transport failure: the client gets a
             // JSON-RPC body it can show the model.
@@ -450,7 +452,7 @@ async fn apply_tool_policy(
             audit.mcp(Some("tools/call"), Some(&tool));
             audit.deny();
             metrics::counter!("gateway_mcp_denied_total", "route" => route.id.clone()).increment(1);
-            count_tool_call(identity, &tool, "deny");
+            count_tool_call(identity, &tool, "deny", false);
 
             let body = mcp::denial_body(
                 id,
@@ -482,9 +484,17 @@ async fn apply_tool_policy(
 fn run_id_header(headers: &HeaderMap) -> Result<Option<String>, AppError> {
     const MAX: usize = 128;
 
-    let Some(value) = headers.get("x-run-id") else {
+    let mut values = headers.get_all("x-run-id").iter();
+    let Some(value) = values.next() else {
         return Ok(None);
     };
+
+    // Two ids would leave the audited one and the forwarded one different.
+    if values.next().is_some() {
+        return Err(AppError::bad_request(
+            "duplicate `x-run-id` header is not allowed",
+        ));
+    }
 
     let value = value
         .to_str()
@@ -673,12 +683,13 @@ fn check_limit(limiter: &RateLimiter, key: &str, headers: &mut HeaderMap) -> Res
 
 /// Per-tool call counter.
 ///
-/// The tool label carries the caller's own name only when the call was not
-/// denied. A denied name is caller-controlled, so labelling it would let
-/// anyone create unbounded metric series; those collapse to `unlisted`. The
-/// exact name is in the audit row, which is where investigation belongs.
-fn count_tool_call(identity: &auth::Principal, tool: &str, decision: &'static str) {
-    let tool = if decision == "deny" { "unlisted" } else { tool };
+/// The tool label carries the caller's own name only when the policy named
+/// that tool: a denied name is caller-controlled, and so is every name when the
+/// caller's role grants `"*"`. Both collapse to `unlisted`, or a caller could
+/// create unbounded metric series by inventing names. The exact name is in the
+/// audit row, which is where investigation belongs.
+fn count_tool_call(identity: &auth::Principal, tool: &str, decision: &'static str, bounded: bool) {
+    let tool = tool_metric_label(tool, decision, bounded);
 
     metrics::counter!(
         "gateway_mcp_tool_calls_total",
@@ -687,6 +698,27 @@ fn count_tool_call(identity: &auth::Principal, tool: &str, decision: &'static st
         "decision" => decision,
     )
     .increment(1);
+}
+
+fn tool_metric_label<'a>(tool: &'a str, decision: &str, bounded: bool) -> &'a str {
+    if decision == "deny" || !bounded {
+        "unlisted"
+    } else {
+        tool
+    }
+}
+
+/// The response cap actually applied. A filtered `tools/list` has to be held
+/// in memory and parsed, so it is additionally bounded by the filter ceiling;
+/// everything else keeps the route's own cap (zero meaning unlimited).
+fn buffered_cap(requested: u64, filtering: bool, filter_ceiling: u64) -> u64 {
+    let cap = if requested == 0 { u64::MAX } else { requested };
+
+    if filtering {
+        cap.min(filter_ceiling)
+    } else {
+        cap
+    }
 }
 
 fn header_value<T: ToString>(value: &T) -> HeaderValue {
@@ -716,6 +748,23 @@ mod tests {
     use axum::{body::Body, http::StatusCode, response::IntoResponse};
 
     use super::*;
+
+    #[test]
+    fn only_a_filtered_list_is_held_to_the_filter_ceiling() {
+        assert_eq!(buffered_cap(0, false, 1_048_576), u64::MAX);
+        assert_eq!(buffered_cap(0, true, 1_048_576), 1_048_576);
+        assert_eq!(buffered_cap(4096, true, 1_048_576), 4096);
+        assert_eq!(buffered_cap(8_388_608, true, 1_048_576), 1_048_576);
+        assert_eq!(buffered_cap(8_388_608, false, 1_048_576), 8_388_608);
+    }
+
+    #[test]
+    fn a_caller_chosen_tool_name_never_becomes_a_metric_label() {
+        assert_eq!(tool_metric_label("search", "allow", true), "search");
+        assert_eq!(tool_metric_label("invented", "allow", false), "unlisted");
+        assert_eq!(tool_metric_label("invented", "deny", false), "unlisted");
+        assert_eq!(tool_metric_label("search", "deny", true), "unlisted");
+    }
 
     #[tokio::test]
     async fn a_complete_body_keeps_its_size_and_releases_the_permit() {

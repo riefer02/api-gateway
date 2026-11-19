@@ -34,6 +34,13 @@ impl Config {
                 "AUTH_CACHE_TTL_SECS=0: every request reads credentials from Postgres".to_owned(),
             );
         }
+        if self.routing.egress == crate::net::Egress::AllowAll {
+            notes.push(
+                "UPSTREAM_EGRESS=allow-all: upstreams may resolve to loopback, link-local \
+                 or the metadata service"
+                    .to_owned(),
+            );
+        }
         if self.limits.ip_per_minute == 0 {
             notes.push("RATE_LIMIT_IP_PER_MINUTE=0: per-IP rate limiting is disabled".to_owned());
         }

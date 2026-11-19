@@ -73,8 +73,10 @@ const FORWARDED_HEADERS: &[&str] = &[
 /// them: `x-forwarded-*` covers for/host/proto/port and friends.
 const FORWARDED_PREFIXES: &[&str] = &["x-forwarded-"];
 
-/// Upstream identity headers: never forwarded to clients.
-const GATEWAY_OWNED_RESPONSE: &[&str] = &["server", "set-cookie"];
+/// Upstream identity headers: never forwarded to clients. `x-run-id` is the
+/// gateway's echo of what it audited; an upstream value would be a different
+/// id wearing the same name.
+const GATEWAY_OWNED_RESPONSE: &[&str] = &["server", "set-cookie", "x-run-id"];
 
 pub(crate) async fn forward(
     request: axum::extract::Request,

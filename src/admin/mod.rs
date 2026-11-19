@@ -190,6 +190,9 @@ pub(crate) struct DataAuditEntry {
     pub(crate) latency_ms: Option<u32>,
     pub(crate) request_id: Option<String>,
     pub(crate) token_id: Option<String>,
+    /// Configured claims and the caller's run id, as recorded. Identifiers
+    /// only; this is what makes a claim worth recording.
+    pub(crate) detail: serde_json::Value,
 }
 
 /// The control plane. One implementation, two adapters (CLI now, HTTP later).
@@ -197,7 +200,9 @@ pub(crate) struct AdminService {
     pool: PgPool,
     store: Arc<dyn ApiKeyStore>,
     verifier: Arc<KeyVerifier>,
-    allow_hosts: Vec<String>,
+    /// The routing policy the compiler will apply, so a write can be rejected
+    /// for the same reasons a reload would reject it.
+    routing: crate::config::RoutingConfig,
     max_request_timeout: std::time::Duration,
     token_exchange_enabled: bool,
 }
@@ -216,7 +221,7 @@ impl AdminService {
     pub(crate) fn new(
         pool: PgPool,
         verifier: Arc<KeyVerifier>,
-        allow_hosts: Vec<String>,
+        routing: crate::config::RoutingConfig,
         store: Arc<dyn ApiKeyStore>,
         max_request_timeout: std::time::Duration,
         token_exchange_enabled: bool,
@@ -225,7 +230,7 @@ impl AdminService {
             pool,
             store,
             verifier,
-            allow_hosts,
+            routing,
             max_request_timeout,
             token_exchange_enabled,
         }
@@ -530,7 +535,11 @@ impl AdminService {
         audience: Option<&str>,
         exchange_scope: Option<&str>,
     ) -> Result<(), AdminError> {
-        routing::validate_upstream_url(base_url, &self.allow_hosts).map_err(AdminError::Invalid)?;
+        let url = routing::validate_upstream_url(base_url, &self.routing.allow_hosts)
+            .map_err(AdminError::Invalid)?;
+        // The same verdict the compiler will reach, applied at write time so a
+        // stored row cannot fail every subsequent reload.
+        routing::reject_literal_egress(&url, self.routing.egress).map_err(AdminError::Invalid)?;
 
         if !(1..=300_000).contains(&timeout_ms) {
             return Err(AdminError::Invalid(
@@ -1207,7 +1216,8 @@ impl AdminService {
     ) -> Result<Vec<DataAuditEntry>, AdminError> {
         let rows = sqlx::query(
             "SELECT occurred_at, tenant_id, subject, assistant, auth_method, mcp_method,
-                    route_id, tool_name, decision, status, latency_ms, request_id, token_id
+                    route_id, tool_name, decision, status, latency_ms, request_id, token_id,
+                    detail
              FROM data_audit_events
              WHERE ($1::bigint IS NULL OR id < $1)
                AND ($2::timestamptz IS NULL OR occurred_at >= $2)
@@ -1266,6 +1276,9 @@ impl AdminService {
                         .map_err(AdminError::Store)?,
                     token_id: row
                         .try_get("token_id")
+                        .map_err(AdminError::Store)?,
+                    detail: row
+                        .try_get("detail")
                         .map_err(AdminError::Store)?,
                 })
             })
@@ -1410,7 +1423,7 @@ mod tests {
         let service = AdminService::new(
             pool.clone(),
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,
@@ -1476,7 +1489,7 @@ mod tests {
         let service = AdminService::new(
             pool.clone(),
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,
@@ -1523,7 +1536,7 @@ mod tests {
         let service = AdminService::new(
             pool.clone(),
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             true,
@@ -1620,7 +1633,7 @@ mod tests {
         let service = AdminService::new(
             pool.clone(),
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,
@@ -1687,7 +1700,7 @@ mod tests {
         let service = AdminService::new(
             pool.clone(),
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,
@@ -1801,7 +1814,7 @@ mod tests {
         let service = AdminService::new(
             pool.clone(),
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,
@@ -1862,6 +1875,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upstream_literal_must_pass_the_egress_policy() {
+        let Some(pool) = pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let mut routing = crate::routing::test_routing();
+        routing.egress = crate::net::Egress::DenyLinkLocal;
+
+        let store: Arc<dyn ApiKeyStore> =
+            Arc::new(crate::auth::store::InMemoryApiKeyStore::default());
+        let service = AdminService::new(
+            pool,
+            Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+            routing,
+            store,
+            std::time::Duration::from_secs(300),
+            false,
+        );
+
+        let actor = Actor::local("test");
+        let error = service
+            .put_upstream(
+                &actor,
+                &unique("literal-upstream"),
+                "http://127.0.0.1:9090",
+                5_000,
+                None,
+                None,
+            )
+            .await
+            .expect_err("loopback literal must be refused at write time");
+
+        assert!(
+            error
+                .to_string()
+                .contains("UPSTREAM_EGRESS"),
+            "expected an egress refusal, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_upstream_audience_requires_token_exchange() {
         let Some(pool) = pg_pool().await else {
             eprintln!("skipping: DATABASE_URL is not set");
@@ -1873,7 +1928,7 @@ mod tests {
         let service = AdminService::new(
             pool,
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,

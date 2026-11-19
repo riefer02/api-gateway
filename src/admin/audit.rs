@@ -18,8 +18,12 @@ use super::{Actor, AdminError};
 pub(crate) struct ChainReport {
     /// Rows whose hash was recomputed and matched.
     pub(crate) verified: usize,
-    /// Rows written before the chain existed; they carry no hash.
+    /// Unhashed rows before the chain starts. Rows retained after a prune are
+    /// not counted here: the walk begins at the oldest surviving hashed row.
     pub(crate) unchained: usize,
+    /// Id of the oldest hashed row the walk could verify. `None` means no
+    /// hashed row was found at all, which proves nothing either way.
+    pub(crate) chain_start: Option<i64>,
     /// First row that did not verify, if any.
     pub(crate) broken: Option<ChainBreak>,
 }
@@ -43,6 +47,10 @@ struct AuditRow {
     detail: serde_json::Value,
     prev_hash: String,
     row_hash: String,
+    /// False for rows written before the chain, or by a replica that had not
+    /// been upgraded. Their hash column is irrelevant: they are gaps, and a
+    /// hashed row that claims to be chained must still verify.
+    chained: bool,
 }
 
 /// The hash that anchors the chain before its first row.
@@ -69,16 +77,18 @@ pub(super) async fn insert(
         .execute(&mut *connection)
         .await?;
 
-    let previous: Option<String> =
-        sqlx::query_scalar("SELECT row_hash FROM audit_events ORDER BY id DESC LIMIT 1")
-            .fetch_optional(&mut *connection)
-            .await?;
+    // Link to the last *hashed* row. During a rolling deploy an older binary
+    // may still insert an unchained row; linking to it would restart the chain
+    // at genesis and break verification for everything after it.
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT row_hash FROM audit_events
+         WHERE chained AND row_hash <> ''
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await?;
 
-    let prev_hash = match previous {
-        // An empty hash is a pre-chain row; treat it as genesis.
-        Some(hash) if !hash.is_empty() => hash,
-        _ => AUDIT_GENESIS.to_owned(),
-    };
+    let prev_hash = previous.unwrap_or_else(|| AUDIT_GENESIS.to_owned());
 
     // Postgres stores timestamptz to microsecond precision, so truncate before
     // hashing: otherwise the recomputed hash after a round trip differs from
@@ -100,8 +110,9 @@ pub(super) async fn insert(
 
     sqlx::query(
         "INSERT INTO audit_events
-            (occurred_at, actor, action, subject, source_ip, request_id, detail, prev_hash, row_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)",
+            (occurred_at, actor, action, subject, source_ip, request_id, detail,
+             prev_hash, row_hash, chained)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, true)",
     )
     .bind(occurred_at)
     .bind(&actor.name)
@@ -120,73 +131,8 @@ pub(super) async fn insert(
 /// Hash of one audit row, including its predecessor.
 ///
 /// The material is a JSON object so field boundaries cannot be forged by
-/// embedding separators in a field. Key order is stable because `serde_json`
-/// maps are sorted by default.
-#[cfg(test)]
-fn verify_rows(rows: &[AuditRow]) -> ChainReport {
-    let mut report = ChainReport {
-        verified: 0,
-        unchained: 0,
-        broken: None,
-    };
-    let mut expected_prev = AUDIT_GENESIS.to_owned();
-
-    for row in rows {
-        match verify_row(row, &expected_prev, &mut report) {
-            Some(next) => expected_prev = next,
-            None => break,
-        }
-    }
-
-    report
-}
-
-/// Checks one row against its expected predecessor, updating the report.
-/// Returns the hash the next row must point at, or `None` once the chain has
-/// broken (or the row was written before the chain existed).
-fn verify_row(row: &AuditRow, expected_prev: &str, report: &mut ChainReport) -> Option<String> {
-    if row.row_hash.is_empty() {
-        report.unchained += 1;
-        return Some(expected_prev.to_owned());
-    }
-
-    let actor = Actor {
-        name: row.actor.clone(),
-        source_ip: row.source_ip.clone(),
-        scopes: std::collections::HashSet::new(),
-    };
-
-    if row.prev_hash != expected_prev {
-        report.broken = Some(ChainBreak {
-            id: row.id,
-            reason: "prev_hash does not match the preceding row".to_owned(),
-        });
-        return None;
-    }
-
-    let recomputed = chain_hash(
-        &row.prev_hash,
-        row.occurred_at,
-        &actor,
-        &row.action,
-        &row.subject,
-        &row.detail,
-        row.request_id.as_deref(),
-    );
-
-    if recomputed != row.row_hash {
-        report.broken = Some(ChainBreak {
-            id: row.id,
-            reason: "row_hash does not match the row's contents".to_owned(),
-        });
-        return None;
-    }
-
-    report.verified += 1;
-
-    Some(row.row_hash.clone())
-}
-
+/// embedding separators in a field; `canonical_json` makes the encoding
+/// independent of map order and of how Postgres returns jsonb.
 fn chain_hash(
     prev_hash: &str,
     occurred_at: time::OffsetDateTime,
@@ -210,6 +156,109 @@ fn chain_hash(
     });
 
     hex::encode(sha2::Sha256::digest(canonical_json(&material).as_bytes()))
+}
+
+/// Walks rows in id order, checking each one against the one before it.
+///
+/// The walk starts at the oldest *hashed* row rather than at genesis, because
+/// retention deletes the oldest rows and a healthy deployment must still
+/// verify. The cost is explicit: removing the oldest rows is indistinguishable
+/// from retention, so the chain proves that nothing after its start was
+/// altered, not that the start is original.
+///
+/// A row with no hash **after** the chain has started is a break, not a gap:
+/// otherwise blanking the hash column would hide any number of edited rows.
+struct Walk {
+    report: ChainReport,
+    expected: Option<String>,
+}
+
+impl Walk {
+    fn new() -> Self {
+        Self {
+            report: ChainReport {
+                verified: 0,
+                unchained: 0,
+                chain_start: None,
+                broken: None,
+            },
+            expected: None,
+        }
+    }
+
+    /// Returns false once the chain has broken and the walk should stop.
+    fn push(&mut self, row: &AuditRow) -> bool {
+        if !row.chained {
+            // Written before the chain existed, or by a replica that had not
+            // been upgraded. A gap, not a break — and never inferred from a
+            // missing hash, which is what an attacker would blank.
+            self.report.unchained += 1;
+            return true;
+        }
+
+        if row.row_hash.is_empty() {
+            self.report.broken = Some(ChainBreak {
+                id: row.id,
+                reason: "a chained row is missing its hash".to_owned(),
+            });
+            return false;
+        }
+
+        if let Some(expected) = &self.expected
+            && row.prev_hash != *expected
+        {
+            self.report.broken = Some(ChainBreak {
+                id: row.id,
+                reason: "prev_hash does not match the preceding row".to_owned(),
+            });
+            return false;
+        }
+
+        let actor = Actor {
+            name: row.actor.clone(),
+            source_ip: row.source_ip.clone(),
+            scopes: std::collections::HashSet::new(),
+        };
+
+        let recomputed = chain_hash(
+            &row.prev_hash,
+            row.occurred_at,
+            &actor,
+            &row.action,
+            &row.subject,
+            &row.detail,
+            row.request_id.as_deref(),
+        );
+
+        if recomputed != row.row_hash {
+            self.report.broken = Some(ChainBreak {
+                id: row.id,
+                reason: "row_hash does not match the row's contents".to_owned(),
+            });
+            return false;
+        }
+
+        self.report
+            .chain_start
+            .get_or_insert(row.id);
+        self.report.verified += 1;
+        self.expected = Some(row.row_hash.clone());
+
+        true
+    }
+}
+
+#[cfg(test)]
+fn verify_rows(rows: &[AuditRow]) -> ChainReport {
+    let mut walk = Walk::new();
+
+    for row in rows {
+        if !walk.push(row) {
+            break;
+        }
+    }
+
+    walk.report
 }
 
 /// Serialises a value with object keys in byte order, at every depth.
@@ -275,18 +324,13 @@ pub(crate) async fn verify(pool: &PgPool) -> Result<ChainReport, AdminError> {
     // whole table at once.
     const PAGE: i64 = 512;
 
-    let mut report = ChainReport {
-        verified: 0,
-        unchained: 0,
-        broken: None,
-    };
-    let mut expected_prev = AUDIT_GENESIS.to_owned();
+    let mut walk = Walk::new();
     let mut cursor = 0i64;
 
     loop {
         let page = sqlx::query(
             "SELECT id, occurred_at, actor, action, subject, source_ip, request_id,
-                    detail, prev_hash, row_hash
+                    detail, prev_hash, row_hash, chained
              FROM audit_events
              WHERE id > $1
              ORDER BY id ASC
@@ -316,22 +360,22 @@ pub(crate) async fn verify(pool: &PgPool) -> Result<ChainReport, AdminError> {
                     detail: row.try_get("detail")?,
                     prev_hash: row.try_get("prev_hash")?,
                     row_hash: row.try_get("row_hash")?,
+                    chained: row.try_get("chained")?,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(AdminError::Store)?;
 
         for row in &rows {
-            match verify_row(row, &expected_prev, &mut report) {
-                Some(next) => expected_prev = next,
-                None => return Ok(report),
+            if !walk.push(row) {
+                return Ok(walk.report);
             }
         }
 
         cursor = rows.last().map_or(cursor, |row| row.id);
     }
 
-    Ok(report)
+    Ok(walk.report)
 }
 
 #[cfg(test)]
@@ -382,6 +426,7 @@ mod tests {
             detail,
             prev_hash: prev.to_owned(),
             row_hash: hash,
+            chained: true,
         }
     }
 
@@ -419,6 +464,7 @@ mod tests {
 
         assert_eq!(report.verified, 2);
         assert_eq!(report.unchained, 0);
+        assert_eq!(report.chain_start, Some(1));
         assert_eq!(report.broken, None);
     }
 
@@ -442,9 +488,58 @@ mod tests {
     #[test]
     fn a_reordered_row_breaks_the_chain() {
         let rows = chain_of_two();
-        let report = verify_rows(&[rows[1].clone()]);
+        let report = verify_rows(&[rows[1].clone(), rows[0].clone()]);
 
-        assert!(matches!(report.broken, Some(ChainBreak { id: 2, .. })));
+        assert!(matches!(report.broken, Some(ChainBreak { id: 1, .. })));
+    }
+
+    #[test]
+    fn a_blank_hash_after_the_chain_starts_is_a_break() {
+        let mut rows = chain_of_two();
+        rows[1].row_hash.clear();
+
+        let report = verify_rows(&rows);
+
+        assert_eq!(report.verified, 1);
+        assert_eq!(
+            report.broken,
+            Some(ChainBreak {
+                id: 2,
+                reason: "a chained row is missing its hash".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unchained_row_between_chained_rows_is_a_gap_not_a_break() {
+        // A replica that has not been upgraded can still insert; its row is
+        // marked chained = false and must not invalidate the chain around it.
+        let rows = chain_of_two();
+        let mut with_gap = vec![rows[0].clone()];
+
+        let mut gap = row(99, "", "legacy.event", serde_json::json!({}));
+        gap.chained = false;
+        gap.row_hash.clear();
+        with_gap.push(gap);
+        with_gap.push(rows[1].clone());
+
+        let report = verify_rows(&with_gap);
+
+        assert_eq!(report.verified, 2);
+        assert_eq!(report.unchained, 1);
+        assert_eq!(report.broken, None);
+    }
+
+    #[test]
+    fn a_pruned_prefix_still_verifies() {
+        // Retention deletes the oldest rows, so the first surviving hashed row
+        // points at a predecessor that is gone. That is not tampering.
+        let rows = chain_of_two();
+        let report = verify_rows(&rows[1..]);
+
+        assert_eq!(report.verified, 1);
+        assert_eq!(report.chain_start, Some(2));
+        assert_eq!(report.broken, None);
     }
 
     #[test]
@@ -455,6 +550,7 @@ mod tests {
             AuditRow {
                 prev_hash: String::new(),
                 row_hash: String::new(),
+                chained: false,
                 ..row(0, "", "legacy.event", serde_json::json!({}))
             },
         );
@@ -463,6 +559,7 @@ mod tests {
 
         assert_eq!(report.unchained, 1);
         assert_eq!(report.verified, 2);
+        assert_eq!(report.chain_start, Some(1));
         assert_eq!(report.broken, None);
     }
 
@@ -470,7 +567,7 @@ mod tests {
     fn the_hash_covers_every_field_and_is_stable() {
         let actor = Actor {
             name: "tester".to_owned(),
-            source_ip: None,
+            source_ip: Some("203.0.113.9".to_owned()),
             scopes: std::collections::HashSet::new(),
         };
         let detail = serde_json::json!({"a": 1, "b": 2});
@@ -482,7 +579,7 @@ mod tests {
             "tenant.create",
             "subject",
             &detail,
-            None,
+            Some("req"),
         );
 
         assert_eq!(
@@ -494,13 +591,12 @@ mod tests {
                 "tenant.create",
                 "subject",
                 &detail,
-                None,
+                Some("req"),
             ),
             "the same row must hash the same way"
         );
 
-        assert_ne!(
-            base,
+        let variants = [
             chain_hash(
                 "other",
                 time::OffsetDateTime::UNIX_EPOCH,
@@ -508,10 +604,71 @@ mod tests {
                 "tenant.create",
                 "subject",
                 &detail,
-                None,
+                Some("req"),
             ),
-            "the predecessor must be part of the hash"
-        );
+            chain_hash(
+                AUDIT_GENESIS,
+                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+                &actor,
+                "tenant.create",
+                "subject",
+                &detail,
+                Some("req"),
+            ),
+            chain_hash(
+                AUDIT_GENESIS,
+                time::OffsetDateTime::UNIX_EPOCH,
+                &Actor {
+                    name: "other".to_owned(),
+                    source_ip: actor.source_ip.clone(),
+                    scopes: std::collections::HashSet::new(),
+                },
+                "tenant.create",
+                "subject",
+                &detail,
+                Some("req"),
+            ),
+            chain_hash(
+                AUDIT_GENESIS,
+                time::OffsetDateTime::UNIX_EPOCH,
+                &actor,
+                "tenant.delete",
+                "subject",
+                &detail,
+                Some("req"),
+            ),
+            chain_hash(
+                AUDIT_GENESIS,
+                time::OffsetDateTime::UNIX_EPOCH,
+                &actor,
+                "tenant.create",
+                "other-subject",
+                &detail,
+                Some("req"),
+            ),
+            chain_hash(
+                AUDIT_GENESIS,
+                time::OffsetDateTime::UNIX_EPOCH,
+                &actor,
+                "tenant.create",
+                "subject",
+                &serde_json::json!({"a": 1, "b": 3}),
+                Some("req"),
+            ),
+            chain_hash(
+                AUDIT_GENESIS,
+                time::OffsetDateTime::UNIX_EPOCH,
+                &actor,
+                "tenant.create",
+                "subject",
+                &detail,
+                Some("other-request"),
+            ),
+        ];
+
+        for (index, variant) in variants.iter().enumerate() {
+            assert_ne!(&base, variant, "field {index} is not covered by the hash");
+        }
     }
 
     #[tokio::test]
@@ -526,7 +683,7 @@ mod tests {
         let service = AdminService::new(
             pool,
             Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
-            Vec::new(),
+            crate::routing::test_routing(),
             store,
             std::time::Duration::from_secs(300),
             false,
@@ -551,6 +708,10 @@ mod tests {
             .expect("verify");
 
         assert!(report.verified >= 2, "inserted rows must be chained");
+        assert!(
+            report.chain_start.is_some(),
+            "the walk must find where the chain begins"
+        );
         assert_eq!(report.broken, None, "the live chain must verify");
     }
 }

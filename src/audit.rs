@@ -318,6 +318,10 @@ mod tests {
         let tenant = crate::testing::unique("data-audit");
         let mut event = event();
         event.tenant_id = tenant.clone();
+        event.detail = serde_json::json!({
+            "claims": {"project_id": "proj-42"},
+            "run_id": "run-1"
+        });
 
         insert(&pool, &[event.clone()])
             .await
@@ -332,15 +336,20 @@ mod tests {
 
         assert_eq!(count, 1);
 
-        let stored: (String, String) = sqlx::query_as(
-            "SELECT decision, auth_method FROM data_audit_events WHERE tenant_id = $1",
+        // The detail is the whole point of the claims and run id: read it back
+        // through the same path an operator uses, not out of the insert.
+        let stored: (String, String, serde_json::Value) = sqlx::query_as(
+            "SELECT decision, auth_method, detail FROM data_audit_events WHERE tenant_id = $1",
         )
         .bind(&tenant)
         .fetch_one(&pool)
         .await
         .expect("read row");
 
-        assert_eq!(stored, ("allow".to_owned(), "oauth".to_owned()));
+        assert_eq!(stored.0, "allow");
+        assert_eq!(stored.1, "oauth");
+        assert_eq!(stored.2["claims"]["project_id"], "proj-42");
+        assert_eq!(stored.2["run_id"], "run-1");
 
         sqlx::query("DELETE FROM data_audit_events WHERE tenant_id = $1")
             .bind(&tenant)

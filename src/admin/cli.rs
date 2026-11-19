@@ -264,7 +264,7 @@ async fn dispatch(
     let service = AdminService::new(
         pool,
         verifier,
-        config.routing.allow_hosts.clone(),
+        config.routing.clone(),
         store,
         config.server.max_request_timeout,
         config
@@ -347,7 +347,7 @@ async fn run_audit_command(
 
             if report.unchained > 0 {
                 println!(
-                    "{} row(s) written before the chain existed (no hash to check)",
+                    "{} row(s) outside the chain (written before it, or by a replica that was not upgraded)",
                     report.unchained
                 );
             }
@@ -360,7 +360,22 @@ async fn run_audit_command(
                     )
                     .into());
                 }
-                None => println!("chain intact: {} rows verified", report.verified),
+                // No hashed rows but some unhashed ones: either the chain was
+                // removed or nothing has been written since the migration.
+                // Either way, saying "intact" would be a false assurance.
+                None if report.verified == 0 && report.unchained > 0 => {
+                    return Err(
+                        "no hashed audit rows: the log predates the chain or the chain was removed; \
+                         verification proves nothing"
+                            .into(),
+                    );
+                }
+                None if report.verified == 0 => println!("no audit events yet"),
+                None => println!(
+                    "chain intact: {} rows verified from event {}",
+                    report.verified,
+                    report.chain_start.unwrap_or_default()
+                ),
             }
         }
         AuditCommand::Data {
@@ -406,6 +421,13 @@ async fn run_audit_command(
                         .map(|status| status.to_string())
                         .unwrap_or_else(|| "-".to_owned())
                 );
+
+                // Claims and the caller's run id are the point of recording
+                // them; printing them only when present keeps the common line
+                // readable.
+                if entry.detail != serde_json::json!({}) {
+                    println!("  {}", entry.detail);
+                }
             }
         }
     }

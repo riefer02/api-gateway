@@ -27,7 +27,7 @@ themselves and the host OS.
 | Key guessing | 256-bit secrets, constant-time comparison, rate limits on the auth path | None practical |
 | Key id enumeration | Lookup by id then constant-time verify; auth failures are indistinguishable | Timing on the id lookup remains theoretically observable |
 | Stolen admin token | Separate listener, named tokens with scopes, not exposed by default | No mTLS/OIDC yet; rotate the token |
-| SSRF through route config | Upstream allowlist enforced at write and compile; redirects disabled; credentials in URLs rejected | DNS rebinding between validation and use is not defended against; pin hosts at the network layer |
+| SSRF through route config | Upstream allowlist enforced at write and compile; redirects disabled; credentials in URLs rejected; resolved addresses filtered by `UPSTREAM_EGRESS` at connect time, IP literals at compile time | The default policy blocks loopback, link-local and the two common metadata endpoints, not every provider's; `allow-all` removes the filter |
 | Path confusion (authorize one path, forward another) | Dot segments, backslashes, and matrix-parameter `;`/`%3b` rejected before matching | Upstreams that double-decode other encodings (e.g. `%252e`) remain out of our control |
 | Request smuggling | Hyper rejects ambiguous `Content-Length`/`Transfer-Encoding`; hop-by-hop and `Connection`-named headers stripped | Depends on hyper's parser |
 | Credential leakage to upstreams | `Authorization`, `Cookie`, `Host`, and forwarded headers stripped before forwarding | Upstreams that need caller identity get an exchanged token, never the inbound one |
@@ -37,7 +37,7 @@ themselves and the host OS.
 | Prompt injection through tool output | Tool allow-lists, write-tool approval (roadmap), response caps, and audit | The gateway cannot make an unsafe or over-broad tool safe; record-level authz belongs in the data layer |
 | Cross-tenant route access | Optional `routes.tenant_id`; a tenant route is invisible to other tenants and never falls through to a shorter prefix | A shared route with broad scopes is reachable by every tenant by design |
 | Browser origin abuse / DNS rebinding | `Origin` is validated against an exact allow-list when CORS is configured; preflight is answered before auth; upstream CORS headers are stripped | With CORS unset, browser clients are not origin-checked; an MCP deployment should configure the allow-list |
-| Audit tampering or gaps | Append-only by convention; route-gated per-call audit; status-derived decisions; bounded queue with explicit drop/write-failure/shutdown metrics; identifiers only | Someone with database write access can rewrite rows; export to an append-only sink if required |
+| Audit tampering or gaps | Control-plane rows are hash-chained and `admin audit verify` walks the chain; per-call audit is route-gated with status-derived decisions, a bounded queue and explicit drop/write-failure metrics; identifiers only | The chain is unkeyed and starts at the oldest retained row, so a writer who can recompute the suffix, or remove the oldest rows, is not detected; export to an append-only sink for that threat |
 | Secret leakage to logs | No secret is logged; upstream errors logged by kind, not `Display`; request ids sanitized; tool arguments are not audited | URL paths and tool arguments may still contain caller-chosen secrets if callers put them there |
 | Resource exhaustion | Body limits, whole-request deadline, header-read timeout, connection cap, per-IP and per-tenant rate limits, cached readiness probe | In-process limits are per replica |
 | Amplification via retries | Idempotent, body-less retries only, gated by a token-bucket retry budget | Retried requests still reach the upstream twice |
@@ -67,8 +67,9 @@ themselves and the host OS.
 - Opaque-token introspection, with an explicit outage policy.
 - Static upstream credentials, if a customer cannot use token exchange: envelope
   encryption/KMS, rotation, and a documented residual risk.
-- Audit rows are append-only but not tamper-evident: someone with database write access
-  can delete or rewrite them. Hash-chaining or shipping to an append-only sink is the
-  next step if that matters to you.
 - Record-level authorization remains in the MCP server or data API; the gateway must
   not become the only authorization layer.
+- Audit integrity has a known ceiling: the control-plane chain is unkeyed and anchored at
+  the oldest retained row, so it detects edits and reordering but not a writer who
+  recomputes the suffix or prunes the head. The data-plane audit is unhashed by design.
+  Ship both to an append-only sink if the threat includes database write access.

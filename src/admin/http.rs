@@ -603,7 +603,7 @@ mod tests {
                     .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
                     .expect("lazy pool"),
                 Arc::new(crate::auth::KeyVerifier::new(SecretString::new("pepper"))),
-                Vec::new(),
+                crate::routing::test_routing(),
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
                 std::time::Duration::from_secs(300),
                 false,
@@ -751,6 +751,8 @@ struct DataAuditView {
     latency_ms: Option<u32>,
     request_id: Option<String>,
     token_id: Option<String>,
+    /// Configured claims and the caller's run id. Identifiers only.
+    detail: serde_json::Value,
 }
 
 async fn list_data_audit(
@@ -796,6 +798,7 @@ async fn list_data_audit(
                 latency_ms: entry.latency_ms,
                 request_id: entry.request_id,
                 token_id: entry.token_id,
+                detail: entry.detail,
             })
             .collect(),
     ))
@@ -827,7 +830,7 @@ mod scope_tests {
                     .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
                     .expect("lazy pool"),
                 Arc::new(crate::auth::KeyVerifier::new(SecretString::new("pepper"))),
-                Vec::new(),
+                crate::routing::test_routing(),
                 Arc::new(crate::auth::store::InMemoryApiKeyStore::default()),
                 std::time::Duration::from_secs(300),
                 false,

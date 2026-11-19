@@ -115,7 +115,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
     let admin = Arc::new(admin::AdminService::new(
         pool.clone(),
         Arc::clone(&verifier),
-        config.routing.allow_hosts.clone(),
+        config.routing.clone(),
         Arc::clone(&store),
         config.server.max_request_timeout,
         config
@@ -133,8 +133,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         tracing::warn!("no routes configured: every request will return 404");
     }
 
-    let routes = RouteTableHandle::new(table)
-        .with_stale_after(config.routing.refresh_interval * 3 + std::time::Duration::from_secs(5));
+    let routes = RouteTableHandle::new(table).with_stale_after(stale_after(config));
     let refresh = RouteRefresh::new(source, routes.clone(), config.routing.refresh_interval);
     let refresh_task = tokio::spawn(refresh.run());
 
@@ -515,5 +514,41 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// How long a snapshot may go unrefreshed before readiness fails.
+///
+/// A failed refresh means the database is unreachable, not that the compiled
+/// policy became wrong — the snapshot in memory is still the one the operator
+/// published. Readiness therefore keeps the window at least as long as the
+/// credential cache, or the fleet would drain on a database blip before the
+/// cache that exists to survive one is exhausted.
+fn stale_after(config: &Config) -> std::time::Duration {
+    let refresh = config.routing.refresh_interval;
+
+    (refresh * 3 + std::time::Duration::from_secs(5)).max(config.auth.cache_ttl + refresh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_staleness_window_covers_the_credential_cache() {
+        let mut config = crate::testing::config();
+        config.auth.cache_ttl = std::time::Duration::from_secs(30);
+        config.routing.refresh_interval = std::time::Duration::from_secs(2);
+
+        assert_eq!(stale_after(&config), std::time::Duration::from_secs(32));
+    }
+
+    #[test]
+    fn a_disabled_cache_keeps_the_short_window() {
+        let mut config = crate::testing::config();
+        config.auth.cache_ttl = std::time::Duration::ZERO;
+        config.routing.refresh_interval = std::time::Duration::from_secs(2);
+
+        assert_eq!(stale_after(&config), std::time::Duration::from_secs(11));
     }
 }

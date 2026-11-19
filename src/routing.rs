@@ -460,16 +460,26 @@ pub(crate) fn validate_path_prefix(prefix: &str) -> Result<(), String> {
 ///
 /// `EgressResolver` runs only when a name is resolved; `http://169.254.169.254/`
 /// is connected to directly and would otherwise skip the policy entirely.
-fn literal_host(url: &Url, egress: crate::net::Egress) -> Option<String> {
-    let host = url.host_str()?;
-    let address: std::net::IpAddr = host
+pub(crate) fn reject_literal_egress(url: &Url, egress: crate::net::Egress) -> Result<(), String> {
+    let Some(host) = url.host_str() else {
+        return Ok(());
+    };
+
+    let Ok(address) = host
         .trim_start_matches('[')
         .trim_end_matches(']')
-        .parse()
-        .ok()?;
+        .parse::<std::net::IpAddr>()
+    else {
+        return Ok(());
+    };
 
-    (!egress.allows(address))
-        .then(|| format!("upstream address `{host}` is not allowed by UPSTREAM_EGRESS"))
+    if egress.allows(address) {
+        Ok(())
+    } else {
+        Err(format!(
+            "upstream address `{host}` is not allowed by UPSTREAM_EGRESS"
+        ))
+    }
 }
 
 pub(crate) fn validate_upstream_url(raw: &str, allow_hosts: &[String]) -> Result<Url, String> {
@@ -550,8 +560,8 @@ fn compile_upstream(
     // A literal address never reaches the resolver, so the egress policy has
     // to be applied here as well. Without this, the only protection is the
     // allowlist — and a development deployment has none.
-    if let Some(address) = literal_host(&base_url, routing.egress) {
-        problem(problems, address);
+    if let Err(message) = reject_literal_egress(&base_url, routing.egress) {
+        problem(problems, message);
         return None;
     }
 
