@@ -370,7 +370,9 @@ async fn run_audit_command(
                             .into(),
                     );
                 }
-                None if report.verified == 0 => println!("no audit events yet"),
+                None if report.verified == 0 => println!(
+                    "no audit events to verify: an emptied log looks the same as a new one"
+                ),
                 None => println!(
                     "chain intact: {} rows verified from event {}",
                     report.verified,

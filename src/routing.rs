@@ -877,6 +877,10 @@ pub(crate) struct RouteTableHandle {
     current: Arc<ArcSwap<RouteTable>>,
     refreshed_at: Arc<std::sync::atomic::AtomicU64>,
     stale_after: Duration,
+    /// Set when the source compiled but rejected the configuration. Distinct
+    /// from staleness on purpose: an unreachable database is tolerated for the
+    /// credential-cache window, a rejected configuration is not.
+    config_invalid: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RouteTableHandle {
@@ -885,6 +889,7 @@ impl RouteTableHandle {
             current: Arc::new(ArcSwap::from_pointee(table)),
             refreshed_at: Arc::new(std::sync::atomic::AtomicU64::new(now_millis())),
             stale_after: Duration::from_secs(30),
+            config_invalid: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -901,6 +906,20 @@ impl RouteTableHandle {
     pub(crate) fn mark_refreshed(&self) {
         self.refreshed_at
             .store(now_millis(), std::sync::atomic::Ordering::Relaxed);
+        // A successful read clears a rejection: either the row was fixed or
+        // the version moved past it.
+        self.config_invalid
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_config_invalid(&self) {
+        self.config_invalid
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_config_invalid(&self) -> bool {
+        self.config_invalid
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn is_stale(&self) -> bool {
@@ -959,8 +978,19 @@ impl RouteRefresh {
         }
 
         // Only a table that actually compiled counts as a healthy refresh: a
-        // rejected configuration must not look ready.
-        let table = self.source.load().await?;
+        // rejected configuration must not look ready, and must not be hidden
+        // behind the staleness window either.
+        let table = match self.source.load().await {
+            Ok(table) => table,
+            Err(error) => {
+                if matches!(error, RouteTableError::Invalid(_)) {
+                    self.handle.mark_config_invalid();
+                }
+
+                return Err(error);
+            }
+        };
+
         let installed = self.handle.replace_if_newer(table);
         self.handle.mark_refreshed();
 
@@ -1058,6 +1088,19 @@ mod tests {
         let mut row = row("api", "/api", &["GET"]);
         row.base_url = "http://10.1.2.3:8080".to_owned();
         assert!(RouteTable::compile(1, vec![row], &routing, false).is_ok());
+    }
+
+    #[test]
+    fn a_rejected_configuration_is_not_hidden_by_the_staleness_window() {
+        let handle = RouteTableHandle::new(RouteTable::for_tests(1, Vec::new()));
+
+        assert!(!handle.is_config_invalid());
+
+        handle.mark_config_invalid();
+        assert!(handle.is_config_invalid());
+
+        handle.mark_refreshed();
+        assert!(!handle.is_config_invalid());
     }
 
     #[test]

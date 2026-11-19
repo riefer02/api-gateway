@@ -1240,6 +1240,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_duplicate_run_id_header_is_refused() {
+        let config = testing::config();
+        let app = crate::app::build_app(&config, testing::empty_state_with(&config));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api")
+                    .header("x-run-id", "first")
+                    .header("x-run-id", "second")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "two ids would let the audited one differ from the echoed one"
+        );
+    }
+
+    #[tokio::test]
     async fn an_upstream_cannot_choose_the_run_id_echo() {
         let upstream = wiremock::MockServer::start().await;
 
@@ -1375,7 +1399,7 @@ mod tests {
                     .uri("/health")
                     .header("origin", "https://app.example.com")
                     .header("access-control-request-method", "GET")
-                    .header("access-control-request-headers", "mcp-name")
+                    .header("access-control-request-headers", "mcp-name, x-run-id")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1390,14 +1414,37 @@ mod tests {
                 .unwrap(),
             "https://app.example.com"
         );
+        let allowed_headers = preflight
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        assert!(allowed_headers.contains("mcp-name"));
         assert!(
-            preflight
+            allowed_headers.contains("x-run-id"),
+            "a browser client must be allowed to send the correlation id"
+        );
+        let probe = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("origin", "https://app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            probe
                 .headers()
-                .get("access-control-allow-headers")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("mcp-name")
+                .get("access-control-expose-headers")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("x-run-id")),
+            "a browser client must be able to read the echo"
         );
 
         let refused = app

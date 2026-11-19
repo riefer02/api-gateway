@@ -60,7 +60,7 @@ const AUDIT_GENESIS: &str = "genesis";
 /// be unique within this database. Control-plane writes are low volume, so one
 /// writer at a time costs nothing and removes the read-then-insert race that
 /// would let two rows claim the same predecessor.
-const AUDIT_CHAIN_LOCK: i64 = 0x6175_6469_745f_6368; // "audit_ch"
+pub(super) const AUDIT_CHAIN_LOCK: i64 = 0x6175_6469_745f_6368; // "audit_ch"
 
 /// Appends one chained audit row. Takes a connection rather than an executor
 /// because the lock, the predecessor read and the insert must share one
@@ -189,9 +189,18 @@ impl Walk {
     /// Returns false once the chain has broken and the walk should stop.
     fn push(&mut self, row: &AuditRow) -> bool {
         if !row.chained {
-            // Written before the chain existed, or by a replica that had not
-            // been upgraded. A gap, not a break — and never inferred from a
-            // missing hash, which is what an attacker would blank.
+            // Before the chain starts, this is simply history. After it starts,
+            // an unchained row is a break: otherwise clearing the marker on a
+            // suffix would present an edited log as intact, which is the same
+            // attack as blanking the hash with one extra column.
+            if self.expected.is_some() {
+                self.report.broken = Some(ChainBreak {
+                    id: row.id,
+                    reason: "a row after the chain start is outside the chain".to_owned(),
+                });
+                return false;
+            }
+
             self.report.unchained += 1;
             return true;
         }
@@ -511,23 +520,28 @@ mod tests {
     }
 
     #[test]
-    fn an_unchained_row_between_chained_rows_is_a_gap_not_a_break() {
-        // A replica that has not been upgraded can still insert; its row is
-        // marked chained = false and must not invalidate the chain around it.
+    fn a_row_outside_the_chain_after_it_starts_is_a_break() {
+        // Clearing `chained` on a suffix must not hide an edit. A replica that
+        // has not been upgraded produces the same shape, which is why a mixed
+        // upgrade has to be followed by a verification.
         let rows = chain_of_two();
         let mut with_gap = vec![rows[0].clone()];
 
-        let mut gap = row(99, "", "legacy.event", serde_json::json!({}));
+        let mut gap = row(99, "", "edited.event", serde_json::json!({}));
         gap.chained = false;
         gap.row_hash.clear();
         with_gap.push(gap);
-        with_gap.push(rows[1].clone());
 
         let report = verify_rows(&with_gap);
 
-        assert_eq!(report.verified, 2);
-        assert_eq!(report.unchained, 1);
-        assert_eq!(report.broken, None);
+        assert_eq!(report.verified, 1);
+        assert_eq!(
+            report.broken,
+            Some(ChainBreak {
+                id: 99,
+                reason: "a row after the chain start is outside the chain".to_owned(),
+            })
+        );
     }
 
     #[test]

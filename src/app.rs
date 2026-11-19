@@ -134,6 +134,9 @@ fn cors_layer(config: &Config) -> Option<CorsLayer> {
         HeaderName::from_static("mcp-session-id"),
         HeaderName::from_static("last-event-id"),
         HeaderName::from_static("x-request-id"),
+        // The caller's correlation id: a browser client has to be allowed to
+        // send it and to read the echo back.
+        HeaderName::from_static("x-run-id"),
     ];
 
     let exposed = vec![
@@ -141,6 +144,7 @@ fn cors_layer(config: &Config) -> Option<CorsLayer> {
         HeaderName::from_static("mcp-session-id"),
         HeaderName::from_static("mcp-protocol-version"),
         HeaderName::from_static("x-request-id"),
+        HeaderName::from_static("x-run-id"),
         HeaderName::from_static("ratelimit-limit"),
         HeaderName::from_static("ratelimit-remaining"),
         HeaderName::from_static("ratelimit-reset"),

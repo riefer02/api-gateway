@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 281 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 284 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -43,10 +43,10 @@ The guarantees are structural where they can be:
   are unreachable under the default policy. `allow-all` exists for development on
   loopback, and `UPSTREAM_EGRESS` cannot block every provider's metadata address.
 - **The control-plane audit is chained.** Every chained row carries its predecessor's hash
-  and its own; an edit or reordering breaks the chain at a named row, and
-  `admin audit verify` proves it rather than asserting it. The chase begins at the oldest
-  retained row, so retention is not mistaken for tampering, and rows written outside the
-  chain are marked and counted rather than trusted.
+  and its own; an edit, a reordering, or a row placed outside the chain after it started
+  breaks verification at a named row, and `admin audit verify` proves it rather than
+  asserting it. The walk begins at the oldest retained row, so retention is not mistaken
+  for tampering; rows before that are counted rather than trusted.
 - **An overloaded upstream sheds load.** With `UPSTREAM_MAX_CONCURRENCY` set, a permit is
   held for the life of the response body — so a long stream counts as the concurrency it
   is — and saturation answers `503` with `Retry-After` rather than queueing without bound.
@@ -585,9 +585,10 @@ stateless-only.
   `inputSchema`, cached for `MCP_TOOL_SCHEMA_TTL_SECS`. A `tools/call` whose
   arguments are not an object, or that omits a field the schema marks `required`,
   is refused locally with JSON-RPC `-32602` and never reaches the upstream. This is
-  deliberately not a JSON Schema engine: unsupported keywords mean "no opinion", and
-  a tool the gateway has not seen listed fails open. The tool still validates;
-  the schema is one the upstream chose to publish.
+  deliberately not a JSON Schema engine: unsupported keywords mean "no opinion", a tool
+  the gateway has not seen listed fails open, and a schema too large to hold (more than
+  64 required fields) is skipped rather than partially enforced. The tool still
+  validates; the schema is one the upstream chose to publish.
 - **Upstream identity.** Routes can declare an audience. The gateway exchanges the
   caller's token with RFC 8693 and sends a short-lived token minted for that
   upstream. The inbound token is never forwarded to another audience.
@@ -596,9 +597,11 @@ stateless-only.
   drops and increments a metric rather than adding latency.
 - **Attribution beyond the subject.** `AUDIT_CLAIMS` names token claims — `project_id`,
   `agent_id`, anything signed by the IdP — and their values are recorded in the
-  per-call audit's `detail`. A caller may also send `X-Run-Id`; it is validated,
-  recorded, and echoed on the response, including on errors, so a client can join its
-  own logs to the audit row. Neither is ever read for authorization.
+  per-call audit's `detail`, which the audit reader returns. A caller may also send
+  `X-Run-Id`; it is validated, recorded, and echoed on the response including on errors,
+  so a client can join its own logs to the audit row. It is not echoed when the request
+  is refused before validation (the IP limiter's `429`, an oversized body, a panic).
+  Neither is ever read for authorization.
 - **Tamper-evident control-plane audit.** Every mutation row carries the hash of its
   predecessor and a hash of its own contents, appended one writer at a time under an
   advisory lock. `admin audit verify` walks the chain and exits non-zero at the first

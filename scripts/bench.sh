@@ -19,6 +19,10 @@ fi
 : "${DEV_API_KEY_SECRET:?DEV_API_KEY_SECRET must be set (see .env.example)}"
 : "${DATABASE_URL:?DATABASE_URL must be set (see .env.example)}"
 
+# The benchmark stub listens on loopback, which the default egress policy
+# blocks. This applies to the gateway process and the admin CLI alike.
+export UPSTREAM_EGRESS=allow-all
+
 PORT="${PORT:-8080}"
 STUB_PORT="${STUB_PORT:-18080}"
 DURATION="${DURATION:-10}"

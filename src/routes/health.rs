@@ -9,6 +9,12 @@ pub(crate) async fn live() -> StatusCode {
 /// Readiness is dependency-aware: a gateway that cannot authenticate anyone or
 /// whose route table has stopped refreshing is removed from rotation.
 pub(crate) async fn ready(State(state): State<AppState>) -> StatusCode {
+    if state.routes.is_config_invalid() {
+        metrics::gauge!("gateway_ready").set(0.0);
+        tracing::warn!("readiness check failed: the route table was rejected by the compiler");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
     if state.routes.is_stale() {
         metrics::gauge!("gateway_ready").set(0.0);
         tracing::warn!(

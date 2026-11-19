@@ -7,6 +7,25 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- **Clearing a row's chain marker is detected.** An unchained row after the chain has
+  started is a break, not a gap: otherwise clearing `chained` on a suffix would present an
+  edited log as intact. The cost is stated: a mixed-version rollout produces a break until
+  every replica runs this version, so verify after the upgrade rather than during it.
+- **A rejected route table is not hidden by the staleness window.** Compile failures now
+  set a separate readiness signal, so a bad configuration is reported immediately instead
+  of waiting out `AUTH_CACHE_TTL_SECS`; only an unreachable database is tolerated.
+- **An oversized schema is skipped, not truncated.** A tool with more than 64 required
+  fields, or a field name over 128 bytes, gets no gateway-side validation at all rather
+  than partial validation that would accept calls missing a required field.
+- **Pruning is a prefix under the chain lock.** Retention now deletes a contiguous id
+  prefix while holding the same advisory lock as inserts, so a clock jump cannot remove a
+  middle row and turn retention into an apparent break.
+- **Readiness pings are bounded.** A hung database reports an unready probe instead of
+  holding the check open past the probe timeout.
+- **CORS allows and exposes `X-Run-Id`**, so a browser client can send it and read the echo.
+- **The local MCP recipes relax egress explicitly.** `just mcp-stub`, `just mcp-route` and
+  `scripts/bench.sh` set `UPSTREAM_EGRESS=allow-all` for their loopback upstreams, which
+  the new default would otherwise refuse.
 - **The audit chain no longer trusts a missing hash.** A row is chained because
   `audit_events.chained` says so, not because its hash happens to be present. Blanking
   `row_hash` on a chained row is a break; a row written before the chain, or by a replica

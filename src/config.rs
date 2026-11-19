@@ -1832,6 +1832,23 @@ mod tests {
     }
 
     #[test]
+    fn a_namespaced_claim_name_is_accepted() {
+        let mut values = oauth_environment();
+        values.insert(
+            "AUDIT_CLAIMS".to_owned(),
+            "https://acme.example/project_id".to_owned(),
+        );
+
+        let config = Config::from_source(&values).expect("valid config");
+        let oauth = config.oauth.expect("oauth configured");
+
+        assert_eq!(
+            oauth.audit_claims,
+            vec!["https://acme.example/project_id".to_owned()]
+        );
+    }
+
+    #[test]
     fn audit_claim_names_are_validated() {
         let mut values = oauth_environment();
         values.insert("AUDIT_CLAIMS".to_owned(), "has space".to_owned());

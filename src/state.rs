@@ -17,6 +17,10 @@ use crate::routing::RouteTableHandle;
 /// database amplifier, and tolerates a failed ping while credentials are still
 /// servable from cache: pulling every replica out of rotation the instant
 /// Postgres blips turns a dependency hiccup into an outage.
+/// Upper bound on one readiness ping. Below the usual probe timeout, so a
+/// hung connection is a failed probe rather than a hung probe.
+const PING_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(crate) struct Readiness {
     state: tokio::sync::Mutex<ReadyState>,
     ttl: Duration,
@@ -51,7 +55,14 @@ impl Readiness {
         }
 
         let now = Instant::now();
-        let healthy = crate::db::ping(pool).await.is_ok();
+
+        // Bounded: a blackholed database must not hold the probe open. The
+        // readiness cache would otherwise turn one hung connection into a
+        // failed liveness check.
+        let healthy = tokio::time::timeout(PING_TIMEOUT, crate::db::ping(pool))
+            .await
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
 
         if healthy {
             state.last_ok = Some(now);

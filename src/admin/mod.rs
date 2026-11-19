@@ -1160,9 +1160,34 @@ impl AdminService {
         .unwrap_or(100 * 365 * 86_400);
         let cutoff = OffsetDateTime::now_utc() - time::Duration::seconds(seconds);
 
-        let result = sqlx::query("DELETE FROM audit_events WHERE occurred_at < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
+        // Prune under the chain lock and only as a prefix. Deleting by
+        // `occurred_at` alone can remove a middle row if the clock moved, and a
+        // hole in the chain is indistinguishable from tampering to `verify`.
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(AdminError::Store)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(audit::AUDIT_CHAIN_LOCK)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AdminError::Store)?;
+
+        let result = sqlx::query(
+            "DELETE FROM audit_events
+             WHERE id <= (
+                 SELECT COALESCE(MAX(id), 0) FROM audit_events WHERE occurred_at < $1
+             )",
+        )
+        .bind(cutoff)
+        .execute(&mut *transaction)
+        .await
+        .map_err(AdminError::Store)?;
+
+        transaction
+            .commit()
             .await
             .map_err(AdminError::Store)?;
 

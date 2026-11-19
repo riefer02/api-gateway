@@ -34,28 +34,37 @@ pub(crate) struct ToolShape {
 }
 
 impl ToolShape {
-    fn from_schema(schema: &Value) -> Self {
+    /// `None` means "no opinion": the schema is larger than the gateway is
+    /// willing to keep, so it is skipped entirely rather than partially
+    /// enforced. Truncating the list would quietly accept calls that omit a
+    /// field the schema requires — worse than not checking at all.
+    fn from_schema(schema: &Value) -> Option<Self> {
         const MAX_REQUIRED: usize = 64;
         const MAX_NAME: usize = 128;
 
-        // A shape is retained for the cache TTL, and an upstream chooses how
-        // large one is. Bounding both keeps a hostile or merely enormous
-        // `required` list from becoming resident memory.
-        let required = schema
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|names| {
-                names
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter(|name| !name.is_empty() && name.len() <= MAX_NAME)
-                    .take(MAX_REQUIRED)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let Some(names) = schema.get("required") else {
+            return Some(Self::default());
+        };
 
-        Self { required }
+        let names = names.as_array()?;
+
+        if names.len() > MAX_REQUIRED {
+            return None;
+        }
+
+        let mut required = Vec::with_capacity(names.len());
+
+        for name in names {
+            let name = name.as_str()?;
+
+            if name.is_empty() || name.len() > MAX_NAME {
+                return None;
+            }
+
+            required.push(name.to_owned());
+        }
+
+        Some(Self { required })
     }
 
     fn check(&self, arguments: Option<&Value>) -> Result<(), String> {
@@ -129,7 +138,14 @@ pub(crate) fn learn(list: &Value, upstream: &str, cache: &SchemaCache) {
             continue;
         };
 
-        cache.insert(upstream, name, ToolShape::from_schema(schema));
+        let Some(shape) = ToolShape::from_schema(schema) else {
+            // Bounded and honest: no schema is remembered, so nothing is
+            // half-enforced. The tool still validates its own arguments.
+            metrics::counter!("gateway_mcp_schema_skipped_total").increment(1);
+            continue;
+        };
+
+        cache.insert(upstream, name, shape);
     }
 }
 
@@ -249,8 +265,10 @@ mod tests {
 
         learn(&list, "u", &cache);
 
-        let shape = cache.get("u", "big").expect("learned");
-        assert_eq!(shape.required.len(), 64);
+        assert!(
+            cache.get("u", "big").is_none(),
+            "an oversized schema must be skipped, not partially enforced"
+        );
     }
 
     #[test]
