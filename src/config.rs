@@ -260,9 +260,12 @@ pub struct RoutingConfig {
     /// Empty means "allow any host"; production requires a non-empty list.
     pub allow_hosts: Vec<String>,
     pub refresh_interval: Duration,
-    /// Idle sockets kept per upstream host, per replica. Bounded so that
-    /// replicas × upstreams cannot hoard an unbounded number of connections;
-    /// peak concurrency is limited separately, not by this value.
+    /// Idle sockets kept per upstream client, per replica. It is per client,
+    /// not per host: routes that differ in timeout, audience or exchange
+    /// scope get their own client, and each keeps up to this many sockets to
+    /// the same host. Peak concurrency is limited separately, not by this
+    /// value. The default is a starting bound, not a measured optimum; size
+    /// it from the upstream's connection limit divided by replicas × clients.
     pub pool_max_idle_per_host: usize,
 }
 
@@ -641,6 +644,8 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
         problems.push("ROUTE_REFRESH_INTERVAL_MS must be greater than zero".to_owned());
     }
     if !(1..=1_024).contains(&routing.pool_max_idle_per_host) {
+        // 0 would turn keep-alive off entirely; the ceiling exists to catch a
+        // typo, not to express a real limit.
         problems.push(
             "UPSTREAM_POOL_MAX_IDLE_PER_HOST must be between 1 and 1024 \
              (0 would disable connection reuse)"

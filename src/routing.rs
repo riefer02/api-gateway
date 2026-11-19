@@ -36,6 +36,11 @@ pub(crate) struct Upstream {
     pub(crate) base_url: Url,
     pub(crate) client: reqwest::Client,
     pub(crate) timeout: Duration,
+    /// The idle-pool bound this client was built with. Recorded because
+    /// `reqwest` exposes no way to read a pool's configuration back; tests
+    /// assert the configured value reached the builder.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) pool_max_idle_per_host: usize,
     /// RFC 8693 `audience` for the exchanged upstream token.
     pub(crate) audience: Option<String>,
     /// Optional scope to request during exchange.
@@ -568,6 +573,7 @@ fn compile_upstream(
         base_url,
         client,
         timeout,
+        pool_max_idle_per_host,
         audience: row.audience.clone(),
         exchange_scope: row.exchange_scope.clone(),
     });
@@ -951,6 +957,23 @@ mod tests {
 
     fn table(rows: Vec<RouteRow>) -> RouteTable {
         RouteTable::compile(1, rows, &[], false, 64).expect("valid route table")
+    }
+
+    #[test]
+    fn compiles_upstreams_with_the_configured_idle_pool_bound() {
+        let table = RouteTable::compile(1, vec![row("api", "/api", &["GET"])], &[], false, 7)
+            .expect("valid route table");
+
+        // The closest observable proxy: reqwest exposes no way to read a
+        // pool's configuration back, so the builder and this record have to be
+        // changed together. It still catches the value being dropped between
+        // config and compile.
+        assert_eq!(
+            found(&table, HttpMethod::GET, "/api")
+                .upstream
+                .pool_max_idle_per_host,
+            7
+        );
     }
 
     fn found<'a>(table: &'a RouteTable, method: HttpMethod, path: &str) -> &'a CompiledRoute {

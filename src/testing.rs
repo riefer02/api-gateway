@@ -124,9 +124,11 @@ pub(crate) fn route(
             .expect("valid upstream url"),
         client: reqwest::Client::builder()
             .timeout(timeout)
+            .pool_max_idle_per_host(64)
             .build()
             .expect("client"),
         timeout,
+        pool_max_idle_per_host: 64,
         audience: None,
         exchange_scope: None,
     });

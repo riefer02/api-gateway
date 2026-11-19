@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 225 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 226 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -375,7 +375,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `DEV_API_KEY_SCOPES` | `read` | Scopes for the seeded key |
 | `UPSTREAM_ALLOW_HOSTS` | — | Comma-separated allowlist; required in production |
 | `ROUTE_REFRESH_INTERVAL_MS` | `2000` | Route table poll interval |
-| `UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `64` | Idle sockets kept per upstream host, per replica; bounds connection fan-out |
+| `UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `64` | Idle sockets kept per upstream client, per replica; bounds idle accumulation, not peak concurrency |
 | `RATE_LIMIT_BACKEND` | `local` | `redis` is rejected until implemented |
 | `RATE_LIMIT_IP_PER_MINUTE` | `600` | Pre-auth abuse control; `0` disables |
 | `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | Per-tenant fairness; `0` disables |
