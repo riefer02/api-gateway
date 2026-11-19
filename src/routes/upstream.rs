@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, HttpBody as _},
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -228,6 +228,15 @@ async fn handle(
 /// concurrency, which is the opposite of what a bulkhead is for.
 fn hold_permit(permit: tokio::sync::OwnedSemaphorePermit, response: Response) -> Response {
     let (parts, body) = response.into_parts();
+
+    // A body that is already complete needs the permit only until here.
+    // Wrapping it would replace a known size with an unknown one, so hyper
+    // would frame a response that could have carried Content-Length as chunked.
+    if body.size_hint().exact().is_some() {
+        drop(permit);
+        return Response::from_parts(parts, body);
+    }
+
     let stream = body.into_data_stream();
 
     Response::from_parts(
@@ -686,5 +695,58 @@ fn client_ip(trusted: &TrustedProxies, request: &Request) -> IpAddr {
         // No connect info (tests, unix sockets): a reserved address keeps the
         // bucket isolated instead of merging everyone into one.
         None => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::{body::Body, http::StatusCode, response::IntoResponse};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_complete_body_keeps_its_size_and_releases_the_permit() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let response = (StatusCode::OK, Body::from("hello")).into_response();
+        let held = hold_permit(permit, response);
+
+        assert_eq!(held.body().size_hint().exact(), Some(5));
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "a complete body must not keep the permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_holds_the_permit_until_it_is_dropped() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"chunk"))
+        }));
+        let held = hold_permit(permit, body.into_response());
+
+        assert_eq!(held.body().size_hint().exact(), None);
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "a stream must keep the permit while it can still produce bytes"
+        );
+
+        drop(held);
+
+        assert_eq!(semaphore.available_permits(), 1);
     }
 }
