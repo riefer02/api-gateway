@@ -151,6 +151,13 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
             .map_err(|problem| format!("TRUSTED_PROXIES: {problem}"))?,
     );
 
+    // A zero TTL means no cache, which means no input validation.
+    let mcp_schemas = (!config.mcp.tool_schema_ttl.is_zero()).then(|| {
+        Arc::new(crate::mcp::schema::SchemaCache::new(
+            config.mcp.tool_schema_ttl,
+        ))
+    });
+
     let state = AppState {
         api_key_store: Arc::clone(&store),
         db: pool,
@@ -162,6 +169,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(RetryPolicy::new(&config.retry)),
         audit: audit_sink,
+        mcp_schemas,
         default_request_timeout: config.server.request_timeout,
         max_request_timeout: config.server.max_request_timeout,
         max_response_bytes: config.server.max_response_bytes,

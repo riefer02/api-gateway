@@ -6,6 +6,7 @@ use axum::{
 };
 use std::{
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Instant,
 };
 
@@ -277,9 +278,28 @@ async fn apply_tool_policy(
             }
 
             audit.mcp(Some(&evaluated.method), evaluated.tool.as_deref());
+
+            // Arguments are checked against the tool's own advertised schema,
+            // learned from `tools/list`. A miss (cold cache, no schema) passes:
+            // the tool still validates, and rejecting on absence of evidence
+            // would break a perfectly good call.
+            if let Some(cache) = state.mcp_schemas.as_deref()
+                && let Some(violation) =
+                    mcp::schema::check(&evaluated.calls, &route.upstream.id, cache)
+            {
+                audit.deny();
+                metrics::counter!("gateway_mcp_invalid_params_total", "route" => route.id.clone())
+                    .increment(1);
+                return Ok(invalid_params(&violation));
+            }
+
             let filter = (evaluated.wants_tools_list && !allowed.is_all()).then(|| ToolFilter {
                 allowed: allowed.clone(),
                 require_tools: true,
+                schemas: state
+                    .mcp_schemas
+                    .as_ref()
+                    .map(|cache| (Arc::clone(cache), route.upstream.id.clone())),
             });
 
             if let Ok(length) = HeaderValue::from_str(&bytes.len().to_string()) {
@@ -349,6 +369,24 @@ fn header_mismatch(message: &str) -> PolicyOutcome {
         StatusCode::BAD_REQUEST,
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(mcp::header_mismatch_body(message)),
+    )
+        .into_response();
+
+    PolicyOutcome::Deny(response)
+}
+
+/// A `200` with a JSON-RPC `InvalidParams` body. 200 is deliberate, as with a
+/// denial: most MCP clients read a non-2xx as a transport failure, not a
+/// protocol error they can show the model.
+fn invalid_params(violation: &mcp::schema::Violation) -> PolicyOutcome {
+    let response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(mcp::rpc_error_body(
+            -32602,
+            violation.id.clone(),
+            &violation.message(),
+        )),
     )
         .into_response();
 

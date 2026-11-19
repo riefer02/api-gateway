@@ -963,6 +963,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_missing_a_required_argument_never_reaches_the_upstream() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [{
+                            "name": "search",
+                            "description": "search tickets",
+                            "inputSchema": {
+                                "type": "object",
+                                "required": ["query"],
+                                "properties": {"query": {"type": "string"}}
+                            }
+                        }]
+                    }
+                })),
+            )
+            // Only the list is forwarded. The rejected call must not be, which
+            // is what `expect(1)` proves.
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (app, token) = app_with_policy(&upstream.uri(), service_policy());
+
+        let list = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })
+        .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swapi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("content-length", list.len())
+                    .body(Body::from(list))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "search", "arguments": {}}
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swapi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("content-length", call.len())
+                    .body(Body::from(call))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // A protocol error, not a transport failure: the client gets a JSON-RPC
+        // body it can show the model.
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["error"]["code"], -32602);
+        assert_eq!(body["id"], 2);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("query"),
+            "message should name the missing argument: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn cors_preflight_is_answered_before_auth_and_other_origins_are_refused() {
         let config = testing::config_with(&[("CORS_ALLOWED_ORIGINS", "https://app.example.com")]);
         let app = crate::app::build_app(&config, testing::empty_state_with(&config));

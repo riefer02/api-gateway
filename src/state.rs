@@ -56,6 +56,9 @@ pub(crate) struct AppState {
     pub(crate) breakers: Arc<BreakerRegistry>,
     pub(crate) retry: Arc<RetryPolicy>,
     pub(crate) audit: Arc<dyn crate::audit::AuditSink>,
+    /// Tool schemas learned from `tools/list`. `None` disables input
+    /// validation, either because it is configured off or no TTL was set.
+    pub(crate) mcp_schemas: Option<Arc<crate::mcp::schema::SchemaCache>>,
     pub(crate) default_request_timeout: Duration,
     pub(crate) max_request_timeout: Duration,
     pub(crate) max_response_bytes: u64,

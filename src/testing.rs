@@ -192,6 +192,11 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
         audit: Arc::new(crate::audit::DisabledAudit),
+        mcp_schemas: (!config.mcp.tool_schema_ttl.is_zero()).then(|| {
+            Arc::new(crate::mcp::schema::SchemaCache::new(
+                config.mcp.tool_schema_ttl,
+            ))
+        }),
         default_request_timeout: config.server.request_timeout,
         max_request_timeout: config.server.max_request_timeout,
         max_response_bytes: config.server.max_response_bytes,
@@ -228,6 +233,11 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
         audit: Arc::new(crate::audit::DisabledAudit),
+        mcp_schemas: (!config.mcp.tool_schema_ttl.is_zero()).then(|| {
+            Arc::new(crate::mcp::schema::SchemaCache::new(
+                config.mcp.tool_schema_ttl,
+            ))
+        }),
         default_request_timeout: config.server.request_timeout,
         max_request_timeout: config.server.max_request_timeout,
         max_response_bytes: config.server.max_response_bytes,

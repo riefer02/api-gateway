@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 226 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 237 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -238,7 +238,8 @@ appear. Writes go through a bounded queue and a batched insert; a full queue inc
   replica, so N replicas enforce N times the configured rate.
 - **MCP policy**: routes may enforce a role-based tool allow-list; denied calls are
   JSON-RPC errors, `tools/list` is filtered, and every authenticated call is audited
-  with the user, assistant, tool, and decision.
+  with the user, assistant, tool, and decision. Tool arguments are checked against
+  the schema the upstream advertised in `tools/list`.
 - **Circuit breaker**: per upstream, consecutive-failure trigger, cooldown, single
   half-open probe. Open circuits answer `503` with `Retry-After`.
 - **Retries**: idempotent, body-less requests are retried on `502`/`503`/`504`,
@@ -376,6 +377,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `UPSTREAM_ALLOW_HOSTS` | — | Comma-separated allowlist; required in production |
 | `ROUTE_REFRESH_INTERVAL_MS` | `2000` | Route table poll interval |
 | `UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `64` | Idle sockets kept per upstream client, per replica; bounds idle accumulation, not peak concurrency |
+| `MCP_TOOL_SCHEMA_TTL_SECS` | `300` | How long a learned tool schema is trusted; `0` disables argument validation |
 | `RATE_LIMIT_BACKEND` | `local` | `redis` is rejected until implemented |
 | `RATE_LIMIT_IP_PER_MINUTE` | `600` | Pre-auth abuse control; `0` disables |
 | `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | Per-tenant fairness; `0` disables |
@@ -533,6 +535,13 @@ stateless-only.
   JSON-RPC error envelopes pass through. `Mcp-Method`, `Mcp-Name`, and
   `MCP-Protocol-Version` must agree with the body when present. Filtered lists are
   rewritten `cacheScope: private` and lose their shared-cache `ttlMs`.
+- **Argument validation.** `tools/list` responses teach the gateway each tool's
+  `inputSchema`, cached for `MCP_TOOL_SCHEMA_TTL_SECS`. A `tools/call` whose
+  arguments are not an object, or that omits a field the schema marks `required`,
+  is refused locally with JSON-RPC `-32602` and never reaches the upstream. This is
+  deliberately not a JSON Schema engine: unsupported keywords mean "no opinion", and
+  a tool the gateway has not seen listed fails open. The tool still validates;
+  the schema is one the upstream chose to publish.
 - **Upstream identity.** Routes can declare an audience. The gateway exchanges the
   caller's token with RFC 8693 and sends a short-lived token minted for that
   upstream. The inbound token is never forwarded to another audience.
@@ -589,6 +598,11 @@ api-gateway admin route put mcp \
 - Prompt-injection and tool-poisoning defence beyond tool allow-lists, output caps,
   and the planned schema pinning. Do not claim the gateway makes an unsafe tool
   safe.
+- Full JSON Schema validation. The gateway checks that arguments are an object and
+  that advertised `required` fields are present; types, formats, `oneOf` and the
+  rest are the tool's business. Schema *pinning* — refusing a tool whose definition
+  changed after approval — is not built either, so a poisoned `tools/list` is
+  filtered for authorization but not for intent.
 - Opaque-token introspection. JWT access tokens are supported; introspection is a
   deliberate seam, not a silent fallback.
 - A static upstream credential store. Token exchange is the supported path; a

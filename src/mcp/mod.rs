@@ -5,6 +5,8 @@
 //! envelope, decides whether a tool may be called, and leaves every protocol
 //! semantic to the upstream server.
 
+pub(crate) mod schema;
+
 use std::collections::{HashMap, HashSet};
 
 use serde::{
@@ -147,12 +149,15 @@ impl AllowedTools {
 }
 
 /// Response filtering instructions for a `tools/list` request.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ToolFilter {
     pub(crate) allowed: AllowedTools,
     /// `tools/list` must return a `result.tools` array; discovery and error
     /// envelopes must pass through unchanged.
     pub(crate) require_tools: bool,
+    /// Where learned tool schemas go, and the upstream they belong to. `None`
+    /// disables schema learning, and therefore input validation.
+    pub(crate) schemas: Option<(std::sync::Arc<schema::SchemaCache>, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -184,8 +189,18 @@ struct RpcMessage {
     params: Option<Value>,
 }
 
+/// One `tools/call` in a request, kept so its arguments can be checked
+/// against the tool's advertised schema before the upstream sees them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolCall {
+    pub(crate) name: String,
+    pub(crate) arguments: Option<Value>,
+    /// The JSON-RPC id, so a rejection answers the right request.
+    pub(crate) id: Option<Value>,
+}
+
 /// A request the gateway understood well enough to audit and authorize.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EvaluatedRequest {
     pub(crate) method: String,
     pub(crate) tool: Option<String>,
@@ -193,6 +208,8 @@ pub(crate) struct EvaluatedRequest {
     pub(crate) wants_tools_list: bool,
     pub(crate) batch: bool,
     pub(crate) protocol_version: Option<String>,
+    /// Every `tools/call` in the request, in order. Batches may hold several.
+    pub(crate) calls: Vec<ToolCall>,
 }
 
 /// Parses the request, enforces the tool policy, and returns the method and tool
@@ -204,6 +221,7 @@ pub(crate) fn evaluate(body: &[u8], allowed: &AllowedTools) -> Result<EvaluatedR
     let mut audit_tool: Option<String> = None;
     let mut wants_tools_list = false;
     let mut protocol_version = None;
+    let mut calls = Vec::new();
 
     for message in messages {
         if message.jsonrpc != "2.0" {
@@ -244,6 +262,16 @@ pub(crate) fn evaluate(body: &[u8], allowed: &AllowedTools) -> Result<EvaluatedR
                 });
             }
 
+            calls.push(ToolCall {
+                name: tool.to_owned(),
+                arguments: message
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("arguments"))
+                    .cloned(),
+                id: message.id.clone(),
+            });
+
             // Prefer a tool call for audit attribution: a batch may also carry
             // initialize/notifications that would otherwise hide the call.
             if audit_tool.is_none() {
@@ -261,6 +289,7 @@ pub(crate) fn evaluate(body: &[u8], allowed: &AllowedTools) -> Result<EvaluatedR
         wants_tools_list,
         batch,
         protocol_version,
+        calls,
     })
 }
 
@@ -329,6 +358,13 @@ pub(crate) fn filter_tool_list(body: &[u8], filter: &ToolFilter) -> Option<Vec<u
     }
 
     let mut value: Value = serde_json::from_slice(body).ok()?;
+
+    // Learn before filtering: the shapes belong to the tools that were listed,
+    // whether or not this caller may see them, and a filtered list still tells
+    // the gateway what a permitted tool requires.
+    if let Some((cache, upstream)) = &filter.schemas {
+        schema::learn(&value, upstream, cache);
+    }
 
     if !filter_value(&mut value, filter) {
         return None;
@@ -667,6 +703,7 @@ mod tests {
         let filter = ToolFilter {
             allowed,
             require_tools: true,
+            schemas: None,
         };
         let filtered = filter_tool_list(&body, &filter).expect("filtered");
         let value: Value = serde_json::from_slice(&filtered).unwrap();
@@ -686,6 +723,7 @@ mod tests {
         let filter = ToolFilter {
             allowed: AllowedTools::Set(HashSet::from(["search".to_owned()])),
             require_tools: false,
+            schemas: None,
         };
         let discover = br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{}}}"#;
         assert!(filter_tool_list(discover, &filter).is_some());
@@ -699,6 +737,7 @@ mod tests {
         let filter = ToolFilter {
             allowed: AllowedTools::Set(HashSet::from(["search".to_owned()])),
             require_tools: true,
+            schemas: None,
         };
         let body = json!([
             {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search"},{"name":"delete"}]}},
@@ -732,6 +771,7 @@ mod tests {
         let filter = ToolFilter {
             allowed: AllowedTools::Set(HashSet::new()),
             require_tools: true,
+            schemas: None,
         };
         assert!(filter_tool_list(b"not json", &filter).is_none());
         assert!(filter_tool_list(br#"{"result":{"content":[]}}"#, &filter).is_none());

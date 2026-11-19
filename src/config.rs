@@ -158,6 +158,7 @@ pub struct Config {
     pub routing: RoutingConfig,
     pub limits: LimitsConfig,
     pub retry: RetryConfig,
+    pub mcp: McpConfig,
     /// `None` disables OAuth. API keys keep working either way.
     pub oauth: Option<OAuthConfig>,
     pub data_audit: DataAuditConfig,
@@ -253,6 +254,14 @@ pub struct RetryConfig {
     pub base_delay: Duration,
     /// Retries allowed per request, as a fraction of normal traffic.
     pub budget_ratio: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct McpConfig {
+    /// How long a tool schema learned from `tools/list` stays trusted. Zero
+    /// disables input validation: with nothing remembered, there is nothing to
+    /// check a call against.
+    pub tool_schema_ttl: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -552,6 +561,15 @@ impl Config {
             ))),
         };
 
+        let mcp = McpConfig {
+            tool_schema_ttl: Duration::from_secs(number_or(
+                source,
+                "MCP_TOOL_SCHEMA_TTL_SECS",
+                300_u64,
+                &mut problems,
+            )),
+        };
+
         let config = Self {
             environment,
             server,
@@ -564,6 +582,7 @@ impl Config {
             retry,
             oauth,
             data_audit,
+            mcp,
         };
 
         validate(&config, &mut problems);
@@ -657,6 +676,9 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     }
     if limits.circuit_cooldown.is_zero() {
         problems.push("CIRCUIT_COOLDOWN_SECS must be greater than zero".to_owned());
+    }
+    if config.mcp.tool_schema_ttl > Duration::from_secs(3_600) {
+        problems.push("MCP_TOOL_SCHEMA_TTL_SECS must not exceed 3600 (0 disables)".to_owned());
     }
 
     if config.retry.max_attempts == 0 {
