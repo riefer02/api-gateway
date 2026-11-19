@@ -5,6 +5,14 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tools/list` buffering is bounded and configurable.** Filtering parses the whole
+  catalogue into a `serde_json::Value`, which costs several times the raw bytes; the
+  hard-coded 4 MiB ceiling could turn one legitimate large catalogue into an
+  out-of-memory kill. `MCP_FILTER_MAX_BYTES` (default 1 MiB, 64 KiB–8 MiB) now bounds
+  it, and a catalogue over the ceiling is refused with `502` instead of buffered.
+
 ### Added
 
 - **Claim attribution and caller correlation.** `AUDIT_CLAIMS` copies named token claims

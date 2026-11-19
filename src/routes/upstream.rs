@@ -152,7 +152,6 @@ async fn handle(
 
     let upstream_authorization = upstream_authorization(state, route, &identity).await?;
     let timeout = route.effective_timeout(state.default_request_timeout, state.max_request_timeout);
-    const MCP_BUFFER_CEILING: u64 = 4 * 1024 * 1024;
     let requested_cap = route
         .max_response_bytes
         .unwrap_or(state.max_response_bytes);
@@ -162,7 +161,7 @@ async fn handle(
         requested_cap
     };
     let response_cap = if filter_tools.is_some() {
-        response_cap.min(MCP_BUFFER_CEILING)
+        response_cap.min(state.mcp_filter_max_bytes)
     } else {
         response_cap
     };

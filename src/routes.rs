@@ -1249,6 +1249,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_catalogue_over_the_filter_ceiling_is_refused_not_buffered() {
+        let upstream = wiremock::MockServer::start().await;
+
+        // 80 KiB of catalogue against a 64 KiB ceiling. Parsing this into a
+        // Value costs several times the raw bytes, which is the multiplication
+        // the ceiling exists to bound.
+        let filler = "x".repeat(80 * 1024);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "tools": [{"name": "search", "description": filler}]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[("MCP_FILTER_MAX_BYTES", "65536")]);
+        let (app, token) = app_with_policy_and_config(&upstream.uri(), service_policy(), &config);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/swapi")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("content-length", body.len())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
     async fn cors_preflight_is_answered_before_auth_and_other_origins_are_refused() {
         let config = testing::config_with(&[("CORS_ALLOWED_ORIGINS", "https://app.example.com")]);
         let app = crate::app::build_app(&config, testing::empty_state_with(&config));

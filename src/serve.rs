@@ -166,6 +166,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         retry: Arc::new(RetryPolicy::new(&config.retry)),
         audit: audit_sink,
         mcp_schemas,
+        mcp_filter_max_bytes: config.mcp.filter_max_bytes,
         default_request_timeout: config.server.request_timeout,
         max_request_timeout: config.server.max_request_timeout,
         max_response_bytes: config.server.max_response_bytes,

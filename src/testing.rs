@@ -197,6 +197,7 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
                 config.mcp.tool_schema_ttl,
             ))
         }),
+        mcp_filter_max_bytes: config.mcp.filter_max_bytes,
         default_request_timeout: config.server.request_timeout,
         max_request_timeout: config.server.max_request_timeout,
         max_response_bytes: config.server.max_response_bytes,
@@ -240,6 +241,7 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
                 config.mcp.tool_schema_ttl,
             ))
         }),
+        mcp_filter_max_bytes: config.mcp.filter_max_bytes,
         default_request_timeout: config.server.request_timeout,
         max_request_timeout: config.server.max_request_timeout,
         max_response_bytes: config.server.max_response_bytes,

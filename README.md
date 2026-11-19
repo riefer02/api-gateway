@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 262 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 268 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -407,6 +407,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `ROUTE_REFRESH_INTERVAL_MS` | `2000` | Route table poll interval |
 | `UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `64` | Idle sockets kept per upstream client, per replica; bounds idle accumulation, not peak concurrency |
 | `MCP_TOOL_SCHEMA_TTL_SECS` | `300` | How long a learned tool schema is trusted; `0` disables argument validation |
+| `MCP_FILTER_MAX_BYTES` | `1048576` | Largest `tools/list` body buffered for filtering; larger catalogues are refused |
 | `RATE_LIMIT_BACKEND` | `local` | `redis` is rejected until implemented |
 | `RATE_LIMIT_IP_PER_MINUTE` | `600` | Pre-auth abuse control; `0` disables |
 | `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | Per-tenant fairness; `0` disables |
@@ -565,7 +566,10 @@ stateless-only.
   wrong-content-type or unparseable list fails closed. `server/discover` and
   JSON-RPC error envelopes pass through. `Mcp-Method`, `Mcp-Name`, and
   `MCP-Protocol-Version` must agree with the body when present. Filtered lists are
-  rewritten `cacheScope: private` and lose their shared-cache `ttlMs`. Setting
+  rewritten `cacheScope: private` and lose their shared-cache `ttlMs`. A catalogue
+  larger than `MCP_FILTER_MAX_BYTES` is refused with `502` rather than parsed: the
+  buffered `Value` costs several times the raw bytes, and an unbounded one is an
+  out-of-memory kill rather than an error. Setting
   `RATE_LIMIT_TOOL_PER_MINUTE` adds a per-tenant bucket per tool, so one tenant
   cannot monopolise an expensive one; `gateway_mcp_tool_calls_total` counts calls
   by tenant, tool and decision, with denied names collapsed to `unlisted` so a

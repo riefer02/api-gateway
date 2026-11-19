@@ -262,6 +262,13 @@ pub struct McpConfig {
     /// disables input validation: with nothing remembered, there is nothing to
     /// check a call against.
     pub tool_schema_ttl: Duration,
+    /// Largest `tools/list` body the gateway will buffer to filter it.
+    ///
+    /// Filtering requires parsing the whole catalogue into memory, and a
+    /// parsed `serde_json::Value` costs several times the bytes it came from.
+    /// The ceiling bounds that multiplication: a larger catalogue is refused
+    /// rather than allowed to become an out-of-memory kill.
+    pub filter_max_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -607,6 +614,12 @@ impl Config {
                 300_u64,
                 &mut problems,
             )),
+            filter_max_bytes: number_or(
+                source,
+                "MCP_FILTER_MAX_BYTES",
+                1_048_576_u64,
+                &mut problems,
+            ),
         };
 
         let config = Self {
@@ -724,6 +737,9 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
     }
     if config.mcp.tool_schema_ttl > Duration::from_secs(3_600) {
         problems.push("MCP_TOOL_SCHEMA_TTL_SECS must not exceed 3600 (0 disables)".to_owned());
+    }
+    if !(65_536..=8_388_608).contains(&config.mcp.filter_max_bytes) {
+        problems.push("MCP_FILTER_MAX_BYTES must be between 65536 and 8388608".to_owned());
     }
 
     if config.retry.max_attempts == 0 {
@@ -1376,6 +1392,32 @@ mod tests {
             error
                 .to_string()
                 .contains("UPSTREAM_EGRESS must be")
+        );
+    }
+
+    #[test]
+    fn the_mcp_filter_ceiling_is_bounded_and_configurable() {
+        let config = Config::from_source(&valid_development()).expect("valid config");
+        assert_eq!(config.mcp.filter_max_bytes, 1_048_576);
+
+        let mut env = valid_development();
+        env.insert("MCP_FILTER_MAX_BYTES".to_owned(), "2097152".to_owned());
+        assert_eq!(
+            Config::from_source(&env)
+                .expect("valid config")
+                .mcp
+                .filter_max_bytes,
+            2_097_152
+        );
+
+        let mut env = valid_development();
+        env.insert("MCP_FILTER_MAX_BYTES".to_owned(), "1024".to_owned());
+        let error = Config::from_source(&env).expect_err("too small");
+
+        assert!(
+            error
+                .to_string()
+                .contains("MCP_FILTER_MAX_BYTES")
         );
     }
 

@@ -92,6 +92,8 @@ pub(crate) struct AppState {
     /// Tool schemas learned from `tools/list`. `None` disables input
     /// validation, either because it is configured off or no TTL was set.
     pub(crate) mcp_schemas: Option<Arc<crate::mcp::schema::SchemaCache>>,
+    /// Bound on a buffered `tools/list` body. See `McpConfig::filter_max_bytes`.
+    pub(crate) mcp_filter_max_bytes: u64,
     pub(crate) default_request_timeout: Duration,
     pub(crate) max_request_timeout: Duration,
     pub(crate) max_response_bytes: u64,
