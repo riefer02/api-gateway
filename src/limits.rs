@@ -6,6 +6,10 @@ use std::{
 
 use crate::config::{LimitsConfig, RateLimitBackend};
 
+/// Upstreams tracked by the in-process registries. The control plane can create
+/// and delete them indefinitely; these maps must not grow with that history.
+const MAX_TRACKED_UPSTREAMS: usize = 4_096;
+
 /// Outcome of one rate-limit decision, rendered into response headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
@@ -221,6 +225,16 @@ impl BreakerRegistry {
     /// Allows the request, or rejects it while the circuit is open.
     pub(crate) fn check(&self, upstream: &str) -> Result<(), BreakerRejection> {
         let mut breakers = self.lock();
+
+        // Upstream ids come from the control plane and change over time; the
+        // registry must not grow with history. Resetting loses breaker state,
+        // which is the safe direction: it forgets an outage rather than
+        // remembering an id that no longer exists.
+        if breakers.len() >= MAX_TRACKED_UPSTREAMS && !breakers.contains_key(upstream) {
+            breakers.clear();
+            tracing::warn!("breaker registry reached its cap; state reset");
+        }
+
         let breaker = breakers
             .entry(upstream.to_owned())
             .or_insert_with(|| Breaker {
@@ -293,18 +307,16 @@ impl BreakerRegistry {
     pub(crate) fn record_failure(&self, upstream: &str) {
         let mut breakers = self.lock();
 
-        if !breakers.contains_key(upstream) {
-            breakers.insert(
-                upstream.to_owned(),
-                Breaker {
-                    state: State::Closed { failures: 0 },
-                },
-            );
+        if breakers.len() >= MAX_TRACKED_UPSTREAMS && !breakers.contains_key(upstream) {
+            breakers.clear();
+            tracing::warn!("breaker registry reached its cap; state reset");
         }
 
         let breaker = breakers
-            .get_mut(upstream)
-            .expect("breaker was just inserted");
+            .entry(upstream.to_owned())
+            .or_insert(Breaker {
+                state: State::Closed { failures: 0 },
+            });
 
         breaker.state = match breaker.state {
             State::Closed { failures } if failures + 1 >= self.failure_threshold => State::Open {
@@ -586,6 +598,13 @@ impl BulkheadRegistry {
                 .bulkheads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // Same reasoning as the breaker registry: in-flight permits keep
+            // their own Arc, so dropping an idle entry is safe.
+            if bulkheads.len() >= MAX_TRACKED_UPSTREAMS && !bulkheads.contains_key(upstream) {
+                bulkheads.clear();
+                tracing::warn!("bulkhead registry reached its cap; state reset");
+            }
 
             Arc::clone(
                 bulkheads
