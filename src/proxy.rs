@@ -50,6 +50,11 @@ const HOP_BY_HOP: &[&str] = &[
 /// Gateway credentials and framing headers: never forwarded upstream.
 const GATEWAY_OWNED_REQUEST: &[&str] = &["host", "authorization", "cookie"];
 
+/// Trace context belongs to the gateway. A caller-supplied one would let it
+/// claim parentage for spans it did not create, and it must never outlive the
+/// context injected below.
+const TRACE_HEADERS: &[&str] = &["traceparent", "tracestate", "baggage"];
+
 /// Client-supplied forwarding headers are dropped until the trusted-proxy
 /// model lands; otherwise any caller can spoof its origin.
 const FORWARDED_HEADERS: &[&str] = &[
@@ -289,6 +294,25 @@ fn outbound_headers(
         headers.insert("x-request-id", value);
     }
 
+    // Continue the trace into the upstream instead of ending it at the
+    // gateway. Without a provider this is a no-op, which is why the forged
+    // headers are dropped above rather than relied on to be overwritten.
+    {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let context = tracing::Span::current().context();
+
+        if context.has_active_span() {
+            opentelemetry::global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(
+                    &context,
+                    &mut opentelemetry_http::HeaderInjector(&mut headers),
+                );
+            });
+        }
+    }
+
     // Replace whatever the caller sent with the address we actually resolved.
     if let Some(client) = parts
         .extensions
@@ -304,6 +328,7 @@ fn outbound_headers(
 fn is_dropped_request_header(name: &str, connection_tokens: &[String]) -> bool {
     HOP_BY_HOP.contains(&name)
         || GATEWAY_OWNED_REQUEST.contains(&name)
+        || TRACE_HEADERS.contains(&name)
         || FORWARDED_HEADERS.contains(&name)
         || FORWARDED_PREFIXES
             .iter()
@@ -1150,6 +1175,9 @@ mod property_tests {
                 "cf-connecting-ip",
                 "x-real-ip",
                 "x-http-method-override",
+                "traceparent",
+                "tracestate",
+                "baggage",
             ]),
         ) {
             let request = Request::builder()

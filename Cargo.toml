@@ -50,3 +50,7 @@ proptest = "1.12.0"
 serde_json = "1.0.154"
 wiremock = "0.6.5"
 
+[lints.rust]
+# No unsafe anywhere in this crate. Forbidding it at compile time keeps the
+# property true without a reviewer having to notice a new `unsafe` block.
+unsafe_code = "forbid"

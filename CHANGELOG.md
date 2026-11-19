@@ -7,6 +7,22 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **MCP argument validation.** On a tool-policy route the gateway learns each
+  tool's `inputSchema` from `tools/list` and refuses a `tools/call` whose arguments
+  are not an object, or that omits an advertised `required` field, with JSON-RPC
+  `-32602`. Deliberately not a JSON-Schema engine: unsupported keywords mean "no
+  opinion" and an unlearned tool fails open. `MCP_TOOL_SCHEMA_TTL_SECS` (default
+  `300`, `0` disables).
+- **Per-tool quota and counters.** `RATE_LIMIT_TOOL_PER_MINUTE` adds a bucket keyed
+  by tenant and tool; `gateway_mcp_tool_calls_total` counts by tenant, tool and
+  decision. Denied tool names collapse to `unlisted` so a caller cannot create
+  metric series by inventing names.
+- **Bound on idle upstream connections.** `UPSTREAM_POOL_MAX_IDLE_PER_HOST`
+  (default `64`, valid `1..=1024`). Previously unbounded, so each replica could
+  retain as many idle sockets per upstream as its peak concurrency produced.
+- **Trace context reaches upstreams.** The gateway injects `traceparent` on
+  proxied requests, and drops caller-supplied `traceparent`, `tracestate` and
+  `baggage` so a client cannot claim parentage for spans it did not create.
 - **OAuth 2.1 resource server.** JWKS cache with cooldown and outage handling, JWT
   validation (issuer, audience, expiry, `nbf`, algorithm allow-list, ID-token
   rejection), RFC 9728 protected-resource metadata, and MCP-shaped `401`/`403`
