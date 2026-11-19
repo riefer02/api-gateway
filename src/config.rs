@@ -286,6 +286,10 @@ pub struct LimitsConfig {
     pub tenant_per_minute: u32,
     /// Requests per minute per authenticated user. Zero disables the limiter.
     pub user_per_minute: u32,
+    /// Tool calls per minute per tenant per tool. Zero disables the limiter.
+    /// Only enforced on routes with a tool policy: without one, the gateway
+    /// does not know which tool a request names.
+    pub tool_per_minute: u32,
     /// Consecutive upstream failures before the circuit opens.
     pub circuit_failure_threshold: u32,
     pub circuit_cooldown: Duration,
@@ -521,6 +525,7 @@ impl Config {
                 600_u32,
                 &mut problems,
             ),
+            tool_per_minute: number_or(source, "RATE_LIMIT_TOOL_PER_MINUTE", 0_u32, &mut problems),
             circuit_failure_threshold: number_or(
                 source,
                 "CIRCUIT_FAILURE_THRESHOLD",

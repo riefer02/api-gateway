@@ -132,7 +132,7 @@ async fn handle(
     }
 
     let (mut request, filter_tools) =
-        match apply_tool_policy(state, request, route, &identity, audit).await? {
+        match apply_tool_policy(state, request, route, &identity, audit, rate_headers).await? {
             PolicyOutcome::Forward(request, filter) => (request, filter),
             PolicyOutcome::Deny(response) => return Ok(response),
         };
@@ -195,6 +195,7 @@ async fn apply_tool_policy(
     route: &routing::CompiledRoute,
     identity: &auth::Principal,
     audit: &mut AuditDraft,
+    rate_headers: &mut HeaderMap,
 ) -> Result<PolicyOutcome, AppError> {
     if !route.tool_policy.is_enforcing() {
         let request = limit_undeclared_body(request, state.body_limit).await?;
@@ -290,6 +291,7 @@ async fn apply_tool_policy(
                 audit.deny();
                 metrics::counter!("gateway_mcp_invalid_params_total", "route" => route.id.clone())
                     .increment(1);
+                count_tool_call(identity, &violation.tool, "invalid");
                 return Ok(invalid_params(&violation));
             }
 
@@ -301,6 +303,22 @@ async fn apply_tool_policy(
                     .as_ref()
                     .map(|cache| (Arc::clone(cache), route.upstream.id.clone())),
             });
+
+            // Per-tool quota. Only calls the policy already allowed reach
+            // here, so a caller cannot mint buckets by inventing names.
+            if let Some(limiter) = state.limits.tool.as_ref() {
+                for call in &evaluated.calls {
+                    check_limit(
+                        limiter,
+                        &format!("tool:{}:{}", identity.tenant_id.as_str(), call.name),
+                        rate_headers,
+                    )?;
+                }
+            }
+
+            for call in &evaluated.calls {
+                count_tool_call(identity, &call.name, "allow");
+            }
 
             if let Ok(length) = HeaderValue::from_str(&bytes.len().to_string()) {
                 parts
@@ -317,6 +335,7 @@ async fn apply_tool_policy(
             audit.mcp(Some("tools/call"), Some(&tool));
             audit.deny();
             metrics::counter!("gateway_mcp_denied_total", "route" => route.id.clone()).increment(1);
+            count_tool_call(identity, &tool, "deny");
 
             let body = mcp::denial_body(
                 id,
@@ -524,6 +543,24 @@ fn check_limit(limiter: &RateLimiter, key: &str, headers: &mut HeaderMap) -> Res
             reset_after_secs: retry_after.as_secs().max(1),
         }),
     }
+}
+
+/// Per-tool call counter.
+///
+/// The tool label carries the caller's own name only when the call was not
+/// denied. A denied name is caller-controlled, so labelling it would let
+/// anyone create unbounded metric series; those collapse to `unlisted`. The
+/// exact name is in the audit row, which is where investigation belongs.
+fn count_tool_call(identity: &auth::Principal, tool: &str, decision: &'static str) {
+    let tool = if decision == "deny" { "unlisted" } else { tool };
+
+    metrics::counter!(
+        "gateway_mcp_tool_calls_total",
+        "tenant" => identity.tenant_id.as_str().to_owned(),
+        "tool" => tool.to_owned(),
+        "decision" => decision,
+    )
+    .increment(1);
 }
 
 fn header_value<T: ToString>(value: &T) -> HeaderValue {

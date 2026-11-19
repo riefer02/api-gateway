@@ -236,9 +236,16 @@ mod tests {
         upstream_uri: &str,
         policy: crate::mcp::ToolPolicy,
     ) -> (axum::Router, String) {
-        let config = testing::config();
+        app_with_policy_and_config(upstream_uri, policy, &testing::config())
+    }
+
+    fn app_with_policy_and_config(
+        upstream_uri: &str,
+        policy: crate::mcp::ToolPolicy,
+        config: &crate::config::Config,
+    ) -> (axum::Router, String) {
         let (mut state, token) =
-            testing::state(&config, upstream_uri, std::time::Duration::from_secs(2));
+            testing::state(config, upstream_uri, std::time::Duration::from_secs(2));
 
         state.routes =
             crate::routing::RouteTableHandle::new(crate::routing::RouteTable::for_tests(
@@ -252,7 +259,7 @@ mod tests {
                 )],
             ));
 
-        (crate::app::build_app(&config, state), token)
+        (crate::app::build_app(config, state), token)
     }
 
     fn service_policy() -> crate::mcp::ToolPolicy {
@@ -1055,6 +1062,56 @@ mod tests {
                 .unwrap()
                 .contains("query"),
             "message should name the missing argument: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_monopolise_one_tool() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config_with(&[("RATE_LIMIT_TOOL_PER_MINUTE", "1")]);
+        let (app, token) = app_with_policy_and_config(&upstream.uri(), service_policy(), &config);
+
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "x"}}
+        })
+        .to_string();
+
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/swapi")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("content-length", call.len())
+                .body(Body::from(call.clone()))
+                .unwrap()
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            second
+                .headers()
+                .contains_key("retry-after")
         );
     }
 

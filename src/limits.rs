@@ -160,6 +160,9 @@ pub(crate) struct RateLimits {
     pub(crate) ip: Option<RateLimiter>,
     pub(crate) tenant: Option<RateLimiter>,
     pub(crate) user: Option<RateLimiter>,
+    /// Keyed by `tenant:tool`. Bounds one tenant monopolising a single tool,
+    /// which the tenant-wide limit cannot see.
+    pub(crate) tool: Option<RateLimiter>,
 }
 
 impl RateLimits {
@@ -176,6 +179,7 @@ impl RateLimits {
             ip: limiter(config.ip_per_minute),
             tenant: limiter(config.tenant_per_minute),
             user: limiter(config.user_per_minute),
+            tool: limiter(config.tool_per_minute),
         }
     }
 }
@@ -374,10 +378,26 @@ mod tests {
             ip_per_minute: 60,
             tenant_per_minute: 600,
             user_per_minute: 60,
+            tool_per_minute: 0,
             circuit_failure_threshold: 2,
             circuit_cooldown: Duration::from_millis(50),
             backend: crate::config::RateLimitBackend::Local,
         }
+    }
+
+    #[test]
+    fn the_tool_limiter_exists_only_when_configured() {
+        let mut config = limits();
+        assert!(RateLimits::new(&config).tool.is_none());
+
+        config.tool_per_minute = 5;
+        assert_eq!(
+            RateLimits::new(&config)
+                .tool
+                .as_ref()
+                .map(RateLimiter::limit),
+            Some(5)
+        );
     }
 
     #[test]

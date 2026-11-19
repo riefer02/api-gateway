@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 237 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 239 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -234,8 +234,8 @@ appear. Writes go through a bounded queue and a batched insert; a full queue inc
 ## Protection
 
 - **Rate limits**: token buckets per client IP (before authentication), per tenant,
-  and per user. `429` carries `Retry-After` and `RateLimit-*`. In-process and per
-  replica, so N replicas enforce N times the configured rate.
+  per user, and per tool per tenant. `429` carries `Retry-After` and `RateLimit-*`.
+  In-process and per replica, so N replicas enforce N times the configured rate.
 - **MCP policy**: routes may enforce a role-based tool allow-list; denied calls are
   JSON-RPC errors, `tools/list` is filtered, and every authenticated call is audited
   with the user, assistant, tool, and decision. Tool arguments are checked against
@@ -382,6 +382,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `RATE_LIMIT_IP_PER_MINUTE` | `600` | Pre-auth abuse control; `0` disables |
 | `RATE_LIMIT_TENANT_PER_MINUTE` | `6000` | Per-tenant fairness; `0` disables |
 | `RATE_LIMIT_USER_PER_MINUTE` | `600` | Per-user fairness for OAuth callers; `0` disables |
+| `RATE_LIMIT_TOOL_PER_MINUTE` | `0` | Per-tool calls per tenant, on tool-policy routes; `0` disables |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures to open |
 | `CIRCUIT_COOLDOWN_SECS` | `30` | Open duration |
 | `RETRY_MAX_ATTEMPTS` | `2` | Total attempts; `1` disables retries |
@@ -534,7 +535,11 @@ stateless-only.
   wrong-content-type or unparseable list fails closed. `server/discover` and
   JSON-RPC error envelopes pass through. `Mcp-Method`, `Mcp-Name`, and
   `MCP-Protocol-Version` must agree with the body when present. Filtered lists are
-  rewritten `cacheScope: private` and lose their shared-cache `ttlMs`.
+  rewritten `cacheScope: private` and lose their shared-cache `ttlMs`. Setting
+  `RATE_LIMIT_TOOL_PER_MINUTE` adds a per-tenant bucket per tool, so one tenant
+  cannot monopolise an expensive one; `gateway_mcp_tool_calls_total` counts calls
+  by tenant, tool and decision, with denied names collapsed to `unlisted` so a
+  caller cannot create metric series by inventing tool names.
 - **Argument validation.** `tools/list` responses teach the gateway each tool's
   `inputSchema`, cached for `MCP_TOOL_SCHEMA_TTL_SECS`. A `tools/call` whose
   arguments are not an object, or that omits a field the schema marks `required`,
