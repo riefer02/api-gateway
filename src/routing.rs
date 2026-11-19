@@ -145,6 +145,7 @@ impl RouteTable {
         rows: Vec<RouteRow>,
         allow_hosts: &[String],
         token_exchange_enabled: bool,
+        pool_max_idle_per_host: usize,
     ) -> Result<Self, Vec<String>> {
         let mut problems = Vec::new();
         let mut routes = Vec::with_capacity(rows.len());
@@ -177,6 +178,7 @@ impl RouteTable {
                 &row,
                 allow_hosts,
                 token_exchange_enabled,
+                pool_max_idle_per_host,
                 &mut upstreams,
                 &mut problems,
             );
@@ -489,6 +491,7 @@ fn compile_upstream(
     row: &RouteRow,
     allow_hosts: &[String],
     token_exchange_enabled: bool,
+    pool_max_idle_per_host: usize,
     cache: &mut HashMap<UpstreamKey, Arc<Upstream>>,
     problems: &mut Vec<String>,
 ) -> Option<Arc<Upstream>> {
@@ -542,6 +545,10 @@ fn compile_upstream(
         // A redirect could leave the allowlisted host, so the gateway never
         // follows one; the client receives the 3xx and decides.
         .redirect(reqwest::redirect::Policy::none())
+        // Idle sockets are retained for reuse but never indefinitely: reqwest
+        // defaults to unbounded, which lets replicas × upstreams hoard
+        // connections the upstream still counts against its own limit.
+        .pool_max_idle_per_host(pool_max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(30))
         .user_agent(concat!("api-gateway/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -720,6 +727,7 @@ pub(crate) struct RouteSource {
     pool: PgPool,
     allow_hosts: Vec<String>,
     token_exchange_enabled: bool,
+    pool_max_idle_per_host: usize,
 }
 
 impl RouteSource {
@@ -727,11 +735,13 @@ impl RouteSource {
         pool: PgPool,
         allow_hosts: Vec<String>,
         token_exchange_enabled: bool,
+        pool_max_idle_per_host: usize,
     ) -> Self {
         Self {
             pool,
             allow_hosts,
             token_exchange_enabled,
+            pool_max_idle_per_host,
         }
     }
 
@@ -791,6 +801,7 @@ impl RouteSource {
             rows,
             &self.allow_hosts,
             self.token_exchange_enabled,
+            self.pool_max_idle_per_host,
         )
         .map_err(RouteTableError::Invalid)
     }
@@ -939,7 +950,7 @@ mod tests {
     }
 
     fn table(rows: Vec<RouteRow>) -> RouteTable {
-        RouteTable::compile(1, rows, &[], false).expect("valid route table")
+        RouteTable::compile(1, rows, &[], false, 64).expect("valid route table")
     }
 
     fn found<'a>(table: &'a RouteTable, method: HttpMethod, path: &str) -> &'a CompiledRoute {
@@ -1062,6 +1073,7 @@ mod tests {
             vec![row("a", "/api", &["GET"]), row("b", "/api", &["GET"])],
             &[],
             false,
+            64,
         )
         .expect_err("ambiguous table");
 
@@ -1079,6 +1091,7 @@ mod tests {
             vec![row("api", "/api", &["GET"])],
             &["allowed.example".to_owned()],
             false,
+            64,
         )
         .expect_err("host not allowed");
 
@@ -1203,7 +1216,8 @@ mod tests {
         let mut route = row("mcp", "/mcp", &["POST"]);
         route.tool_policy = serde_json::json!({"mode": "allow_list", "roles": {}});
 
-        let problems = RouteTable::compile(1, vec![route], &[], false).expect_err("invalid policy");
+        let problems =
+            RouteTable::compile(1, vec![route], &[], false, 64).expect_err("invalid policy");
         assert!(problems[0].contains("at least one role"));
     }
 
@@ -1419,7 +1433,7 @@ mod behaviour_tests {
             return;
         };
 
-        let source = RouteSource::new(pool.clone(), Vec::new(), false);
+        let source = RouteSource::new(pool.clone(), Vec::new(), false, 64);
 
         let before = source.version().await.expect("version");
 

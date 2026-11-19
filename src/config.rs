@@ -260,6 +260,10 @@ pub struct RoutingConfig {
     /// Empty means "allow any host"; production requires a non-empty list.
     pub allow_hosts: Vec<String>,
     pub refresh_interval: Duration,
+    /// Idle sockets kept per upstream host, per replica. Bounded so that
+    /// replicas × upstreams cannot hoard an unbounded number of connections;
+    /// peak concurrency is limited separately, not by this value.
+    pub pool_max_idle_per_host: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -483,6 +487,12 @@ impl Config {
                 2_000_u64,
                 &mut problems,
             )),
+            pool_max_idle_per_host: number_or(
+                source,
+                "UPSTREAM_POOL_MAX_IDLE_PER_HOST",
+                64_usize,
+                &mut problems,
+            ),
         };
 
         let limits = LimitsConfig {
@@ -629,6 +639,13 @@ fn validate(config: &Config, problems: &mut Vec<String>) {
 
     if routing.refresh_interval.is_zero() {
         problems.push("ROUTE_REFRESH_INTERVAL_MS must be greater than zero".to_owned());
+    }
+    if !(1..=1_024).contains(&routing.pool_max_idle_per_host) {
+        problems.push(
+            "UPSTREAM_POOL_MAX_IDLE_PER_HOST must be between 1 and 1024 \
+             (0 would disable connection reuse)"
+                .to_owned(),
+        );
     }
     if limits.circuit_failure_threshold == 0 {
         problems.push("CIRCUIT_FAILURE_THRESHOLD must be at least 1".to_owned());
@@ -1219,6 +1236,45 @@ mod tests {
         assert!(config.auth.dev_api_key_secret.is_none());
         assert!(config.routing.allow_hosts.is_empty());
         assert_eq!(config.auth.pepper.expose(), DEVELOPMENT_PEPPER);
+    }
+
+    #[test]
+    fn upstream_pool_idle_default_is_bounded() {
+        let config = Config::from_source(&valid_development()).expect("valid config");
+
+        // reqwest's own default is unbounded, which is the bug this setting
+        // exists to close; the gateway must never inherit it.
+        assert_eq!(config.routing.pool_max_idle_per_host, 64);
+    }
+
+    #[test]
+    fn parses_an_upstream_pool_override() {
+        let mut env = valid_development();
+        env.insert("UPSTREAM_POOL_MAX_IDLE_PER_HOST".to_owned(), "8".to_owned());
+
+        let config = Config::from_source(&env).expect("valid config");
+
+        assert_eq!(config.routing.pool_max_idle_per_host, 8);
+    }
+
+    #[test]
+    fn rejects_a_pool_size_that_disables_reuse_or_hides_a_typo() {
+        for value in ["0", "100000"] {
+            let mut env = valid_development();
+            env.insert(
+                "UPSTREAM_POOL_MAX_IDLE_PER_HOST".to_owned(),
+                value.to_owned(),
+            );
+
+            let error = Config::from_source(&env).expect_err("invalid pool size");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("UPSTREAM_POOL_MAX_IDLE_PER_HOST must be between 1 and 1024"),
+                "{value} was accepted"
+            );
+        }
     }
 
     #[test]

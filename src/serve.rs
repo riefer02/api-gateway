@@ -130,6 +130,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         pool.clone(),
         config.routing.allow_hosts.clone(),
         exchange.is_some(),
+        config.routing.pool_max_idle_per_host,
     );
     let table = source.load().await?;
 
