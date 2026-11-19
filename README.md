@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 239 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 240 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -16,19 +16,39 @@ and adapted — see [Using this as a template](#using-this-as-a-template).
 
 ## Status
 
-Portfolio-grade and pre-production: not security-audited, not battle-tested under real
-traffic. Read [`docs/threat-model.md`](docs/threat-model.md) before pointing it at anything
-that matters.
+Deployed and operating as a reference implementation. Data plane and control plane are
+complete: API-key and OAuth 2.1 resource-server authentication with a bounded-staleness
+credential cache, a Postgres-backed route table with live reload, a streaming proxy with
+strict header hygiene, MCP tool policy with argument validation, per-call audit, per-IP,
+per-tenant, per-user and per-tool limits, per-upstream circuit breakers, Prometheus
+metrics, OpenTelemetry traces that continue into upstreams, and graceful shutdown. The
+control plane is both a CLI and an HTTP API.
 
-Working data plane and control plane. API-key and OAuth resource-server authentication with a
-bounded-staleness credential cache, a Postgres-backed route table with live reload, streaming proxy with strict header
-hygiene, per-IP and per-tenant rate limits, per-upstream circuit breakers, Prometheus
-metrics, OpenTelemetry traces, and graceful shutdown. The control plane is available as
-both a CLI and an HTTP API.
+The guarantees are structural where they can be:
 
-Ships with a distroless image, a compose stack, Kubernetes manifests, and a Caddy
-edge-TLS example. Not built: distributed rate limiting (needs more than one replica for
-it to mean anything).
+- **Configuration fails closed.** A production deployment cannot start with a development
+  secret, an empty upstream allowlist, or a missing pepper.
+- **Postgres is never on the request path.** Policy is compiled to memory and swapped
+  atomically, so a database outage cannot stop traffic the credential cache can still
+  serve — and readiness reflects that, rather than draining every replica on a blip.
+- **Every failure carries the request id**, and every tool call is attributable to a tenant
+  and a subject whether it was allowed or denied.
+- **Header hygiene in both directions.** Hop-by-hop, `Connection`-named, forwarded,
+  credential, trace and gateway-owned headers are stripped; redirects are never followed.
+
+Known limits, stated rather than discovered:
+
+- Rate limits, retry budgets and circuit breakers are per replica: N replicas enforce
+  N × the configured rate.
+- Idle upstream sockets are bounded; peak concurrency is not (no per-upstream bulkhead yet).
+- The upstream allowlist is enforced when a route is compiled, not when a socket connects.
+- Not independently audited. The threat model, the controls it claims, and the tests that
+  enforce them live in [`docs/threat-model.md`](docs/threat-model.md) and
+  [`SECURITY.md`](SECURITY.md).
+
+Ships with a distroless non-root image, a compose stack, Kubernetes manifests with
+readiness/liveness probes, a PodDisruptionBudget and an HPA, Prometheus alert rules, and a
+Caddy edge-TLS example.
 
 ## Quick start
 

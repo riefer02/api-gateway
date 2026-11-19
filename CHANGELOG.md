@@ -53,6 +53,10 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- **Readiness no longer drains every replica on a database blip.** The probe now answers
+  "can this process still serve?" — a failed ping is tolerated for the credential cache TTL,
+  because cached credentials and the in-memory route table keep working while Postgres is
+  unreachable. Before, one failed ping removed every replica from rotation at once.
 - **`jsonwebtoken` 9 → 12 (CVE-2026-25537).** A malformed `exp` or `nbf` was
   treated as absent, so the check could be skipped. Expiry was a required claim
   here, which closed the dangerous half, but the fix is the upgrade. Enables the

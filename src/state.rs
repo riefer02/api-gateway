@@ -12,36 +12,67 @@ use crate::net::TrustedProxies;
 use crate::retry::RetryPolicy;
 use crate::routing::RouteTableHandle;
 
-/// Cheap to clone: every field is a handle, never a buffer or a lock.
-/// Caches the readiness ping so an unauthenticated probe cannot become a
-/// database amplifier.
+/// Readiness as "can this process still serve?", not "are its dependencies
+/// happy?". Caches the ping so an unauthenticated probe cannot become a
+/// database amplifier, and tolerates a failed ping while credentials are still
+/// servable from cache: pulling every replica out of rotation the instant
+/// Postgres blips turns a dependency hiccup into an outage.
 pub(crate) struct Readiness {
-    cached: tokio::sync::Mutex<Option<(Instant, bool)>>,
+    state: tokio::sync::Mutex<ReadyState>,
     ttl: Duration,
+    /// How long a failed ping is tolerated, normally the credential cache TTL.
+    grace: Duration,
+}
+
+struct ReadyState {
+    checked: Option<(Instant, bool)>,
+    last_ok: Option<Instant>,
 }
 
 impl Readiness {
-    pub(crate) fn new(ttl: Duration) -> Self {
+    pub(crate) fn new(ttl: Duration, grace: Duration) -> Self {
         Self {
-            cached: tokio::sync::Mutex::new(None),
+            state: tokio::sync::Mutex::new(ReadyState {
+                checked: None,
+                last_ok: None,
+            }),
             ttl,
+            grace,
         }
     }
 
     pub(crate) async fn check(&self, pool: &sqlx::PgPool) -> bool {
-        let mut cached = self.cached.lock().await;
+        let mut state = self.state.lock().await;
 
-        if let Some((at, healthy)) = *cached
+        if let Some((at, ready)) = state.checked
             && at.elapsed() < self.ttl
         {
-            return healthy;
+            return ready;
         }
 
+        let now = Instant::now();
         let healthy = crate::db::ping(pool).await.is_ok();
-        *cached = Some((Instant::now(), healthy));
 
-        healthy
+        if healthy {
+            state.last_ok = Some(now);
+        }
+
+        let ready = decide(healthy, state.last_ok, now, self.grace);
+        state.checked = Some((now, ready));
+
+        ready
     }
+}
+
+/// A failed check is tolerated while the last success is within the grace
+/// window. A success is always ready; a failure with no recorded success is
+/// not.
+fn decide(healthy: bool, last_ok: Option<Instant>, now: Instant, grace: Duration) -> bool {
+    if healthy {
+        return true;
+    }
+
+    last_ok.is_some_and(|at| now.saturating_duration_since(at) < grace)
 }
 
 #[derive(Clone)]
@@ -68,4 +99,37 @@ pub(crate) struct AppState {
     pub(crate) metrics: PrometheusHandle,
     pub(crate) readiness: Arc<Readiness>,
     pub(crate) trusted_proxies: Arc<TrustedProxies>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_tolerates_a_blip_within_the_cache_window() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(30);
+
+        assert!(decide(true, None, now, grace), "a healthy ping is ready");
+
+        assert!(
+            !decide(false, None, now, grace),
+            "a failure with no recorded success is not ready"
+        );
+
+        assert!(
+            decide(false, Some(now), now, grace),
+            "a blip inside the grace window stays in rotation"
+        );
+
+        assert!(
+            !decide(false, Some(now - Duration::from_secs(31)), now, grace),
+            "past the grace window the cache is cold and the process cannot serve"
+        );
+
+        assert!(
+            !decide(false, Some(now), now, Duration::ZERO),
+            "zero grace means a failed ping is immediately not ready"
+        );
+    }
 }

@@ -206,6 +206,7 @@ pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (
         metrics: metrics_handle(),
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
+            config.auth.cache_ttl,
         )),
         trusted_proxies: Arc::new(
             crate::net::TrustedProxies::parse(&config.server.trusted_proxies)
@@ -247,6 +248,7 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
         metrics: metrics_handle(),
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
+            config.auth.cache_ttl,
         )),
         trusted_proxies: Arc::new(
             crate::net::TrustedProxies::parse(&config.server.trusted_proxies)

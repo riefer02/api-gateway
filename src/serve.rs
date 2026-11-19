@@ -177,8 +177,11 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
         body_limit: config.server.request_body_limit_bytes,
         metrics_token: config.telemetry.metrics_token.clone(),
         metrics,
+        // A database blip must not drain every replica: while credentials are
+        // still servable from cache, the process can still answer requests.
         readiness: Arc::new(crate::state::Readiness::new(
             std::time::Duration::from_secs(1),
+            config.auth.cache_ttl,
         )),
         trusted_proxies: Arc::clone(&trusted_proxies),
     };
