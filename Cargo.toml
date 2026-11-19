@@ -54,3 +54,11 @@ wiremock = "0.6.5"
 # No unsafe anywhere in this crate. Forbidding it at compile time keeps the
 # property true without a reviewer having to notice a new `unsafe` block.
 unsafe_code = "forbid"
+
+[profile.release]
+# Thin LTO and one codegen unit: the binary is built once per release, so build
+# time is cheap next to the request path it produces.
+lto = "thin"
+codegen-units = 1
+# Deliberately not `panic = "abort"`: CatchPanicLayer turns a panic into a 500
+# instead of dropping every connection on the socket, and that needs unwinding.
