@@ -456,6 +456,22 @@ pub(crate) fn validate_path_prefix(prefix: &str) -> Result<(), String> {
 }
 
 /// One validator for scheme, embedded credentials, and the SSRF allowlist.
+/// The egress verdict for a URL whose host is an IP literal, if any.
+///
+/// `EgressResolver` runs only when a name is resolved; `http://169.254.169.254/`
+/// is connected to directly and would otherwise skip the policy entirely.
+fn literal_host(url: &Url, egress: crate::net::Egress) -> Option<String> {
+    let host = url.host_str()?;
+    let address: std::net::IpAddr = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()?;
+
+    (!egress.allows(address))
+        .then(|| format!("upstream address `{host}` is not allowed by UPSTREAM_EGRESS"))
+}
+
 pub(crate) fn validate_upstream_url(raw: &str, allow_hosts: &[String]) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|error| format!("invalid upstream URL: {error}"))?;
 
@@ -530,6 +546,14 @@ fn compile_upstream(
             return None;
         }
     };
+
+    // A literal address never reaches the resolver, so the egress policy has
+    // to be applied here as well. Without this, the only protection is the
+    // allowlist — and a development deployment has none.
+    if let Some(address) = literal_host(&base_url, routing.egress) {
+        problem(problems, address);
+        return None;
+    }
 
     if row
         .audience
@@ -994,6 +1018,36 @@ mod tests {
 
     fn table(rows: Vec<RouteRow>) -> RouteTable {
         RouteTable::compile(1, rows, &test_routing(), false).expect("valid route table")
+    }
+
+    #[test]
+    fn a_literal_upstream_address_is_held_to_the_egress_policy() {
+        let mut routing = test_routing();
+        routing.egress = crate::net::Egress::DenyLinkLocal;
+
+        for blocked in [
+            "http://169.254.169.254/latest",
+            "http://[fd00:ec2::254]/latest",
+            "http://127.0.0.1:9090",
+        ] {
+            let mut row = row("api", "/api", &["GET"]);
+            row.base_url = blocked.to_owned();
+
+            let problems = RouteTable::compile(1, vec![row], &routing, false)
+                .expect_err("literal must be refused");
+
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("UPSTREAM_EGRESS")),
+                "{blocked} was accepted: {problems:?}"
+            );
+        }
+
+        // A literal that the policy allows still compiles.
+        let mut row = row("api", "/api", &["GET"]);
+        row.base_url = "http://10.1.2.3:8080".to_owned();
+        assert!(RouteTable::compile(1, vec![row], &routing, false).is_ok());
     }
 
     #[test]
