@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 249 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 255 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -38,6 +38,8 @@ The guarantees are structural where they can be:
 - **Egress is resolved, not just parsed.** An allowlisted hostname is filtered by address
   when it resolves, and the client connects to exactly what survived, so the metadata
   service and the gateway's own loopback are unreachable by default.
+- **The control-plane audit is chained.** An edit, insertion or reordering breaks it at
+  a named row, and `admin audit verify` proves it rather than asserting it.
 - **An overloaded upstream sheds load.** With `UPSTREAM_MAX_CONCURRENCY` set, a permit is
   held for the life of the response body — so a long stream counts as the concurrency it
   is — and saturation answers `503` with `Retry-After` rather than queueing without bound.
@@ -580,6 +582,11 @@ stateless-only.
 - **Per-call audit.** Tenant, subject, assistant, tool, decision, status, latency,
   request id, and token id go to a bounded queue and a batched insert. A full queue
   drops and increments a metric rather than adding latency.
+- **Tamper-evident control-plane audit.** Every mutation row carries the hash of its
+  predecessor and a hash of its own contents, appended one writer at a time under an
+  advisory lock. `admin audit verify` walks the chain and exits non-zero at the first
+  row that does not verify. The high-volume data-plane audit stays batched and
+  unchained on purpose: it is not the log an auditor reads.
 - **MCP timing.** Per-route deadline and response cap; `max_response_bytes: 0`
   disables the cap for long-lived streams, and every streamed body has an idle
   timeout (`STREAM_IDLE_TIMEOUT_SECS`). Tool calls carry bodies and are never

@@ -99,6 +99,8 @@ pub(crate) enum AuditCommand {
         #[arg(long)]
         tenant: Option<String>,
     },
+    /// Walk the tamper-evident chain and report the first row that fails
+    Verify,
 }
 
 #[derive(Debug, Subcommand)]
@@ -338,6 +340,27 @@ async fn run_audit_command(
                         .source_ip
                         .unwrap_or_else(|| "-".to_owned())
                 );
+            }
+        }
+        AuditCommand::Verify => {
+            let report = service.verify_audit_chain().await?;
+
+            if report.unchained > 0 {
+                println!(
+                    "{} row(s) written before the chain existed (no hash to check)",
+                    report.unchained
+                );
+            }
+
+            match report.broken {
+                Some(broken) => {
+                    return Err(format!(
+                        "audit chain broken at event {}: {}",
+                        broken.id, broken.reason
+                    )
+                    .into());
+                }
+                None => println!("chain intact: {} rows verified", report.verified),
             }
         }
         AuditCommand::Data {

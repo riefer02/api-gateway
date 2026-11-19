@@ -7,6 +7,13 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Tamper-evident control-plane audit chain.** `audit_events` gains `prev_hash` and
+  `row_hash`; appends are serialised by an advisory lock inside the writing transaction,
+  so two rows cannot claim the same predecessor. `admin audit verify` walks the chain in
+  pages and exits non-zero at the first row that fails, naming it. Rows written before
+  the migration are reported as unchained rather than silently rehashed. The data-plane
+  audit stays batched and unchained: it is high volume, and it is not the log auditors
+  read.
 - **Per-upstream bulkhead.** `UPSTREAM_MAX_CONCURRENCY` bounds in-flight requests to one
   upstream per replica, with `UPSTREAM_QUEUE_TIMEOUT_MS` deciding whether to queue or shed.
   The permit is held until the response body finishes, so a long stream counts as the
