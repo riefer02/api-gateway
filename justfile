@@ -58,6 +58,17 @@ mcp-route:
 docker:
     docker build -t api-gateway:dev .
 
+# Three replicas, one Postgres, one load balancer, one MCP stub. See
+# deploy/local/README.md for what it can and cannot prove.
+cluster-up:
+    docker compose -f deploy/local/compose.yml up -d --build --wait
+
+cluster-down:
+    docker compose -f deploy/local/compose.yml down -v
+
+cluster-limit:
+    ./scripts/cluster-limit-demo.sh
+
 # Measures gateway overhead against a local stub upstream
 bench:
     ./scripts/bench.sh

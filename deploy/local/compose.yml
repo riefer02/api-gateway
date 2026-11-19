@@ -1,0 +1,97 @@
+# A laptop-sized cluster: three gateway replicas behind a load balancer, one
+# Postgres, one MCP stub. Its job is to make replica behaviour observable —
+# per-replica rate limits, connection fan-out, failover, rolling restart —
+# without pretending to be a production network.
+name: api-gateway-local
+
+x-gateway: &gateway
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+  environment:
+    APP_ENV: development
+    HOST: 0.0.0.0
+    PORT: "8080"
+    LOG_LEVEL: info
+    DATABASE_URL: postgres://gateway:gateway@db:5432/gateway
+    AUTH_PEPPER: local-pepper
+    DEV_API_KEY_SECRET: local-secret
+    DEV_API_KEY_SCOPES: read
+    ADMIN_BIND: 0.0.0.0:9090
+    UPSTREAM_ALLOW_HOSTS: stub
+    # The stub is a compose service, so it is on a private network address:
+    # the strict default allows that and still refuses metadata and loopback.
+    UPSTREAM_EGRESS: deny-link-local
+    # Traefik is the peer; without this every client shares one IP bucket.
+    TRUSTED_PROXIES: 172.16.0.0/12
+    ROUTE_REFRESH_INTERVAL_MS: "1000"
+    # Small and deliberately awkward: the demo measures the N x effect.
+    RATE_LIMIT_TENANT_PER_MINUTE: "6"
+    RATE_LIMIT_IP_PER_MINUTE: "0"
+    RATE_LIMIT_USER_PER_MINUTE: "0"
+  expose:
+    - "8080"
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/api-gateway", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  labels:
+    traefik.enable: "true"
+    traefik.http.routers.gateway.rule: PathPrefix(`/`)
+    traefik.http.routers.gateway.entrypoints: web
+    traefik.http.services.gateway.loadbalancer.server.port: "8080"
+    # `STICKY=true` pins a client to one replica by cookie, which is what makes
+    # the per-replica limit behave like a cluster-wide one.
+    traefik.http.services.gateway.loadbalancer.sticky.cookie: ${STICKY:-false}
+    traefik.http.services.gateway.loadbalancer.sticky.cookie.name: gw
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  stub:
+    build:
+      context: ../..
+      dockerfile: deploy/local/stub.Dockerfile
+    restart: unless-stopped
+
+  gateway:
+    <<: *gateway
+    deploy:
+      replicas: 3
+
+  proxy:
+    image: traefik:v3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:8080
+      - --log.level=warn
+    ports:
+      - "127.0.0.1:${CLUSTER_PORT:-8000}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - gateway
+
+volumes:
+  pgdata:
