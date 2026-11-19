@@ -53,6 +53,12 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- **`jsonwebtoken` 9 → 12 (CVE-2026-25537).** A malformed `exp` or `nbf` was
+  treated as absent, so the check could be skipped. Expiry was a required claim
+  here, which closed the dangerous half, but the fix is the upgrade. Enables the
+  `rust_crypto` provider; the pure-Rust crypto stack is 30 additional crates and
+  replaces the ring-backed path. All OAuth tests, including expired-token,
+  wrong-audience and algorithm-confusion cases, pass unchanged.
 - **MCP policy bypasses found in review.** A batch `tools/list` is now filtered even
   when the first message is a notification; `server/discover` and JSON-RPC error
   envelopes pass through instead of returning 502; `Mcp-Name` and
