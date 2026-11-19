@@ -22,6 +22,7 @@ use jsonwebtoken::{
     jwk::{Jwk, JwkSet},
 };
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::config::OAuthConfig;
 use crate::error::AppError;
@@ -51,6 +52,8 @@ pub(crate) struct OAuth {
     metadata_path: String,
     metadata: serde_json::Value,
     jwks: JwksCache,
+    /// Claims to copy into the audit log. Empty means none.
+    audit_claims: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -61,6 +64,8 @@ pub(crate) struct OAuthIdentity {
     pub(crate) scopes: HashSet<String>,
     pub(crate) roles: HashSet<String>,
     pub(crate) token_id: Option<String>,
+    /// Configured claims, as strings, for audit attribution.
+    pub(crate) asserted: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,6 +120,7 @@ impl OAuth {
             metadata_path: metadata_url.path().to_owned(),
             metadata,
             jwks: JwksCache::new(&config.jwks_uri, config.jwks_ttl)?,
+            audit_claims: config.audit_claims.clone(),
         })
     }
 
@@ -225,6 +231,8 @@ impl OAuth {
             .or_else(|| claims.client_id.clone())
             .unwrap_or_else(|| "oauth-client".to_owned());
 
+        let asserted = asserted_claims(&claims.extra, &self.audit_claims);
+
         Ok(OAuthIdentity {
             tenant_id,
             subject: claims.sub,
@@ -232,6 +240,7 @@ impl OAuth {
             scopes,
             roles,
             token_id: claims.jti,
+            asserted,
         })
     }
 
@@ -261,6 +270,53 @@ impl OAuth {
             resource_metadata: self.resource_metadata_url().to_owned(),
         }
     }
+}
+
+/// Copies configured claims out of the token as strings.
+///
+/// Only scalars are accepted. Arrays and objects are skipped rather than
+/// serialised, because this value ends up in an audit row and later in a
+/// header: a structure there is either useless or an injection vector. Control
+/// characters and over-long values are refused for the same reason. A rejected
+/// claim is counted and omitted — never truncated, because a silently shortened
+/// identifier is worse than a missing one.
+fn asserted_claims(
+    extra: &std::collections::BTreeMap<String, Value>,
+    configured: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    const MAX_VALUE: usize = 128;
+
+    let mut asserted = std::collections::BTreeMap::new();
+
+    for name in configured {
+        let Some(value) = extra.get(name) else {
+            continue;
+        };
+
+        let rendered = match value {
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            _ => {
+                metrics::counter!("gateway_claim_rejected_total", "claim" => name.clone())
+                    .increment(1);
+                continue;
+            }
+        };
+
+        let clean = !rendered.is_empty()
+            && rendered.len() <= MAX_VALUE
+            && !rendered.chars().any(char::is_control);
+
+        if !clean {
+            metrics::counter!("gateway_claim_rejected_total", "claim" => name.clone()).increment(1);
+            continue;
+        }
+
+        asserted.insert(name.clone(), rendered);
+    }
+
+    asserted
 }
 
 fn key_algorithm_matches(key: jsonwebtoken::jwk::KeyAlgorithm, header: Algorithm) -> bool {
@@ -358,6 +414,10 @@ struct Claims {
     roles: Option<StringOrList>,
     #[serde(default)]
     groups: Option<StringOrList>,
+    /// Claims the gateway does not interpret, kept so configured ones can be
+    /// recorded. Never read for authorization.
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, Value>,
 }
 
 impl Claims {
@@ -726,6 +786,7 @@ IBtZQ7lereVwJCPn4Be5FQ==
             authorization_servers: vec![ISSUER.to_owned()],
             scopes_supported: vec!["mcp:tools".to_owned()],
             default_tenant: "acme".to_owned(),
+            audit_claims: vec!["project_id".to_owned()],
             token_exchange: None,
         }
     }
@@ -860,6 +921,53 @@ IBtZQ7lereVwJCPn4Be5FQ==
             oauth.authenticate(&token).await,
             Err(OAuthError::Invalid)
         ));
+    }
+
+    #[test]
+    fn configured_claims_are_copied_and_the_rest_are_not() {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert("project_id".to_owned(), serde_json::json!("proj-42"));
+        extra.insert("agent_id".to_owned(), serde_json::json!(7));
+        extra.insert("groups".to_owned(), serde_json::json!(["a", "b"]));
+
+        let asserted = asserted_claims(
+            &extra,
+            &[
+                "project_id".to_owned(),
+                "agent_id".to_owned(),
+                "groups".to_owned(),
+                "missing".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            asserted
+                .get("project_id")
+                .map(String::as_str),
+            Some("proj-42")
+        );
+        assert_eq!(
+            asserted
+                .get("agent_id")
+                .map(String::as_str),
+            Some("7")
+        );
+        assert!(!asserted.contains_key("groups"), "structures are refused");
+        assert!(!asserted.contains_key("missing"));
+    }
+
+    #[test]
+    fn claims_with_control_characters_or_excess_length_are_refused() {
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "project_id".to_owned(),
+            serde_json::json!("proj\r\nX-Injected: 1"),
+        );
+        extra.insert("agent_id".to_owned(), serde_json::json!("a".repeat(129)));
+
+        let asserted = asserted_claims(&extra, &["project_id".to_owned(), "agent_id".to_owned()]);
+
+        assert!(asserted.is_empty());
     }
 
     #[tokio::test]

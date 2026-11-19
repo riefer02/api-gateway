@@ -8,7 +8,7 @@ A production-shaped HTTP API gateway in Rust: authenticates API keys, resolves r
 Postgres, enforces per-route scopes and per-tenant limits, and proxies to allowlisted
 upstreams with streaming bodies, strict header hygiene, tracing, and metrics.
 
-**At a glance:** ~17k lines of Rust, 255 tests, one binary, a distroless image with no
+**At a glance:** ~17k lines of Rust, 262 tests, one binary, a distroless image with no
 shell, and a measured +0.33 ms p50 over a direct call at 77k req/s.
 
 Built on axum 0.8, sqlx 0.9, reqwest 0.13, and OpenTelemetry 0.33. Designed to be cloned
@@ -430,6 +430,7 @@ defaults; `cargo run -- serve --check-config` prints resolved values with secret
 | `DATA_AUDIT_ENABLED` | `true` | Per-call data-plane audit |
 | `DATA_AUDIT_QUEUE_CAPACITY` / `DATA_AUDIT_BATCH_SIZE` | `1024` / `100` | Bounded queue and batch size |
 | `DATA_AUDIT_RETENTION_DAYS` | `90` | Data audit window; `0` keeps forever |
+| `AUDIT_CLAIMS` | — | Token claims recorded in the data-plane audit, e.g. `project_id,agent_id`; max 8 |
 | `MAX_REQUEST_BODY_BYTES` | `1048576` | Inbound body limit |
 | `SHUTDOWN_DRAIN_SECS` | `25` | Graceful drain budget |
 | `OAUTH_ISSUER` | unset | Enables OAuth when set; the IdP issuer |
@@ -582,6 +583,11 @@ stateless-only.
 - **Per-call audit.** Tenant, subject, assistant, tool, decision, status, latency,
   request id, and token id go to a bounded queue and a batched insert. A full queue
   drops and increments a metric rather than adding latency.
+- **Attribution beyond the subject.** `AUDIT_CLAIMS` names token claims — `project_id`,
+  `agent_id`, anything signed by the IdP — and their values are recorded in the
+  per-call audit's `detail`. A caller may also send `X-Run-Id`; it is validated,
+  recorded, and echoed on the response, including on errors, so a client can join its
+  own logs to the audit row. Neither is ever read for authorization.
 - **Tamper-evident control-plane audit.** Every mutation row carries the hash of its
   predecessor and a hash of its own contents, appended one writer at a time under an
   advisory lock. `admin audit verify` walks the chain and exits non-zero at the first

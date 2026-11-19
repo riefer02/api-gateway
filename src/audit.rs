@@ -27,6 +27,8 @@ pub(crate) struct DataAuditEvent {
     pub(crate) latency_ms: u64,
     pub(crate) request_id: Option<String>,
     pub(crate) token_id: Option<String>,
+    /// Identifiers only: configured token claims and the caller's run id.
+    pub(crate) detail: serde_json::Value,
 }
 
 /// One request's audit state, filled as the pipeline learns more.
@@ -41,6 +43,8 @@ pub(crate) struct AuditDraft {
     tool_name: Option<String>,
     decision: Option<&'static str>,
     token_id: Option<String>,
+    asserted: std::collections::BTreeMap<String, String>,
+    run_id: Option<String>,
 }
 
 impl AuditDraft {
@@ -72,6 +76,17 @@ impl AuditDraft {
         self.decision = Some("deny");
     }
 
+    /// Claims the token asserted, for attribution. Never authorization.
+    pub(crate) fn asserted(&mut self, asserted: &std::collections::BTreeMap<String, String>) {
+        self.asserted = asserted.clone();
+    }
+
+    /// A caller-supplied correlation id, distinct from the request id the
+    /// gateway mints: this one is how the caller joins its own logs to ours.
+    pub(crate) fn run_id(&mut self, run_id: Option<&str>) {
+        self.run_id = run_id.map(str::to_owned);
+    }
+
     pub(crate) fn finish(self, status: u16, latency: Duration) -> Option<DataAuditEvent> {
         let tenant_id = self.tenant_id?;
         let auth_method = self.auth_method?;
@@ -83,6 +98,22 @@ impl AuditDraft {
         let decision = self
             .decision
             .unwrap_or(if status < 400 { "allow" } else { "deny" });
+
+        let mut detail = serde_json::Map::new();
+
+        if !self.asserted.is_empty() {
+            detail.insert(
+                "claims".to_owned(),
+                serde_json::to_value(&self.asserted).unwrap_or_default(),
+            );
+        }
+
+        if let Some(run_id) = &self.run_id {
+            detail.insert(
+                "run_id".to_owned(),
+                serde_json::Value::String(run_id.clone()),
+            );
+        }
 
         Some(DataAuditEvent {
             occurred_at: time::OffsetDateTime::now_utc(),
@@ -98,6 +129,7 @@ impl AuditDraft {
             latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
             request_id: crate::request_context::current(),
             token_id: self.token_id,
+            detail: serde_json::Value::Object(detail),
         })
     }
 }
@@ -192,7 +224,7 @@ async fn insert(pool: &PgPool, events: &[DataAuditEvent]) -> Result<(), sqlx::Er
     let mut query = QueryBuilder::new(
         "INSERT INTO data_audit_events
          (occurred_at, tenant_id, subject, assistant, auth_method, mcp_method, route_id,
-          tool_name, decision, status, latency_ms, request_id, token_id)
+          tool_name, decision, status, latency_ms, request_id, token_id, detail)
          ",
     );
 
@@ -209,7 +241,8 @@ async fn insert(pool: &PgPool, events: &[DataAuditEvent]) -> Result<(), sqlx::Er
             .push_bind(i16::try_from(event.status).unwrap_or(0))
             .push_bind(i32::try_from(event.latency_ms).unwrap_or(i32::MAX))
             .push_bind(&event.request_id)
-            .push_bind(&event.token_id);
+            .push_bind(&event.token_id)
+            .push_bind(sqlx::types::Json(&event.detail));
     });
 
     query
@@ -327,6 +360,38 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    #[test]
+    fn the_detail_carries_claims_and_the_run_id() {
+        let mut draft = AuditDraft::default();
+        draft.identity("acme", Some("user-1"), Some("client"), "oauth", None);
+        draft.route("api");
+        draft.asserted(&std::collections::BTreeMap::from([(
+            "project_id".to_owned(),
+            "proj-42".to_owned(),
+        )]));
+        draft.run_id(Some("run-1"));
+
+        let event = draft
+            .finish(200, Duration::from_millis(5))
+            .expect("event");
+
+        assert_eq!(event.detail["claims"]["project_id"], "proj-42");
+        assert_eq!(event.detail["run_id"], "run-1");
+    }
+
+    #[test]
+    fn detail_is_empty_when_nothing_was_asserted() {
+        let mut draft = AuditDraft::default();
+        draft.identity("acme", None, None, "api_key", None);
+        draft.route("api");
+
+        let event = draft
+            .finish(200, Duration::from_millis(5))
+            .expect("event");
+
+        assert_eq!(event.detail, serde_json::json!({}));
+    }
+
     fn event() -> DataAuditEvent {
         DataAuditEvent {
             occurred_at: time::OffsetDateTime::now_utc(),
@@ -342,6 +407,7 @@ mod tests {
             latency_ms: 1,
             request_id: None,
             token_id: None,
+            detail: serde_json::json!({}),
         }
     }
 }

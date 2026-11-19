@@ -28,13 +28,39 @@ pub(crate) async fn dispatch(State(state): State<AppState>, request: Request) ->
     let mut rate_headers = HeaderMap::new();
     let mut audit = AuditDraft::default();
 
-    let mut response = match handle(&state, request, &mut rate_headers, &mut audit).await {
+    // A malformed correlation id is a client bug, so it is refused rather than
+    // ignored: silently dropping it makes the client's logs wrong without
+    // telling anyone.
+    let run_id = match run_id_header(request.headers()) {
+        Ok(run_id) => run_id,
+        Err(error) => return error.into_response(),
+    };
+
+    let mut response = match handle(
+        &state,
+        request,
+        &mut rate_headers,
+        &mut audit,
+        run_id.as_deref(),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
 
     if let Some(event) = audit.finish(response.status().as_u16(), started.elapsed()) {
         state.audit.record(event);
+    }
+
+    // Echo the caller's correlation id, including on failures: the error is
+    // exactly when the client most needs to join its log to ours.
+    if let Some(run_id) = &run_id
+        && let Ok(value) = HeaderValue::from_str(run_id)
+    {
+        response
+            .headers_mut()
+            .insert("x-run-id", value);
     }
 
     // Rate-limit headers belong on failures too, but never overwrite the ones a
@@ -61,6 +87,7 @@ async fn handle(
     mut request: Request,
     rate_headers: &mut HeaderMap,
     audit: &mut AuditDraft,
+    run_id: Option<&str>,
 ) -> Result<Response, AppError> {
     let path = request.uri().path().to_owned();
 
@@ -88,6 +115,8 @@ async fn handle(
         identity.auth_method.as_str(),
         identity.token_id.as_deref(),
     );
+    audit.asserted(&identity.asserted);
+    audit.run_id(run_id);
 
     // Resolve before the tenant/user limiters so a limit rejection is still
     // attributed to a route and can be audited meaningfully.
@@ -420,6 +449,35 @@ async fn apply_tool_policy(
             Err(AppError::bad_request(error.message()))
         }
     }
+}
+
+/// Reads the caller's correlation id. Distinct from `X-Request-Id`, which the
+/// gateway mints: this one is the caller's key for joining its own logs to the
+/// audit row, so it is validated but never trusted for anything else.
+fn run_id_header(headers: &HeaderMap) -> Result<Option<String>, AppError> {
+    const MAX: usize = 128;
+
+    let Some(value) = headers.get("x-run-id") else {
+        return Ok(None);
+    };
+
+    let value = value
+        .to_str()
+        .map_err(|_| AppError::bad_request("`x-run-id` must be valid ASCII"))?;
+
+    let valid = !value.is_empty()
+        && value.len() <= MAX
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
+
+    if !valid {
+        return Err(AppError::bad_request(
+            "`x-run-id` must be 1-128 characters of A-Z, a-z, 0-9, '.', '_', ':' or '-'",
+        ));
+    }
+
+    Ok(Some(value.to_owned()))
 }
 
 /// Reads a header that must occur at most once. Duplicate values are

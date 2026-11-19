@@ -1167,6 +1167,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_run_id_is_echoed_and_validated() {
+        let upstream = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+
+        let config = testing::config();
+        let (app, token) =
+            app_with_policy_and_config(&upstream.uri(), crate::mcp::ToolPolicy::default(), &config);
+
+        let sent = |run_id: &'static str| {
+            Request::builder()
+                .uri("/swapi")
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-run-id", run_id)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(sent("run-abc.1"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-run-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("run-abc.1"),
+            "the caller must be able to join its logs to the audit row"
+        );
+
+        let response = app
+            .oneshot(sent("bad value"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn cors_preflight_is_answered_before_auth_and_other_origins_are_refused() {
         let config = testing::config_with(&[("CORS_ALLOWED_ORIGINS", "https://app.example.com")]);
         let app = crate::app::build_app(&config, testing::empty_state_with(&config));

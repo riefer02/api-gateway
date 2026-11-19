@@ -7,6 +7,12 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Claim attribution and caller correlation.** `AUDIT_CLAIMS` copies named token claims
+  (`project_id`, `agent_id`, …) into the data-plane audit's `detail`; only scalars pass,
+  control characters and values over 128 bytes are refused rather than truncated, and a
+  refused claim increments `gateway_claim_rejected_total`. `X-Run-Id` is validated
+  (`[A-Za-z0-9._:-]{1,128}`), audited and echoed on the response including errors, so a
+  client can join its logs to ours. Neither is used for authorization.
 - **Tamper-evident control-plane audit chain.** `audit_events` gains `prev_hash` and
   `row_hash`; appends are serialised by an advisory lock inside the writing transaction,
   so two rows cannot claim the same predecessor. `admin audit verify` walks the chain in

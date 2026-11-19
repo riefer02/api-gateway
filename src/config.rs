@@ -327,6 +327,10 @@ pub struct OAuthConfig {
     /// Tenant assigned to a token that carries no tenant claim. One-org
     /// deployments usually leave this at `oauth` and keep routes shared.
     pub default_tenant: String,
+    /// Token claims recorded in the data-plane audit, e.g. `project_id`.
+    /// Identifiers only: they are read from the signed token, never from a
+    /// request header or a model argument.
+    pub audit_claims: Vec<String>,
     /// RFC 8693 token exchange. `None` means upstreams receive no gateway token.
     pub token_exchange: Option<TokenExchangeConfig>,
 }
@@ -1037,6 +1041,7 @@ fn oauth_config(
         authorization_servers,
         scopes_supported: csv_preserve(source.get("OAUTH_SCOPES_SUPPORTED")),
         default_tenant: string_or(source, "OAUTH_DEFAULT_TENANT", "oauth"),
+        audit_claims: claim_names(source.get("AUDIT_CLAIMS"), problems),
         token_exchange,
     })
 }
@@ -1128,6 +1133,48 @@ fn validate_cors_origin(raw: &str, environment: &AppEnvironment, problems: &mut 
         false,
         problems,
     );
+}
+
+/// Claim names that may be copied into the audit log. Bounded and validated
+/// because they become JSON keys and, later, header names.
+fn claim_names(value: Option<String>, problems: &mut Vec<String>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+
+    for raw in csv(value) {
+        let name = raw.trim();
+
+        if name.is_empty() {
+            continue;
+        }
+
+        let valid = name.len() <= 32
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+
+        if !valid {
+            problems.push(format!(
+                "AUDIT_CLAIMS: `{name}` must be 1-32 characters of a-z, 0-9 or _"
+            ));
+            continue;
+        }
+
+        if names
+            .iter()
+            .any(|existing| existing == name)
+        {
+            continue;
+        }
+
+        names.push(name.to_owned());
+    }
+
+    if names.len() > 8 {
+        problems.push("AUDIT_CLAIMS accepts at most 8 claims".to_owned());
+        names.truncate(8);
+    }
+
+    names
 }
 
 fn csv(value: Option<String>) -> Vec<String> {
@@ -1698,6 +1745,50 @@ mod tests {
             error
                 .to_string()
                 .contains("OAUTH_ISSUER is required")
+        );
+    }
+
+    fn oauth_environment() -> HashMap<String, String> {
+        let mut values = valid_development();
+
+        for (key, value) in [
+            ("OAUTH_ISSUER", "https://auth.example.com"),
+            ("OAUTH_AUDIENCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_JWKS_URI", "https://auth.example.com/jwks"),
+            ("OAUTH_RESOURCE", "https://gateway.example.com/mcp"),
+            ("OAUTH_AUTHORIZATION_SERVERS", "https://auth.example.com"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+
+        values
+    }
+
+    #[test]
+    fn audit_claims_are_parsed_and_bounded() {
+        let mut values = oauth_environment();
+        values.insert(
+            "AUDIT_CLAIMS".to_owned(),
+            "project_id,agent_id,project_id".to_owned(),
+        );
+
+        let config = Config::from_source(&values).expect("valid config");
+        let oauth = config.oauth.expect("oauth configured");
+
+        assert_eq!(oauth.audit_claims, vec!["project_id", "agent_id"]);
+    }
+
+    #[test]
+    fn audit_claim_names_are_validated() {
+        let mut values = oauth_environment();
+        values.insert("AUDIT_CLAIMS".to_owned(), "Project-ID".to_owned());
+
+        let error = Config::from_source(&values).expect_err("invalid claim name");
+
+        assert!(
+            error
+                .to_string()
+                .contains("AUDIT_CLAIMS")
         );
     }
 

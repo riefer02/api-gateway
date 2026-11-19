@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use axum::http::{HeaderMap, header};
@@ -114,6 +114,9 @@ pub(crate) struct Principal {
     /// The inbound access token, kept only for RFC 8693 exchange. It is
     /// zeroized on drop and never logged.
     pub(crate) subject_token: Option<crate::config::SecretString>,
+    /// Configured token claims copied for audit attribution. Never used for
+    /// authorization; empty for API keys, which have no claims.
+    pub(crate) asserted: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +214,7 @@ pub(crate) async fn verify_api_key(
         roles: HashSet::from(["service".to_owned()]),
         token_id: None,
         subject_token: None,
+        asserted: BTreeMap::new(),
     })
 }
 
@@ -275,6 +279,7 @@ pub(crate) async fn authenticate(
             roles: identity.roles,
             token_id: identity.token_id,
             subject_token: Some(crate::config::SecretString::new(token.to_owned())),
+            asserted: identity.asserted,
         };
 
         record_identity(&principal);
@@ -513,6 +518,7 @@ mod tests {
             roles: HashSet::from(["service".to_owned()]),
             token_id: None,
             subject_token: None,
+            asserted: BTreeMap::new(),
         };
 
         assert!(authorize(&identity, &HashSet::new()).is_ok());
@@ -552,6 +558,7 @@ mod tests {
             roles: HashSet::new(),
             token_id: None,
             subject_token: None,
+            asserted: BTreeMap::new(),
         };
 
         assert_eq!(principal.user_key().as_deref(), Some("acme:user-1"));
