@@ -126,13 +126,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
 
     seed_development_key(config, &admin).await?;
 
-    let source = RouteSource::new(
-        pool.clone(),
-        config.routing.allow_hosts.clone(),
-        exchange.is_some(),
-        config.routing.pool_max_idle_per_host,
-        config.routing.egress,
-    );
+    let source = RouteSource::new(pool.clone(), config.routing.clone(), exchange.is_some());
     let table = source.load().await?;
 
     if table.is_empty() {
