@@ -180,6 +180,13 @@ pub(crate) enum McpError {
     Malformed(&'static str),
     /// The request calls a tool this caller may not use.
     Denied { tool: String, id: Option<Value> },
+    /// The call named a tool the caller may use, but with arguments the tool's
+    /// advertised schema refuses.
+    InvalidArguments {
+        tool: String,
+        id: Option<Value>,
+        reason: String,
+    },
 }
 
 impl McpError {
@@ -188,6 +195,9 @@ impl McpError {
             Self::Malformed(reason) => format!("invalid MCP request: {reason}"),
             Self::Denied { tool, .. } => {
                 format!("tool `{tool}` is not permitted for this user")
+            }
+            Self::InvalidArguments { tool, reason, .. } => {
+                format!("tool `{tool}`: {reason}")
             }
         }
     }
@@ -203,14 +213,21 @@ struct RpcMessage {
     params: Option<Value>,
 }
 
-/// One `tools/call` in a request, kept so its arguments can be checked
-/// against the tool's advertised schema before the upstream sees them.
+/// One `tools/call` in a request. Arguments are validated while parsing and
+/// deliberately not stored: keeping them would mean copying a subtree that can
+/// be most of the body, only to read it once.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolCall {
     pub(crate) name: String,
-    pub(crate) arguments: Option<Value>,
     /// The JSON-RPC id, so a rejection answers the right request.
     pub(crate) id: Option<Value>,
+}
+
+/// A check applied to each `tools/call` while the request is parsed. The
+/// gateway supplies the schema check; `mcp` stays ignorant of where schemas
+/// come from, and the arguments never have to leave the parsed message.
+pub(crate) trait CallValidator {
+    fn validate(&self, tool: &str, arguments: Option<&Value>) -> Result<(), String>;
 }
 
 /// A request the gateway understood well enough to audit and authorize.
@@ -228,7 +245,11 @@ pub(crate) struct EvaluatedRequest {
 
 /// Parses the request, enforces the tool policy, and returns the method and tool
 /// for auditing. Called only when the route has an enforcing policy.
-pub(crate) fn evaluate(body: &[u8], allowed: &AllowedTools) -> Result<EvaluatedRequest, McpError> {
+pub(crate) fn evaluate(
+    body: &[u8],
+    allowed: &AllowedTools,
+    validator: Option<&dyn CallValidator>,
+) -> Result<EvaluatedRequest, McpError> {
     let messages = parse(body)?;
     let batch = messages.len() > 1;
     let mut audit_method: Option<String> = None;
@@ -276,13 +297,24 @@ pub(crate) fn evaluate(body: &[u8], allowed: &AllowedTools) -> Result<EvaluatedR
                 });
             }
 
+            if let Some(validator) = validator
+                && let Err(reason) = validator.validate(
+                    tool,
+                    message
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("arguments")),
+                )
+            {
+                return Err(McpError::InvalidArguments {
+                    tool: tool.to_owned(),
+                    id: message.id.clone(),
+                    reason,
+                });
+            }
+
             calls.push(ToolCall {
                 name: tool.to_owned(),
-                arguments: message
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.get("arguments"))
-                    .cloned(),
                 id: message.id.clone(),
             });
 
@@ -617,7 +649,7 @@ mod tests {
         let policy = policy(ToolMode::AllowList, &[("support", &["search"])]);
         let allowed = policy.allowed_tools(&roles(&["support"]));
 
-        let error = evaluate(&call("delete_ticket"), &allowed).expect_err("denied");
+        let error = evaluate(&call("delete_ticket"), &allowed, None).expect_err("denied");
         assert_eq!(
             error,
             McpError::Denied {
@@ -632,7 +664,7 @@ mod tests {
         let policy = policy(ToolMode::AllowList, &[("support", &["search"])]);
         let allowed = policy.allowed_tools(&roles(&["support"]));
 
-        let evaluated = evaluate(&call("search"), &allowed).expect("allowed");
+        let evaluated = evaluate(&call("search"), &allowed, None).expect("allowed");
         assert_eq!(evaluated.tool.as_deref(), Some("search"));
         assert_eq!(evaluated.method, "tools/call");
     }
@@ -642,11 +674,11 @@ mod tests {
         let allowed = AllowedTools::All;
 
         assert!(matches!(
-            evaluate(b"not json", &allowed),
+            evaluate(b"not json", &allowed, None),
             Err(McpError::Malformed(_))
         ));
         assert!(matches!(
-            evaluate(b"[]", &allowed),
+            evaluate(b"[]", &allowed, None),
             Err(McpError::Malformed(_))
         ));
 
@@ -664,7 +696,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            evaluate(&batch, &allowed),
+            evaluate(&batch, &allowed, None),
             Err(McpError::Malformed("batch size is out of range"))
         ));
     }
@@ -674,7 +706,7 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","name":"delete"}}"#;
 
         assert!(matches!(
-            evaluate(body, &AllowedTools::All),
+            evaluate(body, &AllowedTools::All, None),
             Err(McpError::Malformed(_))
         ));
     }
@@ -692,7 +724,7 @@ mod tests {
         .into_bytes();
 
         assert!(matches!(
-            evaluate(&batch, &allowed),
+            evaluate(&batch, &allowed, None),
             Err(McpError::Denied { tool, .. }) if tool == "delete"
         ));
     }

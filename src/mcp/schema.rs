@@ -96,23 +96,6 @@ impl SchemaCache {
     }
 }
 
-/// A rejected call. Carries the JSON-RPC id so the client can pair the error
-/// with its request, and never carries an argument value: a rejected call may
-/// hold exactly the secret that made it wrong.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Violation {
-    pub(crate) tool: String,
-    pub(crate) id: Option<Value>,
-    pub(crate) reason: String,
-}
-
-impl Violation {
-    /// Message for the caller. Names the tool and the rule, not the payload.
-    pub(crate) fn message(&self) -> String {
-        format!("tool `{}`: {}", self.tool, self.reason)
-    }
-}
-
 /// Records every tool schema in a `tools/list` result. Unknown shapes are
 /// ignored rather than treated as an error: a server that publishes no schema
 /// simply gets no gateway-side validation.
@@ -142,32 +125,29 @@ pub(crate) fn learn(list: &Value, upstream: &str, cache: &SchemaCache) {
     }
 }
 
-/// Checks every `tools/call` in a request. Returns the first violation so the
-/// caller learns about one bad call at a time, matching the rest of the
-/// policy layer.
-pub(crate) fn check(
-    calls: &[super::ToolCall],
-    upstream: &str,
-    cache: &SchemaCache,
-) -> Option<Violation> {
-    for call in calls {
-        let Some(shape) = cache.get(upstream, &call.name) else {
-            // No schema learned yet (cold cache, or the caller never listed).
-            // Fail open: the tool validates, and a rejection here would be
-            // based on absence rather than evidence.
-            continue;
-        };
+/// Applies the learned shape to a call. Constructed per policy-checked
+/// request; holds borrows only.
+pub(crate) struct SchemaValidator<'a> {
+    cache: &'a SchemaCache,
+    upstream: &'a str,
+}
 
-        if let Err(reason) = shape.check(call.arguments.as_ref()) {
-            return Some(Violation {
-                tool: call.name.clone(),
-                id: call.id.clone(),
-                reason,
-            });
+impl<'a> SchemaValidator<'a> {
+    pub(crate) fn new(cache: &'a SchemaCache, upstream: &'a str) -> Self {
+        Self { cache, upstream }
+    }
+}
+
+impl super::CallValidator for SchemaValidator<'_> {
+    fn validate(&self, tool: &str, arguments: Option<&Value>) -> Result<(), String> {
+        // No schema learned yet (cold cache, or the caller never listed):
+        // fail open. The tool validates, and rejecting on the absence of
+        // evidence would break a perfectly good call.
+        match self.cache.get(self.upstream, tool) {
+            Some(shape) => shape.check(arguments),
+            None => Ok(()),
         }
     }
-
-    None
 }
 
 #[cfg(test)]
@@ -175,7 +155,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mcp::ToolCall;
 
     fn cache() -> SchemaCache {
         SchemaCache::new(Duration::from_secs(60))
@@ -204,12 +183,15 @@ mod tests {
         })
     }
 
-    fn call(name: &str, arguments: Option<Value>) -> ToolCall {
-        ToolCall {
-            name: name.to_owned(),
-            arguments,
-            id: Some(json!(7)),
-        }
+    fn validate(
+        cache: &SchemaCache,
+        upstream: &str,
+        tool: &str,
+        arguments: Option<Value>,
+    ) -> Result<(), String> {
+        use super::super::CallValidator as _;
+
+        SchemaValidator::new(cache, upstream).validate(tool, arguments.as_ref())
     }
 
     #[test]
@@ -249,19 +231,10 @@ mod tests {
         let cache = cache();
         learn(&list(), "u", &cache);
 
-        let violation = check(
-            &[call("search_tickets", Some(json!({"q": "x"})))],
-            "u",
-            &cache,
-        )
-        .expect("violation");
+        let reason = validate(&cache, "u", "search_tickets", Some(json!({"q": "x"})))
+            .expect_err("missing query");
 
-        assert_eq!(violation.tool, "search_tickets");
-        assert_eq!(violation.id, Some(json!(7)));
-        assert_eq!(
-            violation.message(),
-            "tool `search_tickets`: missing required argument `query`"
-        );
+        assert_eq!(reason, "missing required argument `query`");
     }
 
     #[test]
@@ -269,14 +242,10 @@ mod tests {
         let cache = cache();
         learn(&list(), "u", &cache);
 
-        let violation = check(
-            &[call("search_tickets", Some(json!(["query"])))],
-            "u",
-            &cache,
-        )
-        .expect("violation");
+        let reason = validate(&cache, "u", "search_tickets", Some(json!(["query"])))
+            .expect_err("arguments are not an object");
 
-        assert_eq!(violation.reason, "arguments must be a JSON object");
+        assert_eq!(reason, "arguments must be a JSON object");
     }
 
     #[test]
@@ -284,7 +253,7 @@ mod tests {
         let cache = cache();
         learn(&list(), "u", &cache);
 
-        assert!(check(&[call("health", None)], "u", &cache).is_none());
+        assert!(validate(&cache, "u", "health", None).is_ok());
     }
 
     #[test]
@@ -292,7 +261,7 @@ mod tests {
         let cache = cache();
         learn(&list(), "u", &cache);
 
-        assert!(check(&[call("search_tickets", None)], "u", &cache).is_some());
+        assert!(validate(&cache, "u", "search_tickets", None).is_err());
     }
 
     #[test]
@@ -313,21 +282,14 @@ mod tests {
 
         // The unsupported keywords must not turn a call the schema would have
         // accepted into a rejection.
-        assert!(
-            check(
-                &[call("strict", Some(json!({"a": "not-a-uuid"})))],
-                "u",
-                &cache
-            )
-            .is_none()
-        );
+        assert!(validate(&cache, "u", "strict", Some(json!({"a": "not-a-uuid"}))).is_ok());
     }
 
     #[test]
     fn an_unknown_tool_fails_open() {
         let cache = cache();
 
-        assert!(check(&[call("never_listed", Some(json!({})))], "u", &cache).is_none());
+        assert!(validate(&cache, "u", "never_listed", Some(json!({}))).is_ok());
     }
 
     #[test]
@@ -340,7 +302,7 @@ mod tests {
                 .get("u", "search_tickets")
                 .is_none()
         );
-        assert!(check(&[call("search_tickets", Some(json!({})))], "u", &cache).is_none());
+        assert!(validate(&cache, "u", "search_tickets", Some(json!({}))).is_ok());
     }
 
     #[test]
@@ -348,6 +310,6 @@ mod tests {
         let cache = cache();
         learn(&list(), "a", &cache);
 
-        assert!(check(&[call("search_tickets", Some(json!({})))], "b", &cache).is_none());
+        assert!(validate(&cache, "b", "search_tickets", Some(json!({}))).is_ok());
     }
 }

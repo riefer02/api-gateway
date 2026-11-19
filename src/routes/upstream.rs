@@ -323,7 +323,21 @@ async fn apply_tool_policy(
         .await
         .map_err(|_| AppError::PayloadTooLarge)?;
 
-    match mcp::evaluate(&bytes, &allowed) {
+    // Built here, not in `mcp`: the policy layer owns where schemas come from,
+    // and passing a validator lets the arguments be checked in place instead of
+    // being cloned out of the parsed message.
+    let validator = state
+        .mcp_schemas
+        .as_ref()
+        .map(|cache| mcp::schema::SchemaValidator::new(cache, &route.upstream.id));
+
+    match mcp::evaluate(
+        &bytes,
+        &allowed,
+        validator
+            .as_ref()
+            .map(|validator| validator as &dyn mcp::CallValidator),
+    ) {
         Ok(evaluated) => {
             // A batch has no single unambiguous method/name/version. A header
             // that claims one is a routing/authorization split-brain.
@@ -367,21 +381,6 @@ async fn apply_tool_policy(
 
             audit.mcp(Some(&evaluated.method), evaluated.tool.as_deref());
 
-            // Arguments are checked against the tool's own advertised schema,
-            // learned from `tools/list`. A miss (cold cache, no schema) passes:
-            // the tool still validates, and rejecting on absence of evidence
-            // would break a perfectly good call.
-            if let Some(cache) = state.mcp_schemas.as_deref()
-                && let Some(violation) =
-                    mcp::schema::check(&evaluated.calls, &route.upstream.id, cache)
-            {
-                audit.deny();
-                metrics::counter!("gateway_mcp_invalid_params_total", "route" => route.id.clone())
-                    .increment(1);
-                count_tool_call(identity, &violation.tool, "invalid");
-                return Ok(invalid_params(&violation));
-            }
-
             let filter = (evaluated.wants_tools_list && !allowed.is_all()).then(|| ToolFilter {
                 allowed: Arc::clone(&allowed),
                 require_tools: true,
@@ -420,6 +419,33 @@ async fn apply_tool_policy(
                 Request::from_parts(parts, Body::from(bytes)),
                 filter,
             ))
+        }
+        Err(mcp::McpError::InvalidArguments { tool, id, reason }) => {
+            audit.mcp(Some("tools/call"), Some(&tool));
+            audit.deny();
+            metrics::counter!("gateway_mcp_invalid_params_total", "route" => route.id.clone())
+                .increment(1);
+            count_tool_call(identity, &tool, "invalid");
+
+            // A protocol error, not a transport failure: the client gets a
+            // JSON-RPC body it can show the model.
+            let response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(mcp::rpc_error_body(
+                    -32602,
+                    id,
+                    &mcp::McpError::InvalidArguments {
+                        tool,
+                        id: None,
+                        reason,
+                    }
+                    .message(),
+                )),
+            )
+                .into_response();
+
+            Ok(PolicyOutcome::Deny(response))
         }
         Err(mcp::McpError::Denied { tool, id }) => {
             audit.mcp(Some("tools/call"), Some(&tool));
@@ -507,24 +533,6 @@ fn header_mismatch(message: &str) -> PolicyOutcome {
         StatusCode::BAD_REQUEST,
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(mcp::header_mismatch_body(message)),
-    )
-        .into_response();
-
-    PolicyOutcome::Deny(response)
-}
-
-/// A `200` with a JSON-RPC `InvalidParams` body. 200 is deliberate, as with a
-/// denial: most MCP clients read a non-2xx as a transport failure, not a
-/// protocol error they can show the model.
-fn invalid_params(violation: &mcp::schema::Violation) -> PolicyOutcome {
-    let response = (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        Body::from(mcp::rpc_error_body(
-            -32602,
-            violation.id.clone(),
-            &violation.message(),
-        )),
     )
         .into_response();
 
