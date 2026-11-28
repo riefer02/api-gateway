@@ -7,6 +7,15 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Keyset pagination on every control-plane listing.** `GET /v1/keys`, `/v1/upstreams`,
+  `/v1/routes`, `/v1/audit`, and `/v1/data-audit` take `limit` (default 100, max 1000) and
+  an opaque `cursor`, and return `{"items": [...], "next_cursor": "..."}`. Cursors name
+  the last row returned, so inserts and deletes between pages cannot shift the boundary or
+  duplicate a row. A malformed cursor or out-of-range limit is a 400, never a silent
+  clamp. The CLI gained `admin upstream list` and `--limit`/`--cursor` on the listing
+  commands. Breaking: the five listing responses are now envelopes, and the data audit
+  endpoint's `before_id` parameter is replaced by `cursor`.
+
 - **Local cluster harness and experiments.** `deploy/local` runs three replicas behind
   Traefik with Toxiproxy for fault injection, and four scripts measure the behaviours the
   documentation asserts: per-replica limits (15/24 round-robin against 5/24 sticky), a

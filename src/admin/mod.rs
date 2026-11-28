@@ -247,6 +247,27 @@ pub(crate) fn decode_cursor(encoded: &str, expected: usize) -> Result<Vec<String
     Ok(parts)
 }
 
+/// Cursor for a listing ordered by `(timestamp, tiebreak)` descending.
+///
+/// The timestamp travels as Unix nanoseconds: exact, cheap to parse back, and
+/// independent of `time`'s formatting features.
+pub(crate) fn encode_timestamp_cursor(at: OffsetDateTime, tiebreak: &str) -> String {
+    let nanos = at.unix_timestamp_nanos().to_string();
+    encode_cursor(&[nanos.as_str(), tiebreak])
+}
+
+pub(crate) fn decode_timestamp_cursor(
+    cursor: &str,
+) -> Result<(OffsetDateTime, String), AdminError> {
+    let parts = decode_cursor(cursor, 2)?;
+    let nanos: i128 = parts[0]
+        .parse()
+        .map_err(|_| invalid_cursor())?;
+    let at = OffsetDateTime::from_unix_timestamp_nanos(nanos).map_err(|_| invalid_cursor())?;
+
+    Ok((at, parts[1].clone()))
+}
+
 /// Trims the extra row fetched to detect a next page and returns the cursor of
 /// the last row that is actually part of this page.
 fn finish_page<T>(mut entries: Vec<(T, String)>, limit: u32) -> Page<T> {

@@ -170,6 +170,7 @@ api-gateway admin upstream put billing --base-url https://billing.internal --tim
 api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing --scope billing:read
 api-gateway admin route put billing-v1 --prefix /v1/billing --upstream billing --disabled
 api-gateway admin route list
+api-gateway admin upstream list
 
 api-gateway admin route rm billing-v1
 api-gateway admin upstream rm billing
@@ -177,11 +178,12 @@ api-gateway admin client rm acme-app
 api-gateway admin tenant rm acme
 ```
 
-`key list` and `route list` return one page: default 100 rows, maximum 1000
-(`--limit`), and they print the `--cursor` for the next page when more exist. The HTTP
-listings page the same way, with `limit` and `cursor`, and return
-`{"items": [...], "next_cursor": "..."}`. Cursors are keyset-based, so a key issued or a
-route added between pages cannot shift the boundary; see `docs/openapi.yaml`.
+Every listing — `key list`, `route list`, `upstream list`, `audit list`, `audit data` —
+returns one page: default 100 rows, maximum 1000 (`--limit`), and prints the `--cursor` for
+the next page when more exist. The HTTP listings page the same way, with `limit` and
+`cursor`, and return `{"items": [...], "next_cursor": "..."}`. Cursors are keyset-based, so
+a key issued, a route added, or an audit row written between pages cannot shift the
+boundary; see `docs/openapi.yaml`.
 
 A route `PUT`/`route put` is **partial for security fields**: omitting `tenant_id`,
 `scopes`, `tool_policy`, or the enable flags preserves what is stored. An explicit

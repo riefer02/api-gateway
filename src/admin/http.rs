@@ -740,6 +740,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_endpoints_share_the_page_contract() {
+        for uri in [
+            "/v1/audit?cursor=zz",
+            "/v1/data-audit?cursor=zz",
+            "/v1/data-audit?limit=0",
+        ] {
+            let response = router_with_token("secret")
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_requests_reach_the_service() {
         // No database: the handler surfaces a 5xx, which proves the token
         // check passed and the request reached the service.
@@ -760,8 +782,14 @@ mod tests {
 
 #[derive(Deserialize)]
 struct AuditQuery {
-    limit: Option<i64>,
-    before_id: Option<i64>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DataAuditQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
     since: Option<String>,
     tenant: Option<String>,
 }
@@ -780,16 +808,15 @@ async fn list_audit(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
     ApiQuery(query): ApiQuery<AuditQuery>,
-) -> Result<Json<Vec<AuditView>>, AppError> {
+) -> Result<Json<ListResponse<AuditView>>, AppError> {
     actor.require(AdminScope::AuditRead)?;
 
-    let entries = state
-        .service
-        .list_audit(query.limit.unwrap_or(100))
-        .await?;
+    let page = PageRequest::new(query.limit, query.cursor)?;
+    let entries = state.service.list_audit(page).await?;
 
-    Ok(Json(
-        entries
+    Ok(Json(ListResponse {
+        items: entries
+            .items
             .into_iter()
             .map(|entry| AuditView {
                 occurred_at: entry.occurred_at.to_string(),
@@ -800,7 +827,8 @@ async fn list_audit(
                 request_id: entry.request_id,
             })
             .collect(),
-    ))
+        next_cursor: entries.next_cursor,
+    }))
 }
 
 #[derive(Serialize)]
@@ -825,8 +853,8 @@ struct DataAuditView {
 async fn list_data_audit(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
-    ApiQuery(query): ApiQuery<AuditQuery>,
-) -> Result<Json<Vec<DataAuditView>>, AppError> {
+    ApiQuery(query): ApiQuery<DataAuditQuery>,
+) -> Result<Json<ListResponse<DataAuditView>>, AppError> {
     actor.require(AdminScope::AuditRead)?;
 
     let since = query
@@ -838,18 +866,15 @@ async fn list_data_audit(
         })
         .transpose()?;
 
+    let page = PageRequest::new(query.limit, query.cursor)?;
     let entries = state
         .service
-        .list_data_audit(
-            query.limit.unwrap_or(100),
-            query.before_id,
-            since,
-            query.tenant.as_deref(),
-        )
+        .list_data_audit(page, since, query.tenant.as_deref())
         .await?;
 
-    Ok(Json(
-        entries
+    Ok(Json(ListResponse {
+        items: entries
+            .items
             .into_iter()
             .map(|entry| DataAuditView {
                 occurred_at: entry.occurred_at.to_string(),
@@ -868,7 +893,8 @@ async fn list_data_audit(
                 detail: entry.detail,
             })
             .collect(),
-    ))
+        next_cursor: entries.next_cursor,
+    }))
 }
 
 #[cfg(test)]

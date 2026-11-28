@@ -91,15 +91,21 @@ pub(crate) enum AdminCommand {
 pub(crate) enum AuditCommand {
     /// Control-plane mutations
     List {
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
+        /// Maximum events to return (1-1000)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Continue from the previous page's next cursor
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Data-plane calls (who used which tool)
     Data {
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
+        /// Maximum events to return (1-1000)
         #[arg(long)]
-        before_id: Option<i64>,
+        limit: Option<u32>,
+        /// Continue from the previous page's next cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         since: Option<String>,
         #[arg(long)]
@@ -161,6 +167,14 @@ pub(crate) enum KeyCommand {
 pub(crate) enum UpstreamCommand {
     Rm {
         id: String,
+    },
+    List {
+        /// Maximum upstreams to return (1-1000)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Continue from the previous page's next cursor
+        #[arg(long)]
+        cursor: Option<String>,
     },
     Put {
         id: String,
@@ -340,15 +354,16 @@ async fn run_audit_command(
     command: AuditCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match command {
-        AuditCommand::List { limit } => {
-            let entries = service.list_audit(limit).await?;
+        AuditCommand::List { limit, cursor } => {
+            let page = PageRequest::new(limit, cursor)?;
+            let entries = service.list_audit(page).await?;
 
-            if entries.is_empty() {
+            if entries.items.is_empty() {
                 println!("no audit events");
                 return Ok(());
             }
 
-            for entry in entries {
+            for entry in &entries.items {
                 println!(
                     "{:<32} {:<12} {:<18} {:<24} {}",
                     entry.occurred_at.to_string(),
@@ -357,8 +372,13 @@ async fn run_audit_command(
                     entry.subject,
                     entry
                         .source_ip
+                        .clone()
                         .unwrap_or_else(|| "-".to_owned())
                 );
+            }
+
+            if let Some(cursor) = &entries.next_cursor {
+                println!("\nmore: --cursor {cursor}");
             }
         }
         AuditCommand::Verify => {
@@ -401,7 +421,7 @@ async fn run_audit_command(
         }
         AuditCommand::Data {
             limit,
-            before_id,
+            cursor,
             since,
             tenant,
         } => {
@@ -416,26 +436,27 @@ async fn run_audit_command(
                 })
                 .transpose()?;
 
+            let page = PageRequest::new(limit, cursor)?;
             let entries = service
-                .list_data_audit(limit, before_id, since, tenant.as_deref())
+                .list_data_audit(page, since, tenant.as_deref())
                 .await?;
 
-            if entries.is_empty() {
+            if entries.items.is_empty() {
                 println!("no data audit events");
                 return Ok(());
             }
 
-            for entry in entries {
+            for entry in &entries.items {
                 println!(
                     "{:<32} {:<12} {:<20} {:<18} {:<8} {}",
                     entry.occurred_at.to_string(),
                     entry.tenant_id,
+                    entry.subject.as_deref().unwrap_or("-"),
                     entry
-                        .subject
-                        .unwrap_or_else(|| "-".to_owned()),
-                    entry.tool_name.unwrap_or_else(|| entry
-                        .mcp_method
-                        .unwrap_or_else(|| "-".to_owned())),
+                        .tool_name
+                        .as_deref()
+                        .or(entry.mcp_method.as_deref())
+                        .unwrap_or("-"),
                     entry.decision,
                     entry
                         .status
@@ -449,6 +470,10 @@ async fn run_audit_command(
                 if entry.detail != serde_json::json!({}) {
                     println!("  {}", entry.detail);
                 }
+            }
+
+            if let Some(cursor) = &entries.next_cursor {
+                println!("\nmore: --cursor {cursor}");
             }
         }
     }
@@ -532,6 +557,38 @@ async fn run_upstream_command(
                 .delete_upstream(actor, &id)
                 .await?;
             println!("upstream `{id}` deleted");
+        }
+        UpstreamCommand::List { limit, cursor } => {
+            let page = PageRequest::new(limit, cursor)?;
+            let upstreams = service.list_upstreams(page).await?;
+
+            if upstreams.items.is_empty() {
+                println!("no upstreams configured");
+                return Ok(());
+            }
+
+            for upstream in &upstreams.items {
+                println!(
+                    "{:<20} {:<44} timeout={}ms{}{}",
+                    upstream.id,
+                    upstream.base_url,
+                    upstream.timeout_ms,
+                    upstream
+                        .audience
+                        .as_deref()
+                        .map(|audience| format!("  audience={audience}"))
+                        .unwrap_or_default(),
+                    upstream
+                        .exchange_scope
+                        .as_deref()
+                        .map(|scope| format!("  scope={scope}"))
+                        .unwrap_or_default()
+                );
+            }
+
+            if let Some(cursor) = &upstreams.next_cursor {
+                println!("\nmore: --cursor {cursor}");
+            }
         }
         UpstreamCommand::Put {
             id,

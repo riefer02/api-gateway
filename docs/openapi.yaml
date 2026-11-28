@@ -292,23 +292,21 @@ paths:
     get:
       tags: [audit]
       summary: Read the control-plane audit trail
+      description: |
+        Most recent first. Same page contract as the resource listings: pass
+        `next_cursor` back as `cursor`.
       parameters:
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-            minimum: 1
-            maximum: 1000
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
       responses:
         "200":
-          description: Most recent events first
+          description: One page of events, newest first
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/AuditEntry"
+                $ref: "#/components/schemas/AuditList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -322,18 +320,8 @@ paths:
         Requires `audit:read`. Rows carry identifiers and decisions, never
         payloads, tokens, or verifier material.
       parameters:
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-            minimum: 1
-            maximum: 1000
-        - name: before_id
-          in: query
-          schema:
-            type: integer
-          description: Keyset paging; return rows older than this id.
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
         - name: since
           in: query
           schema:
@@ -346,13 +334,13 @@ paths:
             type: string
       responses:
         "200":
-          description: Most recent calls first
+          description: One page of calls, newest first
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/DataAuditEntry"
+                $ref: "#/components/schemas/DataAuditList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -622,6 +610,17 @@ components:
           example:
             support: [search_tickets]
             admin: ["*"]
+    DataAuditList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataAuditEntry"
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` for the next page; null when the listing ends.
     DataAuditEntry:
       type: object
       required: [occurred_at, tenant_id, auth_method, decision]
@@ -660,6 +659,17 @@ components:
             Configured token claims (`AUDIT_CLAIMS`) and the caller's `X-Run-Id`.
             Identifiers only, never payloads.
           additionalProperties: true
+    AuditList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` for the next page; null when the listing ends.
     AuditEntry:
       type: object
       required: [occurred_at, actor, action, subject]

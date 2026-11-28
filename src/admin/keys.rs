@@ -182,15 +182,7 @@ impl AdminService {
         page: PageRequest,
     ) -> Result<Page<KeySummary>, AdminError> {
         let after = match page.cursor() {
-            Some(cursor) => {
-                let parts = decode_cursor(cursor, 2)?;
-                let nanos: i128 = parts[0]
-                    .parse()
-                    .map_err(|_| invalid_cursor())?;
-                let at = OffsetDateTime::from_unix_timestamp_nanos(nanos)
-                    .map_err(|_| invalid_cursor())?;
-                Some((at, parts[1].clone()))
-            }
+            Some(cursor) => Some(decode_timestamp_cursor(cursor)?),
             None => None,
         };
 
@@ -211,11 +203,7 @@ impl AdminService {
         let entries = keys
             .into_iter()
             .map(|key| {
-                let nanos = key
-                    .created_at
-                    .unix_timestamp_nanos()
-                    .to_string();
-                let cursor = encode_cursor(&[nanos.as_str(), key.key_id.as_str()]);
+                let cursor = encode_timestamp_cursor(key.created_at, &key.key_id);
                 (key, cursor)
             })
             .collect();

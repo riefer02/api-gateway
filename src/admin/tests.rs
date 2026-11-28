@@ -141,10 +141,11 @@ async fn mutations_record_the_actor_and_source() {
         .expect("create tenant");
 
     let entries = service
-        .list_audit(50)
+        .list_audit(PageRequest::new(None, None).expect("page"))
         .await
         .expect("list audit");
     let entry = entries
+        .items
         .iter()
         .find(|entry| entry.subject == tenant)
         .expect("audit entry for the tenant");
@@ -596,6 +597,13 @@ fn cursors_round_trip_and_reject_garbage() {
 
     // A caller must not be able to fabricate a cursor for another listing, or a
     // truncated one, and silently skip rows.
+    let at = OffsetDateTime::now_utc();
+    let timestamped = encode_timestamp_cursor(at, "42");
+    let (decoded_at, tiebreak) = decode_timestamp_cursor(&timestamped).expect("decode");
+    assert_eq!(decoded_at.unix_timestamp_nanos(), at.unix_timestamp_nanos());
+    assert_eq!(tiebreak, "42");
+    assert!(decode_timestamp_cursor("zz").is_err());
+
     for (candidate, parts) in [
         // not hex
         ("zz", 2),
@@ -740,4 +748,80 @@ fn page_requests_are_bounded() {
     assert!(PageRequest::new(Some(0), None).is_err());
     assert!(PageRequest::new(Some(MAX_PAGE_SIZE + 1), None).is_err());
     assert!(PageRequest::new(Some(MAX_PAGE_SIZE), None).is_ok());
+}
+
+#[tokio::test]
+async fn audit_listing_pages_newest_first() {
+    let Some(pool) = pg_pool().await else {
+        eprintln!("skipping: DATABASE_URL is not set");
+        return;
+    };
+
+    let store: Arc<dyn ApiKeyStore> = Arc::new(auth::store::postgres::PostgresApiKeyStore::new(
+        pool.clone(),
+    ));
+    let service = AdminService::new(
+        pool.clone(),
+        Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+        crate::routing::test_routing(),
+        store,
+        std::time::Duration::from_secs(300),
+        false,
+    );
+
+    let actor = Actor::local("pager");
+    let mut subjects = Vec::new();
+    for _ in 0..3 {
+        let tenant = unique("audit-page");
+        service
+            .create_tenant(&actor, &tenant)
+            .await
+            .expect("tenant");
+        subjects.push(tenant);
+    }
+
+    // The log is shared and append-only, so walk a bounded number of pages and
+    // assert the contract on what was returned: newest first, no repeats.
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut last: Option<OffsetDateTime> = None;
+
+    for _ in 0..64 {
+        let page = service
+            .list_audit(PageRequest::new(Some(2), cursor).expect("page"))
+            .await
+            .expect("audit page");
+
+        assert!(page.items.len() <= 2, "a page is never larger than asked");
+
+        for entry in &page.items {
+            if let Some(previous) = last {
+                assert!(
+                    entry.occurred_at <= previous,
+                    "audit pages must be newest first"
+                );
+            }
+            last = Some(entry.occurred_at);
+            seen.push(entry.subject.clone());
+        }
+
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    for subject in &subjects {
+        assert_eq!(
+            seen.iter()
+                .filter(|seen| *seen == subject)
+                .count(),
+            1,
+            "event for `{subject}` must appear exactly once across pages"
+        );
+        service
+            .delete_tenant(&actor, subject)
+            .await
+            .ok();
+    }
 }

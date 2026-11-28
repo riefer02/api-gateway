@@ -175,10 +175,14 @@ the allow-list over turning policy off.
 
 ```bash
 api-gateway admin audit data --limit 20
-api-gateway admin audit data --limit 20 --before-id 12345 --tenant acme \
+api-gateway admin audit data --limit 20 --tenant acme \
   --since 2026-11-01T00:00:00Z
 curl -s "$ADMIN/v1/data-audit?limit=20&tenant=acme" -H "Authorization: Bearer $AUDITOR_TOKEN"
 ```
+
+To keep reading older rows, pass the previous page's `next_cursor` back as `--cursor`
+(HTTP: `cursor`). The listing is newest-first and keyset-paged, so rows written while you
+page do not shift the boundary.
 
 Rows carry identifiers and decisions, never payloads or tokens. `subject` is the
 OIDC `sub`, not an email; resolve it through the IdP if a human-readable identity is
