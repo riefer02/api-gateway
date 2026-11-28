@@ -182,7 +182,7 @@ impl AdminService {
         page: PageRequest,
     ) -> Result<Page<KeySummary>, AdminError> {
         let after = match page.cursor() {
-            Some(cursor) => Some(decode_timestamp_cursor(cursor)?),
+            Some(cursor) => Some(decode_timestamp_cursor(CursorKind::Keys, cursor)?),
             None => None,
         };
 
@@ -203,7 +203,7 @@ impl AdminService {
         let entries = keys
             .into_iter()
             .map(|key| {
-                let cursor = encode_timestamp_cursor(key.created_at, &key.key_id);
+                let cursor = encode_timestamp_cursor(CursorKind::Keys, key.created_at, &key.key_id);
                 (key, cursor)
             })
             .collect();

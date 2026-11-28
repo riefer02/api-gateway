@@ -59,7 +59,7 @@ impl AdminService {
     ) -> Result<Page<AuditEntry>, AdminError> {
         let (after_at, after_id) = match page.cursor() {
             Some(cursor) => {
-                let (at, id) = decode_timestamp_cursor(cursor)?;
+                let (at, id) = decode_timestamp_cursor(CursorKind::Audit, cursor)?;
                 let id = id
                     .parse::<i64>()
                     .map_err(|_| invalid_cursor())?;
@@ -111,7 +111,7 @@ impl AdminService {
                             .try_get("request_id")
                             .map_err(AdminError::Store)?,
                     },
-                    encode_timestamp_cursor(occurred_at, &id.to_string()),
+                    encode_timestamp_cursor(CursorKind::Audit, occurred_at, &id.to_string()),
                 ))
             })
             .collect::<Result<Vec<_>, AdminError>>()?;
@@ -127,7 +127,7 @@ impl AdminService {
     ) -> Result<Page<DataAuditEntry>, AdminError> {
         let (after_at, after_id) = match page.cursor() {
             Some(cursor) => {
-                let (at, id) = decode_timestamp_cursor(cursor)?;
+                let (at, id) = decode_timestamp_cursor(CursorKind::DataAudit, cursor)?;
                 let id = id
                     .parse::<i64>()
                     .map_err(|_| invalid_cursor())?;
@@ -211,7 +211,7 @@ impl AdminService {
                             .try_get("detail")
                             .map_err(AdminError::Store)?,
                     },
-                    encode_timestamp_cursor(occurred_at, &id.to_string()),
+                    encode_timestamp_cursor(CursorKind::DataAudit, occurred_at, &id.to_string()),
                 ))
             })
             .collect::<Result<Vec<_>, AdminError>>()?;

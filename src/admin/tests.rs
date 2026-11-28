@@ -587,53 +587,210 @@ async fn an_upstream_audience_requires_token_exchange() {
 }
 
 #[test]
-fn cursors_round_trip_and_reject_garbage() {
-    let encoded = encode_cursor(&["/api", "route-1"]);
+fn empty_id_cursor_survives_page_request() {
+    let next_cursor = encode_cursor(CursorKind::Routes, &[""]);
+    assert_eq!(
+        next_cursor, "routes.",
+        "the encoding must be nonempty and named"
+    );
+
+    let page = PageRequest::new(Some(1), Some(next_cursor)).expect("page");
+    let cursor = page
+        .cursor()
+        .expect("cursor after the empty id");
 
     assert_eq!(
-        decode_cursor(&encoded, 2).expect("decode"),
+        decode_cursor(CursorKind::Routes, cursor, 1).expect("decode"),
+        vec![String::new()]
+    );
+    assert!(decode_cursor(CursorKind::Routes, cursor, 2).is_err());
+}
+
+/// Ids address rows in URLs and name them in the audit log, so a blank one is
+/// not addressable and must never be created. Validation runs before any
+/// database work, which the lazy pool proves.
+#[tokio::test]
+async fn blank_entity_ids_are_refused_before_any_write() {
+    let service = AdminService::new(
+        crate::testing::lazy_pool(),
+        Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+        crate::routing::test_routing(),
+        Arc::new(auth::store::InMemoryApiKeyStore::default()),
+        std::time::Duration::from_secs(300),
+        false,
+    );
+
+    let actor = Actor::local("test");
+
+    assert_blank_id(
+        service
+            .put_route(
+                &actor,
+                RouteSpec {
+                    id: "  ".to_owned(),
+                    path_prefix: "/blank".to_owned(),
+                    methods: vec!["GET".to_owned()],
+                    upstream_id: "unused".to_owned(),
+                    rewrite_prefix: None,
+                    tenant_id: None,
+                    scopes: None,
+                    tool_policy: None,
+                    request_timeout_ms: None,
+                    max_response_bytes: None,
+                    enabled: None,
+                    priority: None,
+                },
+            )
+            .await,
+        "route",
+    );
+    assert_blank_id(
+        service
+            .put_upstream(&actor, "", "https://mcp.internal", 5_000, None, None)
+            .await,
+        "upstream",
+    );
+    assert_blank_id(service.create_tenant(&actor, "").await, "tenant");
+    assert_blank_id(
+        service
+            .create_client(&actor, "", "tenant")
+            .await,
+        "client",
+    );
+    assert_blank_id(
+        service
+            .create_client(&actor, "client", " ")
+            .await,
+        "tenant",
+    );
+}
+
+fn assert_blank_id(result: Result<(), AdminError>, entity: &str) {
+    match result {
+        Err(AdminError::Invalid(message)) => assert!(
+            message.contains(&format!("{entity} id must not be blank")),
+            "{message}"
+        ),
+        other => panic!("expected Invalid for a blank {entity} id, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_blank_cursor_is_rejected_rather_than_reinterpreted() {
+    // A broken client that sends `cursor=` must learn that it is broken, not
+    // silently restart at the first page.
+    assert!(PageRequest::new(None, Some(String::new())).is_err());
+    assert!(PageRequest::new(None, Some("   ".to_owned())).is_err());
+
+    // Omitting the parameter still means the first page.
+    assert!(
+        PageRequest::new(None, None)
+            .expect("page")
+            .cursor()
+            .is_none()
+    );
+}
+
+#[test]
+fn cursors_round_trip_and_reject_garbage() {
+    let encoded = encode_cursor(CursorKind::Routes, &["/api", "route-1"]);
+
+    assert_eq!(
+        decode_cursor(CursorKind::Routes, &encoded, 2).expect("decode"),
         vec!["/api".to_owned(), "route-1".to_owned()]
     );
 
-    // A caller must not be able to fabricate a cursor for another listing, or a
-    // truncated one, and silently skip rows.
     // A part may contain anything, including the character an "encode the
     // joined string" scheme would have used as a separator.
-    let awkward = encode_cursor(&["/api/\u{1f}/x", "id.with.dots"]);
+    let awkward = encode_cursor(CursorKind::Routes, &["/api/\u{1f}/x", "id.with.dots"]);
     assert_eq!(
-        decode_cursor(&awkward, 2).expect("decode"),
+        decode_cursor(CursorKind::Routes, &awkward, 2).expect("decode"),
         vec!["/api/\u{1f}/x".to_owned(), "id.with.dots".to_owned()]
     );
 
-    // Empty strings are legal ids in this codebase (nothing validates entity
-    // ids), so the codec must round-trip them rather than break pagination on
-    // the row after one.
+    // Empty parts are legal (rows written before ids were validated), so the
+    // codec must round-trip them rather than break pagination on the row after
+    // one.
     assert_eq!(
-        decode_cursor(&encode_cursor(&["", "id"]), 2).expect("decode"),
+        decode_cursor(
+            CursorKind::Routes,
+            &encode_cursor(CursorKind::Routes, &["", "id"]),
+            2
+        )
+        .expect("decode"),
         vec![String::new(), "id".to_owned()]
     );
 
     let at = OffsetDateTime::now_utc();
-    let timestamped = encode_timestamp_cursor(at, "42");
-    let (decoded_at, tiebreak) = decode_timestamp_cursor(&timestamped).expect("decode");
+    let timestamped = encode_timestamp_cursor(CursorKind::Audit, at, "42");
+    let (decoded_at, tiebreak) =
+        decode_timestamp_cursor(CursorKind::Audit, &timestamped).expect("decode");
     assert_eq!(decoded_at.unix_timestamp_nanos(), at.unix_timestamp_nanos());
     assert_eq!(tiebreak, "42");
-    assert!(decode_timestamp_cursor("zz").is_err());
+    assert!(decode_timestamp_cursor(CursorKind::Audit, "zz").is_err());
 
     for (candidate, parts) in [
         // not hex
-        ("zz", 2),
+        ("routes.zz", 2),
         // odd-length hex
-        ("abc", 2),
+        ("routes.abc", 2),
+        // no tag at all
         ("", 2),
+        ("zz", 2),
         // right encoding, wrong arity for this listing
         (encoded.as_str(), 1),
     ] {
         assert!(
-            matches!(decode_cursor(candidate, parts), Err(AdminError::Invalid(_))),
+            matches!(
+                decode_cursor(CursorKind::Routes, candidate, parts),
+                Err(AdminError::Invalid(_))
+            ),
             "{candidate:?} with {parts} parts must be rejected"
         );
     }
+}
+
+/// A cursor names the listing it belongs to. Keys, audit, and data-audit all
+/// page over `(timestamp, tiebreak)`, so arity alone cannot tell them apart;
+/// without the tag one listing would accept another's cursor and silently page
+/// from a boundary it never produced.
+#[test]
+fn a_cursor_from_another_listing_is_rejected() {
+    let at = OffsetDateTime::now_utc();
+    let from_audit = encode_timestamp_cursor(CursorKind::Audit, at, "42");
+
+    // Same arity, same shape, wrong listing.
+    assert!(matches!(
+        decode_timestamp_cursor(CursorKind::Keys, &from_audit),
+        Err(AdminError::Invalid(_))
+    ));
+    assert!(matches!(
+        decode_timestamp_cursor(CursorKind::DataAudit, &from_audit),
+        Err(AdminError::Invalid(_))
+    ));
+
+    let from_routes = encode_cursor(CursorKind::Routes, &["route-1"]);
+    assert!(matches!(
+        decode_cursor(CursorKind::Upstreams, &from_routes, 1),
+        Err(AdminError::Invalid(_))
+    ));
+}
+
+/// The issued token is a secret; `Debug` is how it would reach a log, a panic
+/// message, or a trace without anyone writing `token` on purpose.
+#[test]
+fn an_issued_token_never_reaches_debug_output() {
+    let issued = IssuedKey {
+        key_id: "key-1".to_owned(),
+        token: "the-secret-token".to_owned(),
+        scopes: vec!["read".to_owned()],
+        expires_at: None,
+    };
+
+    let rendered = format!("{issued:?}");
+
+    assert!(!rendered.contains("the-secret-token"), "{rendered}");
+    assert!(rendered.contains("key-1"), "{rendered}");
 }
 
 #[tokio::test]
@@ -751,6 +908,72 @@ async fn route_listing_pages_and_ends() {
         .delete_tenant(&actor, &tenant)
         .await
         .ok();
+}
+
+/// An empty id sorts before every other id, so it is the first row of a
+/// listing. Its cursor is `routes.`: the tag keeps it nonempty, so it survives
+/// `PageRequest`, and the empty part after the dot names the row. The write
+/// path and the schema both refuse new blank ids, so the only remaining source
+/// is a row stored before those checks — which is why the codec still knows how
+/// to encode and read one.
+#[test]
+fn a_cursor_past_a_legacy_empty_id_is_nonempty_and_steps_over_it() {
+    let page = finish_page(
+        vec![
+            ((), encode_cursor(CursorKind::Routes, &[""])),
+            ((), encode_cursor(CursorKind::Routes, &["next"])),
+        ],
+        1,
+    );
+
+    assert_eq!(page.next_cursor.as_deref(), Some("routes."));
+
+    let request = PageRequest::new(Some(1), page.next_cursor).expect("the cursor is accepted");
+    let after =
+        decode_cursor(CursorKind::Routes, request.cursor().expect("cursor"), 1).expect("decode");
+
+    // `WHERE id > ''` matches every non-blank id, so the listing advances.
+    assert_eq!(after, vec![String::new()]);
+}
+
+/// The migration is the second boundary: a writer that bypasses the service
+/// cannot recreate the row the cursor above exists to survive. `NOT VALID` is
+/// deliberate — rows stored before the check are not rewritten or deleted.
+#[tokio::test]
+async fn the_schema_carries_the_blank_id_check() {
+    let Some(pool) = pg_pool().await else {
+        eprintln!("skipping: DATABASE_URL is not set");
+        return;
+    };
+
+    let check: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT conname, convalidated FROM pg_constraint
+         WHERE conname IN ('clients_id_not_blank', 'routes_id_not_blank',
+                           'tenants_id_not_blank', 'upstreams_id_not_blank')
+         ORDER BY conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read the blank-id constraints");
+
+    assert_eq!(
+        check
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "clients_id_not_blank",
+            "routes_id_not_blank",
+            "tenants_id_not_blank",
+            "upstreams_id_not_blank",
+        ]
+    );
+    assert!(
+        check
+            .iter()
+            .all(|(_, validated)| !validated),
+        "legacy rows must not block the migration: {check:?}"
+    );
 }
 
 #[test]

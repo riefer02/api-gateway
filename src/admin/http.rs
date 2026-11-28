@@ -708,19 +708,22 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_cursor_is_a_bad_request() {
         // Rejected while decoding, before any database work: the lazy pool in
-        // this fixture proves it.
-        let response = router_with_token("secret")
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/routes?cursor=zz")
-                    .header("authorization", "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        // this fixture proves it. A blank cursor is malformed too: silently
+        // treating it as "first page" is the loop this test exists to prevent.
+        for uri in ["/v1/routes?cursor=zz", "/v1/routes?cursor="] {
+            let response = router_with_token("secret")
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ use super::*;
 
 impl AdminService {
     pub(crate) async fn create_tenant(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {
+        validate_id("tenant", id)?;
+
         let mut transaction = self
             .pool
             .begin()
@@ -36,6 +38,9 @@ impl AdminService {
         id: &str,
         tenant_id: &str,
     ) -> Result<(), AdminError> {
+        validate_id("client", id)?;
+        validate_id("tenant", tenant_id)?;
+
         let mut transaction = self
             .pool
             .begin()

@@ -28,6 +28,22 @@ versions follow [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- **A paginated listing no longer stops on an empty id, and a cursor names its listing.**
+  An entity id may be empty, and the empty id sorts before every other id, so its cursor
+  encoded to the empty string — which the next request read as "first page", either
+  repeating the row or ending the listing early. Cursors now lead with the listing name
+  (`routes.`, `keys.`, ...): that keeps the empty id's cursor nonempty, and it makes a
+  cursor from another listing a 400 instead of a boundary this listing never produced —
+  keys, audit, and data-audit page over the same shape, so arity alone could not tell them
+  apart. A blank `cursor=` is a 400 rather than a silent restart. Breaking: cursors issued
+  by a previous build are rejected, so a client mid-pagination restarts at page 1.
+- **Blank entity ids are refused at the write boundary.** A route, upstream, tenant, or
+  client id is a key and a URL segment; the admin service now rejects a blank one (400)
+  instead of storing a row no adapter can address, and the OpenAPI schema says so. The
+  check runs before any database work. Rows written before it stay listable, which is why
+  the cursor above still has to carry the empty id. A `NOT VALID` check on `routes`,
+  `upstreams`, `tenants`, and `clients` holds the same line against writers that bypass the
+  service, without rewriting or deleting rows stored earlier.
 - **A request deadline now charges the circuit breaker.** The timeout wrapped the proxied
   call, so the call never returned and the breaker never saw a failure — it protected
   against fast failures but not slow ones.

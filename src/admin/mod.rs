@@ -36,12 +36,27 @@ pub(crate) enum AdminError {
     Store(#[source] sqlx::Error),
 }
 
-#[derive(Debug)]
 pub(crate) struct IssuedKey {
     pub(crate) key_id: String,
     pub(crate) token: String,
     pub(crate) scopes: Vec<String>,
     pub(crate) expires_at: Option<OffsetDateTime>,
+}
+
+/// The token is the one secret the control plane hands out; it reaches an
+/// operator through the CLI's stdout or the issue/rotate response body, and
+/// nowhere else. A derived `Debug` would put it in any log line, panic message
+/// or trace that formats the struct, so this is written by hand.
+impl std::fmt::Debug for IssuedKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedKey")
+            .field("key_id", &self.key_id)
+            .field("token", &"[redacted]")
+            .field("scopes", &self.scopes)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// The credential listing is a store read model, not a second definition.
@@ -193,9 +208,21 @@ impl PageRequest {
             )));
         }
 
-        let cursor = cursor
-            .map(|cursor| cursor.trim().to_owned())
-            .filter(|cursor| !cursor.is_empty());
+        // A present but blank cursor is a caller error, not "no cursor":
+        // treating it as the first page makes a broken client loop forever
+        // instead of seeing the 400 that names its mistake.
+        let cursor = match cursor {
+            Some(cursor) => {
+                let cursor = cursor.trim();
+
+                if cursor.is_empty() {
+                    return Err(invalid_cursor());
+                }
+
+                Some(cursor.to_owned())
+            }
+            None => None,
+        };
 
         Ok(Self { limit, cursor })
     }
@@ -217,14 +244,49 @@ impl PageRequest {
 /// never contain. Encoding the parts separately rather than joining them first
 /// matters: a route id or path prefix may contain any character, including the
 /// separator an "encode, then split" scheme would use.
+///
+/// A cursor starts with the listing it belongs to. Every listing is a keyset
+/// over a different tuple, so a cursor from one is not merely wrong at another,
+/// it is meaningless — and two listings can have the same arity, which made the
+/// old "reject the wrong part count" check accept a keys cursor at the audit
+/// endpoint. The tag makes that a 400, and makes every cursor nonempty by
+/// construction: an empty id is `routes.`, not the empty string.
 const MAX_CURSOR_BYTES: usize = 16_384;
 
-pub(crate) fn encode_cursor(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(hex::encode)
-        .collect::<Vec<_>>()
-        .join(".")
+/// The listings that page. The tag is the wire name; renaming one invalidates
+/// cursors issued by the previous build, which is why it is not derived from a
+/// type or a position.
+#[derive(Clone, Copy)]
+pub(crate) enum CursorKind {
+    Routes,
+    Upstreams,
+    Keys,
+    Audit,
+    DataAudit,
+}
+
+impl CursorKind {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Routes => "routes",
+            Self::Upstreams => "upstreams",
+            Self::Keys => "keys",
+            Self::Audit => "audit",
+            Self::DataAudit => "data-audit",
+        }
+    }
+}
+
+pub(crate) fn encode_cursor(kind: CursorKind, parts: &[&str]) -> String {
+    let mut cursor = String::with_capacity(16 + parts.len() * 16);
+    cursor.push_str(kind.tag());
+
+    for part in parts {
+        cursor.push('.');
+        cursor.push_str(&hex::encode(part));
+    }
+
+    cursor
 }
 
 /// The one rejection for an unusable cursor, wherever it is decoded.
@@ -235,12 +297,24 @@ pub(crate) fn invalid_cursor() -> AdminError {
     )
 }
 
-pub(crate) fn decode_cursor(encoded: &str, expected: usize) -> Result<Vec<String>, AdminError> {
-    if encoded.is_empty() || encoded.len() > MAX_CURSOR_BYTES {
+pub(crate) fn decode_cursor(
+    kind: CursorKind,
+    encoded: &str,
+    expected: usize,
+) -> Result<Vec<String>, AdminError> {
+    if encoded.len() > MAX_CURSOR_BYTES {
         return Err(invalid_cursor());
     }
 
-    let encoded_parts: Vec<&str> = encoded.split('.').collect();
+    let Some((tag, encoded_parts)) = encoded.split_once('.') else {
+        return Err(invalid_cursor());
+    };
+
+    if tag != kind.tag() {
+        return Err(invalid_cursor());
+    }
+
+    let encoded_parts: Vec<&str> = encoded_parts.split('.').collect();
 
     if encoded_parts.len() != expected {
         return Err(invalid_cursor());
@@ -261,15 +335,20 @@ pub(crate) fn decode_cursor(encoded: &str, expected: usize) -> Result<Vec<String
 ///
 /// The timestamp travels as Unix nanoseconds: exact, cheap to parse back, and
 /// independent of `time`'s formatting features.
-pub(crate) fn encode_timestamp_cursor(at: OffsetDateTime, tiebreak: &str) -> String {
+pub(crate) fn encode_timestamp_cursor(
+    kind: CursorKind,
+    at: OffsetDateTime,
+    tiebreak: &str,
+) -> String {
     let nanos = at.unix_timestamp_nanos().to_string();
-    encode_cursor(&[nanos.as_str(), tiebreak])
+    encode_cursor(kind, &[nanos.as_str(), tiebreak])
 }
 
 pub(crate) fn decode_timestamp_cursor(
+    kind: CursorKind,
     cursor: &str,
 ) -> Result<(OffsetDateTime, String), AdminError> {
-    let parts = decode_cursor(cursor, 2)?;
+    let parts = decode_cursor(kind, cursor, 2)?;
     let nanos: i128 = parts[0]
         .parse()
         .map_err(|_| invalid_cursor())?;
@@ -414,6 +493,20 @@ impl AdminService {
             tracing::warn!(%error, action, subject, "audit write failed");
         }
     }
+}
+
+/// Ids are keys, not labels: one addresses a row in a URL, names it in the
+/// audit log, and becomes a keyset boundary. A blank id is none of those, and
+/// as a single-part cursor it would encode to nothing, so the write path
+/// refuses it. Rows written before this check still page correctly.
+fn validate_id(entity: &'static str, id: &str) -> Result<(), AdminError> {
+    if id.trim().is_empty() {
+        return Err(AdminError::Invalid(format!(
+            "{entity} id must not be blank"
+        )));
+    }
+
+    Ok(())
 }
 
 fn normalize_scopes(scopes: &[String]) -> Result<Vec<String>, AdminError> {

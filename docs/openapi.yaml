@@ -46,6 +46,8 @@ paths:
               properties:
                 id:
                   type: string
+                  minLength: 1
+                  pattern: '\S'
                   example: acme
       responses:
         "201":
@@ -84,8 +86,12 @@ paths:
               properties:
                 id:
                   type: string
+                  minLength: 1
+                  pattern: '\S'
                 tenant_id:
                   type: string
+                  minLength: 1
+                  pattern: '\S'
       responses:
         "201":
           description: Created
@@ -451,8 +457,12 @@ components:
       name: id
       in: path
       required: true
+      description: |
+        Entity id. An id that is blank or only whitespace is a 400: it cannot be
+        addressed in a URL or named in the audit log.
       schema:
         type: string
+        pattern: '\S'
     KeyId:
       name: key_id
       in: path
@@ -474,7 +484,8 @@ components:
       description: |
         Opaque `next_cursor` from the previous page. Omit it to start at the
         beginning. Cursors are not offsets and must not be constructed by a
-        client; an invalid one is a 400.
+        client; an invalid one is a 400. A cursor is bound to the listing that
+        issued it, and an empty value is invalid rather than "first page".
       schema:
         type: string
 

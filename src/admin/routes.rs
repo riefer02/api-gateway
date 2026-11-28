@@ -13,6 +13,8 @@ impl AdminService {
         audience: Option<&str>,
         exchange_scope: Option<&str>,
     ) -> Result<(), AdminError> {
+        validate_id("upstream", id)?;
+
         let url = routing::validate_upstream_url(base_url, &self.routing.allow_hosts)
             .map_err(AdminError::Invalid)?;
         // The same verdict the compiler will reach, applied at write time so a
@@ -114,6 +116,8 @@ impl AdminService {
     }
 
     pub(crate) async fn put_route(&self, actor: &Actor, spec: RouteSpec) -> Result<(), AdminError> {
+        validate_id("route", &spec.id)?;
+
         routing::validate_path_prefix(&spec.path_prefix).map_err(AdminError::Invalid)?;
         routing::parse_methods(&spec.methods).map_err(AdminError::Invalid)?;
 
@@ -346,7 +350,7 @@ impl AdminService {
         // keeps across updates, and keyset pagination over a mutable sort key
         // can skip or repeat the edited row between pages.
         let after = match page.cursor() {
-            Some(cursor) => Some(decode_cursor(cursor, 1)?.remove(0)),
+            Some(cursor) => Some(decode_cursor(CursorKind::Routes, cursor, 1)?.remove(0)),
             None => None,
         };
 
@@ -419,7 +423,7 @@ impl AdminService {
         let entries = summaries
             .into_iter()
             .map(|route| {
-                let cursor = encode_cursor(&[route.id.as_str()]);
+                let cursor = encode_cursor(CursorKind::Routes, &[route.id.as_str()]);
                 (route, cursor)
             })
             .collect();
@@ -432,7 +436,7 @@ impl AdminService {
         page: PageRequest,
     ) -> Result<Page<UpstreamSummary>, AdminError> {
         let after = match page.cursor() {
-            Some(cursor) => Some(decode_cursor(cursor, 1)?.remove(0)),
+            Some(cursor) => Some(decode_cursor(CursorKind::Upstreams, cursor, 1)?.remove(0)),
             None => None,
         };
 
@@ -477,7 +481,7 @@ impl AdminService {
         let entries = summaries
             .into_iter()
             .map(|upstream| {
-                let cursor = encode_cursor(&[upstream.id.as_str()]);
+                let cursor = encode_cursor(CursorKind::Upstreams, &[upstream.id.as_str()]);
                 (upstream, cursor)
             })
             .collect();
