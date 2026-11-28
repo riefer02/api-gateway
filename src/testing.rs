@@ -13,7 +13,7 @@ use crate::{
     app,
     audit::{AuditSink, DataAuditEvent},
     auth,
-    auth::{KeyVerifier, store::InMemoryApiKeyStore},
+    auth::{KeyVerifier, store::ApiKeyStore, store::InMemoryApiKeyStore},
     config::{Config, EnvSource},
     limits::{BreakerRegistry, RateLimits},
     routing::{CompiledRoute, RouteTable, RouteTableHandle, Upstream},
@@ -152,87 +152,23 @@ pub(crate) fn route(
     }
 }
 
-/// State with one `/swapi` route pointing at `upstream_url`, plus the token
-/// that authenticates against it with the [`SCOPES`] scopes.
-pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (AppState, String) {
-    let verifier = KeyVerifier::new(config.auth.pepper.clone());
-
-    let (key, secret) = auth::key::generate(
-        &verifier,
-        auth::ClientId("client-test".to_owned()),
-        SCOPES
-            .iter()
-            .map(|scope| (*scope).to_owned())
-            .collect(),
-        None,
-    )
-    .expect("generate key");
-
-    let key_id = key.key_id.clone();
-    let store = InMemoryApiKeyStore::default();
-    store
-        .insert_active(key)
-        .expect("seed credential");
-
-    let route = route(
-        upstream_url,
-        timeout,
-        crate::mcp::ToolPolicy::default(),
-        None,
-        None,
-    );
-
-    let state = AppState {
-        db: lazy_pool(),
-        api_key_store: Arc::new(store),
-        verifier: Arc::new(verifier),
-        oauth: None,
-        exchange: None,
-        routes: RouteTableHandle::new(RouteTable::for_tests(1, vec![route])),
-        limits: Arc::new(RateLimits::new(&config.limits)),
-        breakers: Arc::new(BreakerRegistry::new(&config.limits)),
-        bulkheads: crate::limits::BulkheadRegistry::new(&config.routing).map(Arc::new),
-        retry: Arc::new(crate::retry::RetryPolicy::new(&config.retry)),
-        audit: Arc::new(crate::audit::DisabledAudit),
-        mcp_schemas: (!config.mcp.tool_schema_ttl.is_zero()).then(|| {
-            Arc::new(crate::mcp::schema::SchemaCache::new(
-                config.mcp.tool_schema_ttl,
-            ))
-        }),
-        mcp_filter_max_bytes: config.mcp.filter_max_bytes,
-        default_request_timeout: config.server.request_timeout,
-        max_request_timeout: config.server.max_request_timeout,
-        max_response_bytes: config.server.max_response_bytes,
-        stream_idle_timeout: config.server.stream_idle_timeout,
-        body_limit: config.server.request_body_limit_bytes,
-        metrics_token: config.telemetry.metrics_token.clone(),
-        metrics: metrics_handle(),
-        readiness: Arc::new(crate::state::Readiness::new(
-            std::time::Duration::from_secs(1),
-            config.auth.cache_ttl,
-        )),
-        trusted_proxies: Arc::new(
-            crate::net::TrustedProxies::parse(&config.server.trusted_proxies)
-                .expect("test trusted proxies"),
-        ),
-    };
-
-    (state, auth::key::token(&key_id, &secret))
-}
-
-/// A state with no routes: everything 404s.
-pub(crate) fn empty_state() -> AppState {
-    empty_state_with(&config())
-}
-
-pub(crate) fn empty_state_with(config: &Config) -> AppState {
+/// Every field of `AppState`, in one place.
+///
+/// The helpers below differ only in their route table and credential store.
+/// A new field is added here once, not in every test constructor.
+fn build_state(
+    config: &Config,
+    routes: RouteTable,
+    api_key_store: Arc<dyn ApiKeyStore>,
+    verifier: Arc<KeyVerifier>,
+) -> AppState {
     AppState {
         db: lazy_pool(),
-        api_key_store: Arc::new(InMemoryApiKeyStore::default()),
-        verifier: Arc::new(KeyVerifier::new(config.auth.pepper.clone())),
+        api_key_store,
+        verifier,
         oauth: None,
         exchange: None,
-        routes: RouteTableHandle::new(RouteTable::for_tests(1, Vec::new())),
+        routes: RouteTableHandle::new(routes),
         limits: Arc::new(RateLimits::new(&config.limits)),
         breakers: Arc::new(BreakerRegistry::new(&config.limits)),
         bulkheads: crate::limits::BulkheadRegistry::new(&config.routing).map(Arc::new),
@@ -260,6 +196,60 @@ pub(crate) fn empty_state_with(config: &Config) -> AppState {
                 .expect("test trusted proxies"),
         ),
     }
+}
+
+/// State with one `/swapi` route pointing at `upstream_url`, plus the token
+/// that authenticates against it with the [`SCOPES`] scopes.
+pub(crate) fn state(config: &Config, upstream_url: &str, timeout: Duration) -> (AppState, String) {
+    let verifier = Arc::new(KeyVerifier::new(config.auth.pepper.clone()));
+
+    let (key, secret) = auth::key::generate(
+        &verifier,
+        auth::ClientId("client-test".to_owned()),
+        SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect(),
+        None,
+    )
+    .expect("generate key");
+
+    let key_id = key.key_id.clone();
+    let store = InMemoryApiKeyStore::default();
+    store
+        .insert_active(key)
+        .expect("seed credential");
+
+    let route = route(
+        upstream_url,
+        timeout,
+        crate::mcp::ToolPolicy::default(),
+        None,
+        None,
+    );
+
+    let state = build_state(
+        config,
+        RouteTable::for_tests(1, vec![route]),
+        Arc::new(store),
+        verifier,
+    );
+
+    (state, auth::key::token(&key_id, &secret))
+}
+
+/// A state with no routes: everything 404s.
+pub(crate) fn empty_state() -> AppState {
+    empty_state_with(&config())
+}
+
+pub(crate) fn empty_state_with(config: &Config) -> AppState {
+    build_state(
+        config,
+        RouteTable::for_tests(1, Vec::new()),
+        Arc::new(InMemoryApiKeyStore::default()),
+        Arc::new(KeyVerifier::new(config.auth.pepper.clone())),
+    )
 }
 
 pub(crate) fn app(upstream_url: &str, timeout: Duration) -> (Router, String) {
