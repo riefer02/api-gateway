@@ -12,8 +12,8 @@ versions follow [Semantic Versioning](https://semver.org).
   an opaque `cursor`, and return `{"items": [...], "next_cursor": "..."}`. Cursors name
   the last row returned, so inserts and deletes between pages cannot shift the boundary or
   duplicate a row. A malformed cursor or out-of-range limit is a 400, never a silent
-  clamp. The CLI gained `admin upstream list` and `--limit`/`--cursor` on the listing
-  commands. Breaking: the five listing responses are now envelopes, and the data audit
+  clamp, and an unknown query parameter is a 400 rather than silently ignored. The CLI
+  gained `admin upstream list` and `--limit`/`--cursor` on the listing commands. Breaking: the five listing responses are now envelopes, and the data audit
   endpoint's `before_id` parameter is replaced by `cursor`.
 
 - **Local cluster harness and experiments.** `deploy/local` runs three replicas behind

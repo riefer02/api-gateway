@@ -597,6 +597,22 @@ fn cursors_round_trip_and_reject_garbage() {
 
     // A caller must not be able to fabricate a cursor for another listing, or a
     // truncated one, and silently skip rows.
+    // A part may contain anything, including the character an "encode the
+    // joined string" scheme would have used as a separator.
+    let awkward = encode_cursor(&["/api/\u{1f}/x", "id.with.dots"]);
+    assert_eq!(
+        decode_cursor(&awkward, 2).expect("decode"),
+        vec!["/api/\u{1f}/x".to_owned(), "id.with.dots".to_owned()]
+    );
+
+    // Empty strings are legal ids in this codebase (nothing validates entity
+    // ids), so the codec must round-trip them rather than break pagination on
+    // the row after one.
+    assert_eq!(
+        decode_cursor(&encode_cursor(&["", "id"]), 2).expect("decode"),
+        vec![String::new(), "id".to_owned()]
+    );
+
     let at = OffsetDateTime::now_utc();
     let timestamped = encode_timestamp_cursor(at, "42");
     let (decoded_at, tiebreak) = decode_timestamp_cursor(&timestamped).expect("decode");

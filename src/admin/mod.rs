@@ -208,16 +208,18 @@ impl PageRequest {
 /// Cursors are keyset, not offsets: they name the last row returned, so a row
 /// inserted or deleted between pages cannot shift the page boundary.
 ///
-/// The parts are hex-encoded behind a unit separator, which keeps the cursor
-/// opaque (a caller must not build one) and safe in a query string without
-/// pulling in a base64 dependency.
-const CURSOR_SEPARATOR: &str = "\u{1f}";
-/// Generous enough for a long path prefix plus a long id, small enough that a
-/// caller cannot turn decoding into work.
+/// Each part is hex-encoded and the parts are joined with `.`, which hex can
+/// never contain. Encoding the parts separately rather than joining them first
+/// matters: a route id or path prefix may contain any character, including the
+/// separator an "encode, then split" scheme would use.
 const MAX_CURSOR_BYTES: usize = 16_384;
 
 pub(crate) fn encode_cursor(parts: &[&str]) -> String {
-    hex::encode(parts.join(CURSOR_SEPARATOR))
+    parts
+        .iter()
+        .map(hex::encode)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The one rejection for an unusable cursor, wherever it is decoded.
@@ -233,15 +235,18 @@ pub(crate) fn decode_cursor(encoded: &str, expected: usize) -> Result<Vec<String
         return Err(invalid_cursor());
     }
 
-    let bytes = hex::decode(encoded).map_err(|_| invalid_cursor())?;
-    let text = String::from_utf8(bytes).map_err(|_| invalid_cursor())?;
-    let parts: Vec<String> = text
-        .split(CURSOR_SEPARATOR)
-        .map(str::to_owned)
-        .collect();
+    let encoded_parts: Vec<&str> = encoded.split('.').collect();
 
-    if parts.len() != expected || parts.iter().any(String::is_empty) {
+    if encoded_parts.len() != expected {
         return Err(invalid_cursor());
+    }
+
+    let mut parts = Vec::with_capacity(expected);
+
+    for encoded_part in encoded_parts {
+        let bytes = hex::decode(encoded_part).map_err(|_| invalid_cursor())?;
+        let part = String::from_utf8(bytes).map_err(|_| invalid_cursor())?;
+        parts.push(part);
     }
 
     Ok(parts)

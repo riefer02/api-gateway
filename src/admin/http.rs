@@ -327,6 +327,7 @@ async fn revoke_key(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListKeysQuery {
     client_id: String,
     limit: Option<u32>,
@@ -334,6 +335,7 @@ struct ListKeysQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PageQuery {
     limit: Option<u32>,
     cursor: Option<String>,
@@ -762,6 +764,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_query_parameters_are_rejected() {
+        // A stale or mistyped parameter must not silently return the default
+        // first page: `before_id` no longer exists, and `limt` is a typo.
+        for uri in [
+            "/v1/routes?limt=5",
+            "/v1/data-audit?before_id=1",
+            "/v1/audit?tenant=acme",
+        ] {
+            let response = router_with_token("secret")
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_requests_reach_the_service() {
         // No database: the handler surfaces a 5xx, which proves the token
         // check passed and the request reached the service.
@@ -781,12 +807,14 @@ mod tests {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuditQuery {
     limit: Option<u32>,
     cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DataAuditQuery {
     limit: Option<u32>,
     cursor: Option<String>,
