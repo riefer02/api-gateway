@@ -5,7 +5,6 @@ use axum::http::{HeaderMap, header};
 use time::OffsetDateTime;
 
 use crate::error::AppError;
-use crate::state::AppState;
 
 /// Bound before any store lookup, cache key, or base64 decode.
 const MAX_BEARER_TOKEN_BYTES: usize = 8 * 1024;
@@ -223,17 +222,34 @@ fn is_expired(key: &ApiKeyRecord) -> bool {
         .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
 }
 
+/// The three things authentication needs.
+///
+/// Deliberately not `AppState`: taking the composition root made `auth` depend
+/// on every subsystem and closed a module cycle with `state`. A caller builds
+/// this from whatever owns the handles.
+pub(crate) struct AuthContext<'a> {
+    pub(crate) store: &'a dyn store::ApiKeyStore,
+    pub(crate) verifier: &'a KeyVerifier,
+    pub(crate) oauth: Option<&'a oauth::OAuth>,
+}
+
 pub(crate) async fn authenticate(
-    state: &AppState,
+    context: AuthContext<'_>,
     headers: &HeaderMap,
 ) -> Result<Principal, AppError> {
-    let token = bearer_token(headers).ok_or_else(|| match &state.oauth {
+    let AuthContext {
+        store,
+        verifier,
+        oauth,
+    } = context;
+
+    let token = bearer_token(headers).ok_or_else(|| match oauth {
         Some(oauth) => oauth.challenge_unauthorized(None),
         None => AppError::Unauthorized,
     })?;
 
     if token.len() > MAX_BEARER_TOKEN_BYTES {
-        return Err(match &state.oauth {
+        return Err(match oauth {
             Some(oauth) => oauth.challenge_unauthorized(Some("invalid_token")),
             None => AppError::Unauthorized,
         });
@@ -242,7 +258,7 @@ pub(crate) async fn authenticate(
     // Access tokens are signed JWTs with three segments. API keys are
     // `key_id.secret`, so the shapes cannot be confused without an accidental
     // dot in a generated secret.
-    if let Some(oauth) = &state.oauth
+    if let Some(oauth) = oauth
         && token.split('.').count() == 3
     {
         let identity = oauth
@@ -288,7 +304,7 @@ pub(crate) async fn authenticate(
 
     let (key_id, secret) = token
         .split_once('.')
-        .ok_or_else(|| match &state.oauth {
+        .ok_or_else(|| match oauth {
             Some(oauth) => oauth.challenge_unauthorized(Some("invalid_token")),
             None => AppError::Unauthorized,
         })?;
@@ -297,27 +313,22 @@ pub(crate) async fn authenticate(
         return Err(AppError::Unauthorized);
     }
 
-    let identity = verify_api_key(
-        state.api_key_store.as_ref(),
-        &state.verifier,
-        &ApiKeyId(key_id.to_owned()),
-        secret,
-    )
-    .await
-    .map_err(|error| {
-        metrics::counter!(
-            "gateway_auth_failures_total",
-            "reason" => error.metric_reason(),
-        )
-        .increment(1);
+    let identity = verify_api_key(store, verifier, &ApiKeyId(key_id.to_owned()), secret)
+        .await
+        .map_err(|error| {
+            metrics::counter!(
+                "gateway_auth_failures_total",
+                "reason" => error.metric_reason(),
+            )
+            .increment(1);
 
-        match (&state.oauth, &error) {
-            (Some(oauth), AuthError::InvalidCredentials) => {
-                oauth.challenge_unauthorized(Some("invalid_token"))
+            match (oauth, &error) {
+                (Some(oauth), AuthError::InvalidCredentials) => {
+                    oauth.challenge_unauthorized(Some("invalid_token"))
+                }
+                _ => error.into_app_error(),
             }
-            _ => error.into_app_error(),
-        }
-    })?;
+        })?;
 
     record_identity(&identity);
 

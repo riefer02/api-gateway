@@ -90,7 +90,15 @@ async fn handle(
         rate_headers.insert("x-run-id", value);
     }
 
-    let identity = auth::authenticate(state, request.headers()).await?;
+    let identity = auth::authenticate(
+        auth::AuthContext {
+            store: state.api_key_store.as_ref(),
+            verifier: &state.verifier,
+            oauth: state.oauth.as_deref(),
+        },
+        request.headers(),
+    )
+    .await?;
 
     audit.identity(
         identity.tenant_id.as_str(),
