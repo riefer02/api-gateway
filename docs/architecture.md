@@ -135,6 +135,25 @@ where the credential is known.
 it is a composition root. If it owns mutable state, say what bounds it. Add it to this
 document's map in the same commit.
 
+## Known limits at organization scale
+
+These are deliberate and documented rather than hidden. Capacity planning should start
+here.
+
+- **Control-plane listings are unpaginated** for keys (per client), upstreams, and routes.
+  Audit listings already clamp to 1000 rows and page by `before_id`. A fleet with tens of
+  thousands of routes should get cursor pagination (`after_id`/`limit`) before the listing
+  becomes the slowest call an operator makes; that is an API change and needs its own
+  decision.
+- **Rate limits and breakers are per replica** (ADR 0005). N replicas allow up to N × the
+  configured rate, and a breaker needs N × its threshold before every replica opens.
+- **Control-plane writes serialise** on one advisory lock so the audit chain has a single
+  writer (ADR 0003). Fine at operator speed; it is not a bulk-import path.
+- **Audit verification is O(rows) and manual.** It pages, so memory is bounded, but a
+  multi-million-row chain is a scheduled maintenance job, not a request-time check.
+- **The JWKS and exchange caches are per replica.** An IdP outage is absorbed per replica
+  and a cold replica re-fetches on first use.
+
 ## Enforcement
 
 `just check` runs everything CI runs:
