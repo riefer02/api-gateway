@@ -128,10 +128,11 @@ allowlisted upstream
 | `src/auth/` | Tokens, peppered verifiers, credential cache, OAuth/JWKS, store. |
 | `src/mcp/` | Tool policy and the small JSON-RPC surface the gateway enforces. |
 | `src/audit.rs` | Bounded, batched per-call audit off the request path. |
-| `src/admin/` | Control-plane service with CLI and HTTP adapters. |
+| `src/admin/` | Control plane split by aggregate (`accounts`, `keys`, `routes`, `audit_read`) with CLI and HTTP adapters. |
 | `src/limits.rs` | Rate limiters and circuit breaker registry. |
 | `src/config.rs` | Typed configuration with validation and redaction. |
 | `src/error.rs` | `AppError` and the JSON error envelope. |
+| `src/metric_names.rs` | Every metric name; a test checks `deploy/alerts.yml` against it. |
 | `examples/` | Stub upstream and load generator for `just bench`. |
 | `docs/` | Threat model, runbook, and control-plane OpenAPI. |
 | `deploy/` | Prometheus alerts, Kubernetes manifests, Caddy edge config. |
@@ -684,6 +685,8 @@ direction.
 
 ## Further reading
 
+- [`docs/architecture.md`](docs/architecture.md) — module ownership, dependency rules,
+  state ownership, and how the checks in `just check` keep them true
 - [`docs/threat-model.md`](docs/threat-model.md) — trust boundaries, threats, residual risk
 - [`docs/runbook.md`](docs/runbook.md) — rotation, revocation, outages, deploy checklist
 - [`docs/openapi.yaml`](docs/openapi.yaml) — control-plane API
@@ -695,7 +698,8 @@ direction.
 
 | Command | What it does |
 |---|---|
-| `just check` | fmt + clippy + tests + dependency policy (mirrors CI) |
+| `just check` | fmt + architecture checks + clippy + tests + dependency policy (mirrors CI) |
+| `just architecture` | Module direction, table ownership, metric-name rules |
 | `just test` | Tests; Postgres tests run only when `DATABASE_URL` is set |
 | `just deny` | Licenses, advisories, duplicates, wildcards |
 | `just bench` | Measures gateway overhead against a local stub upstream |
