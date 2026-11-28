@@ -188,21 +188,24 @@ impl CachedApiKeyStore {
 impl ApiKeyStore for CachedApiKeyStore {
     async fn find_by_key_id(&self, key_id: &ApiKeyId) -> Result<Option<Credential>, StoreError> {
         if self.tombstones.get(key_id).is_some() {
-            metrics::counter!("gateway_auth_cache_total", "result" => "revoked").increment(1);
+            metrics::counter!(crate::metric_names::AUTH_CACHE_TOTAL, "result" => "revoked")
+                .increment(1);
             return Ok(None);
         }
 
         if self.negative.get(key_id).is_some() {
-            metrics::counter!("gateway_auth_cache_total", "result" => "negative").increment(1);
+            metrics::counter!(crate::metric_names::AUTH_CACHE_TOTAL, "result" => "negative")
+                .increment(1);
             return Ok(None);
         }
 
         if let Some(credential) = self.cache.get(key_id) {
-            metrics::counter!("gateway_auth_cache_total", "result" => "hit").increment(1);
+            metrics::counter!(crate::metric_names::AUTH_CACHE_TOTAL, "result" => "hit")
+                .increment(1);
             return Ok(Some(credential));
         }
 
-        metrics::counter!("gateway_auth_cache_total", "result" => "miss").increment(1);
+        metrics::counter!(crate::metric_names::AUTH_CACHE_TOTAL, "result" => "miss").increment(1);
         let generation = self.generation.load(Ordering::Acquire);
 
         let credential = self

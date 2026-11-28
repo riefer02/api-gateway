@@ -161,7 +161,7 @@ impl ChannelAudit {
 impl AuditSink for ChannelAudit {
     fn record(&self, event: DataAuditEvent) {
         if self.sender.try_send(event).is_err() {
-            metrics::counter!("gateway_data_audit_dropped_total").increment(1);
+            metrics::counter!(crate::metric_names::DATA_AUDIT_DROPPED_TOTAL).increment(1);
         }
     }
 }
@@ -188,7 +188,7 @@ pub(crate) async fn run(
         }
 
         if let Err(error) = insert(&pool, &events).await {
-            metrics::counter!("gateway_data_audit_write_failures_total")
+            metrics::counter!(crate::metric_names::DATA_AUDIT_WRITE_FAILURES_TOTAL)
                 .increment(events.len() as u64);
             tracing::warn!(%error, rows = events.len(), "data audit write failed");
         }

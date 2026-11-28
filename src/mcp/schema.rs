@@ -141,7 +141,7 @@ pub(crate) fn learn(list: &Value, upstream: &str, cache: &SchemaCache) {
         let Some(shape) = ToolShape::from_schema(schema) else {
             // Bounded and honest: no schema is remembered, so nothing is
             // half-enforced. The tool still validates its own arguments.
-            metrics::counter!("gateway_mcp_schema_skipped_total").increment(1);
+            metrics::counter!(crate::metric_names::MCP_SCHEMA_SKIPPED_TOTAL).increment(1);
             continue;
         };
 

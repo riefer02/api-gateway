@@ -107,7 +107,7 @@ impl OAuth {
             "bearer_methods_supported": ["header"],
         });
 
-        metrics::gauge!("gateway_oauth_jwks_ready").set(0.0);
+        metrics::gauge!(crate::metric_names::OAUTH_JWKS_READY).set(0.0);
 
         Ok(Self {
             issuer: config.issuer.clone(),
@@ -298,7 +298,7 @@ fn asserted_claims(
             Value::Number(number) => number.to_string(),
             Value::Bool(flag) => flag.to_string(),
             _ => {
-                metrics::counter!("gateway_claim_rejected_total", "claim" => name.clone())
+                metrics::counter!(crate::metric_names::CLAIM_REJECTED_TOTAL, "claim" => name.clone())
                     .increment(1);
                 continue;
             }
@@ -309,7 +309,8 @@ fn asserted_claims(
             && !rendered.chars().any(char::is_control);
 
         if !clean {
-            metrics::counter!("gateway_claim_rejected_total", "claim" => name.clone()).increment(1);
+            metrics::counter!(crate::metric_names::CLAIM_REJECTED_TOTAL, "claim" => name.clone())
+                .increment(1);
             continue;
         }
 
@@ -621,7 +622,7 @@ impl JwksCache {
             Ok(keys) => {
                 state.keys = Some(Arc::new(keys));
                 state.fetched_at = Some(Instant::now());
-                metrics::gauge!("gateway_oauth_jwks_ready").set(1.0);
+                metrics::gauge!(crate::metric_names::OAUTH_JWKS_READY).set(1.0);
                 Ok(())
             }
             Err(error) => {
@@ -630,7 +631,7 @@ impl JwksCache {
                     tracing::warn!(%error, "JWKS refresh failed; using cached keys");
                     Ok(())
                 } else {
-                    metrics::gauge!("gateway_oauth_jwks_ready").set(0.0);
+                    metrics::gauge!(crate::metric_names::OAUTH_JWKS_READY).set(0.0);
                     tracing::warn!(%error, "JWKS unavailable and no keys are cached");
                     Err(OAuthError::Unavailable)
                 }

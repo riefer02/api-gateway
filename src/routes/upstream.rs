@@ -185,7 +185,7 @@ async fn handle(
             Err(rejection) => {
                 audit.deny();
                 metrics::counter!(
-                    "gateway_upstream_saturated_total",
+                    crate::metric_names::UPSTREAM_SATURATED_TOTAL,
                     "upstream" => route.upstream.id.clone(),
                 )
                 .increment(1);
@@ -441,7 +441,7 @@ async fn apply_tool_policy(
         Err(mcp::McpError::InvalidArguments { tool, id, reason }) => {
             audit.mcp(Some("tools/call"), Some(&tool));
             audit.deny();
-            metrics::counter!("gateway_mcp_invalid_params_total", "route" => route.id.clone())
+            metrics::counter!(crate::metric_names::MCP_INVALID_PARAMS_TOTAL, "route" => route.id.clone())
                 .increment(1);
             count_tool_call(identity, &tool, "invalid", !allowed.is_all());
 
@@ -468,7 +468,8 @@ async fn apply_tool_policy(
         Err(mcp::McpError::Denied { tool, id }) => {
             audit.mcp(Some("tools/call"), Some(&tool));
             audit.deny();
-            metrics::counter!("gateway_mcp_denied_total", "route" => route.id.clone()).increment(1);
+            metrics::counter!(crate::metric_names::MCP_DENIED_TOTAL, "route" => route.id.clone())
+                .increment(1);
             count_tool_call(identity, &tool, "deny", false);
 
             let body = mcp::denial_body(
@@ -604,7 +605,7 @@ async fn upstream_authorization(
         .map_err(|error| match error {
             crate::auth::exchange::ExchangeError::Denied => {
                 metrics::counter!(
-                    "gateway_upstream_auth_failures_total",
+                    crate::metric_names::UPSTREAM_AUTH_FAILURES_TOTAL,
                     "reason" => "denied",
                 )
                 .increment(1);
@@ -612,7 +613,7 @@ async fn upstream_authorization(
             }
             crate::auth::exchange::ExchangeError::Unavailable => {
                 metrics::counter!(
-                    "gateway_upstream_auth_failures_total",
+                    crate::metric_names::UPSTREAM_AUTH_FAILURES_TOTAL,
                     "reason" => "unavailable",
                 )
                 .increment(1);
@@ -709,7 +710,7 @@ fn count_tool_call(identity: &auth::Principal, tool: &str, decision: &'static st
     let tool = tool_metric_label(tool, decision, bounded);
 
     metrics::counter!(
-        "gateway_mcp_tool_calls_total",
+        crate::metric_names::MCP_TOOL_CALLS_TOTAL,
         "tenant" => identity.tenant_id.as_str().to_owned(),
         "tool" => tool.to_owned(),
         "decision" => decision,

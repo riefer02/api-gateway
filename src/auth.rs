@@ -267,7 +267,7 @@ pub(crate) async fn authenticate(
             .map_err(|error| match error {
                 oauth::OAuthError::Invalid => {
                     metrics::counter!(
-                        "gateway_auth_failures_total",
+                        crate::metric_names::AUTH_FAILURES_TOTAL,
                         "reason" => "oauth_invalid",
                     )
                     .increment(1);
@@ -276,7 +276,7 @@ pub(crate) async fn authenticate(
                 }
                 oauth::OAuthError::Unavailable => {
                     metrics::counter!(
-                        "gateway_auth_failures_total",
+                        crate::metric_names::AUTH_FAILURES_TOTAL,
                         "reason" => "oauth_unavailable",
                     )
                     .increment(1);
@@ -317,7 +317,7 @@ pub(crate) async fn authenticate(
         .await
         .map_err(|error| {
             metrics::counter!(
-                "gateway_auth_failures_total",
+                crate::metric_names::AUTH_FAILURES_TOTAL,
                 "reason" => error.metric_reason(),
             )
             .increment(1);

@@ -218,7 +218,7 @@ async fn serve(config: &Config) -> Result<(), BoxError> {
             .await
             .is_err()
         {
-            metrics::counter!("gateway_data_audit_shutdown_timeouts_total").increment(1);
+            metrics::counter!(crate::metric_names::DATA_AUDIT_SHUTDOWN_TIMEOUTS_TOTAL).increment(1);
             tracing::warn!("data audit did not drain before shutdown; queued events may be lost");
         }
     }
@@ -406,7 +406,7 @@ async fn run_server(
                 };
 
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                    metrics::counter!("gateway_connections_rejected_total").increment(1);
+                    metrics::counter!(crate::metric_names::CONNECTIONS_REJECTED_TOTAL).increment(1);
                     tracing::warn!(%peer, "connection limit reached; refusing");
                     drop(stream);
                     continue;

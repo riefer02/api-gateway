@@ -40,4 +40,13 @@ check "SQL belongs to the storage modules" \
     "sqlx::query" \
     src/routes src/proxy.rs src/auth.rs src/app.rs src/mcp
 
+# Metric names are a contract with deploy/alerts.yml. A test checks the rules
+# against the list; this stops a new literal from appearing beside it.
+if matches=$(grep -REn '"gateway_[a-z0-9_]+"' src --include='*.rs' 2>/dev/null \
+    | grep -v '^src/metric_names.rs:'); then
+    echo "architecture: metric names belong in src/metric_names.rs" >&2
+    echo "$matches" >&2
+    failed=1
+fi
+
 exit "$failed"

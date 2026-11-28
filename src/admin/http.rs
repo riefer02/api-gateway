@@ -107,7 +107,7 @@ async fn require_admin(
     }
 
     let Some(account) = matched else {
-        metrics::counter!("gateway_admin_auth_failures_total").increment(1);
+        metrics::counter!(crate::metric_names::ADMIN_AUTH_FAILURES_TOTAL).increment(1);
         tracing::warn!(
             source_ip = source_ip
                 .as_deref()

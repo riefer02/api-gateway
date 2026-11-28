@@ -239,9 +239,10 @@ async fn record_metrics(
     let response = next.run(request).await;
     let status = response.status().as_u16().to_string();
 
-    metrics::counter!("gateway_requests_total", "method" => method, "status" => status)
+    metrics::counter!(crate::metric_names::REQUESTS_TOTAL, "method" => method, "status" => status)
         .increment(1);
-    metrics::histogram!("gateway_request_duration_seconds").record(started.elapsed().as_secs_f64());
+    metrics::histogram!(crate::metric_names::REQUEST_DURATION_SECONDS)
+        .record(started.elapsed().as_secs_f64());
 
     response
 }

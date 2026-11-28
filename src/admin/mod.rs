@@ -1300,7 +1300,7 @@ impl AdminService {
         .await;
 
         if let Err(error) = chained {
-            metrics::counter!("gateway_admin_audit_write_failures_total").increment(1);
+            metrics::counter!(crate::metric_names::ADMIN_AUDIT_WRITE_FAILURES_TOTAL).increment(1);
             tracing::warn!(%error, action, subject, "audit write failed");
         }
     }

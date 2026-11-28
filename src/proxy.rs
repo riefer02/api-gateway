@@ -88,7 +88,7 @@ pub(crate) async fn forward(
     let upstream_id = route.upstream.id.as_str();
 
     if let Err(rejection) = breakers.check(upstream_id) {
-        metrics::counter!("gateway_circuit_open_total", "upstream" => upstream_id.to_owned())
+        metrics::counter!(crate::metric_names::CIRCUIT_OPEN_TOTAL, "upstream" => upstream_id.to_owned())
             .increment(1);
 
         return Err(AppError::CircuitOpen {
@@ -168,7 +168,7 @@ pub(crate) async fn forward(
                     }
 
                     metrics::counter!(
-                        "gateway_retry_budget_exhausted_total",
+                        crate::metric_names::RETRY_BUDGET_EXHAUSTED_TOTAL,
                         "upstream" => upstream_id.to_owned(),
                     )
                     .increment(1);
@@ -182,7 +182,7 @@ pub(crate) async fn forward(
                 }
 
                 metrics::counter!(
-                    "gateway_upstream_requests_total",
+                    crate::metric_names::UPSTREAM_REQUESTS_TOTAL,
                     "upstream" => upstream_id.to_owned(),
                     "status" => status.as_u16().to_string(),
                 )
@@ -227,7 +227,7 @@ pub(crate) async fn forward(
 
 fn record_retry(upstream: &str, reason: &'static str, attempt: u32) {
     metrics::counter!(
-        "gateway_upstream_retries_total",
+        crate::metric_names::UPSTREAM_RETRIES_TOTAL,
         "upstream" => upstream.to_owned(),
         "reason" => reason,
     )

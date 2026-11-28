@@ -7,6 +7,7 @@ mod db;
 mod error;
 mod limits;
 mod mcp;
+mod metric_names;
 mod net;
 mod observability;
 mod proxy;
