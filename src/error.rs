@@ -70,7 +70,6 @@ pub enum AppError {
 }
 
 impl AppError {
-    #[allow(dead_code)] // TODO(W5): used once route matching validates paths.
     pub fn bad_request(message: impl Into<Cow<'static, str>>) -> Self {
         Self::BadRequest {
             message: message.into(),

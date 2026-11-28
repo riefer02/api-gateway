@@ -10,6 +10,19 @@ use crate::config::{LimitsConfig, RateLimitBackend};
 /// and delete them indefinitely; these maps must not grow with that history.
 const MAX_TRACKED_UPSTREAMS: usize = 4_096;
 
+/// Drops the whole registry when it reaches its cap and the key is new.
+///
+/// Resetting loses state, which is the safe direction: it forgets an outage
+/// (or a permit count) rather than remembering an upstream that no longer
+/// exists. Both registries reach this state the same way, so they share the
+/// rule instead of restating it.
+fn evict_if_full<V>(map: &mut std::collections::HashMap<String, V>, key: &str, registry: &str) {
+    if map.len() >= MAX_TRACKED_UPSTREAMS && !map.contains_key(key) {
+        map.clear();
+        tracing::warn!("{registry} registry reached its cap; state reset");
+    }
+}
+
 /// Outcome of one rate-limit decision, rendered into response headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
@@ -226,14 +239,7 @@ impl BreakerRegistry {
     pub(crate) fn check(&self, upstream: &str) -> Result<(), BreakerRejection> {
         let mut breakers = self.lock();
 
-        // Upstream ids come from the control plane and change over time; the
-        // registry must not grow with history. Resetting loses breaker state,
-        // which is the safe direction: it forgets an outage rather than
-        // remembering an id that no longer exists.
-        if breakers.len() >= MAX_TRACKED_UPSTREAMS && !breakers.contains_key(upstream) {
-            breakers.clear();
-            tracing::warn!("breaker registry reached its cap; state reset");
-        }
+        evict_if_full(&mut breakers, upstream, "breaker");
 
         let breaker = breakers
             .entry(upstream.to_owned())
@@ -307,10 +313,7 @@ impl BreakerRegistry {
     pub(crate) fn record_failure(&self, upstream: &str) {
         let mut breakers = self.lock();
 
-        if breakers.len() >= MAX_TRACKED_UPSTREAMS && !breakers.contains_key(upstream) {
-            breakers.clear();
-            tracing::warn!("breaker registry reached its cap; state reset");
-        }
+        evict_if_full(&mut breakers, upstream, "breaker");
 
         let breaker = breakers
             .entry(upstream.to_owned())
@@ -601,10 +604,7 @@ impl BulkheadRegistry {
 
             // Same reasoning as the breaker registry: in-flight permits keep
             // their own Arc, so dropping an idle entry is safe.
-            if bulkheads.len() >= MAX_TRACKED_UPSTREAMS && !bulkheads.contains_key(upstream) {
-                bulkheads.clear();
-                tracing::warn!("bulkhead registry reached its cap; state reset");
-            }
+            evict_if_full(&mut bulkheads, upstream, "bulkhead");
 
             Arc::clone(
                 bulkheads

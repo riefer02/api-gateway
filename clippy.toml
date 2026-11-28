@@ -1,4 +1,5 @@
-# Clippy configuration. Lint selection lives in Cargo.toml `[lints]` and CI
-# flags; this file only holds tool-wide settings.
+# Clippy configuration. Lint selection lives in Cargo.toml `[lints]` (currently
+# only `unsafe_code = "forbid"`) and in the CI `-D warnings` flag; this file
+# only holds tool-wide settings.
 
 msrv = "1.99"

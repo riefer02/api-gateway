@@ -561,27 +561,19 @@ fn inbound_headers(headers: &HeaderMap) -> HeaderMap {
 fn upstream_error(error: reqwest::Error) -> AppError {
     // Never log `Display`: reqwest includes the full URL, which may carry
     // client query parameters.
-    let kind = if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
-        "connect"
-    } else if error.is_body() {
-        "body"
-    } else {
-        "request"
-    };
-
-    if kind == "timeout" {
-        tracing::warn!(kind, "upstream timed out");
+    if error.is_timeout() {
+        tracing::warn!(kind = "timeout", "upstream timed out");
         return AppError::UpstreamTimeout;
     }
 
-    if kind == "body" {
-        tracing::warn!(kind, "request body failed while forwarding");
-        return AppError::BadGateway;
+    if error.is_body() {
+        tracing::warn!(kind = "body", "request body failed while forwarding");
+    } else if error.is_connect() {
+        tracing::warn!(kind = "connect", "upstream request failed");
+    } else {
+        tracing::warn!(kind = "request", "upstream request failed");
     }
 
-    tracing::warn!(kind, "upstream request failed");
     AppError::BadGateway
 }
 
