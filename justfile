@@ -20,8 +20,12 @@ test:
 deny:
     cargo deny check
 
+# Module dependency direction and storage ownership (cheap greps)
+architecture:
+    ./scripts/check-architecture.sh
+
 # Full local gate; mirrors CI
-check: fmt-check clippy test deny
+check: fmt-check architecture clippy test deny
     @echo "all checks passed"
 
 run:
