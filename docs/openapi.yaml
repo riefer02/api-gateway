@@ -274,7 +274,10 @@ paths:
     get:
       tags: [routes]
       summary: List routes
-      description: Ordered by path prefix, then id. Pass `next_cursor` back as `cursor`.
+      description: |
+        Ordered by id, which a route keeps across updates, so editing a path
+        prefix cannot move a row across a page boundary. Pass `next_cursor`
+        back as `cursor`.
       parameters:
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"

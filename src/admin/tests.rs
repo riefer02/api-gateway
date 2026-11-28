@@ -699,7 +699,7 @@ async fn route_listing_pages_and_ends() {
     // on the way, and only this test's rows are removed afterwards.
     let mut seen = Vec::new();
     let mut cursor = None;
-    let mut last: Option<(String, String)> = None;
+    let mut last: Option<String> = None;
 
     for _ in 0..32 {
         let page = service
@@ -710,14 +710,14 @@ async fn route_listing_pages_and_ends() {
         assert!(page.items.len() <= 2, "a page is never larger than asked");
 
         for route in &page.items {
-            let key = (route.path_prefix.clone(), route.id.clone());
             if let Some(previous) = &last {
                 assert!(
-                    previous < &key,
-                    "pages must be strictly ordered by (prefix, id): {previous:?} then {key:?}"
+                    previous < &route.id,
+                    "pages must be strictly ordered by id: {previous} then {}",
+                    route.id
                 );
             }
-            last = Some(key);
+            last = Some(route.id.clone());
             seen.push(route.id.clone());
         }
 
@@ -840,4 +840,154 @@ async fn audit_listing_pages_newest_first() {
             .await
             .ok();
     }
+}
+
+/// Regression: a route's path prefix can be edited, so it cannot be the sort
+/// key. Ordered by prefix, moving the middle route *before* the page boundary
+/// made the walk skip it; the id order must not move.
+#[tokio::test]
+async fn route_pagination_survives_a_prefix_edit_between_pages() {
+    let Some(pool) = pg_pool().await else {
+        eprintln!("skipping: DATABASE_URL is not set");
+        return;
+    };
+
+    let store: Arc<dyn ApiKeyStore> = Arc::new(auth::store::postgres::PostgresApiKeyStore::new(
+        pool.clone(),
+    ));
+    let service = AdminService::new(
+        pool.clone(),
+        Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+        crate::routing::test_routing(),
+        store,
+        std::time::Duration::from_secs(300),
+        false,
+    );
+
+    let actor = Actor::local("pager");
+    let upstream = unique("edit-upstream");
+    service
+        .put_upstream(&actor, &upstream, "https://mcp.internal", 5_000, None, None)
+        .await
+        .expect("upstream");
+
+    let base = unique("page-edit");
+    let ids: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|suffix| format!("{base}-{suffix}"))
+        .collect();
+
+    for id in &ids {
+        service
+            .put_route(
+                &actor,
+                RouteSpec {
+                    id: id.clone(),
+                    path_prefix: format!("/{id}"),
+                    methods: vec!["GET".to_owned()],
+                    upstream_id: upstream.clone(),
+                    rewrite_prefix: None,
+                    tenant_id: None,
+                    scopes: None,
+                    tool_policy: None,
+                    request_timeout_ms: None,
+                    max_response_bytes: None,
+                    enabled: Some(true),
+                    priority: None,
+                },
+            )
+            .await
+            .expect("route");
+    }
+
+    // Walk one row at a time until the first of this test's routes is reached.
+    let mut cursor = None;
+    let mut reached = false;
+
+    for _ in 0..256 {
+        let page = service
+            .list_routes(PageRequest::new(Some(1), cursor.clone()).expect("page"))
+            .await
+            .expect("page");
+
+        let Some(route) = page.items.first() else {
+            break;
+        };
+
+        assert!(
+            route.id <= ids[0] || reached,
+            "the walk passed the test routes without seeing them"
+        );
+
+        if route.id == ids[0] {
+            reached = true;
+            cursor = page.next_cursor;
+            break;
+        }
+
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert!(reached, "did not reach the test routes");
+
+    // Move the middle route before the page boundary in prefix order.
+    service
+        .put_route(
+            &actor,
+            RouteSpec {
+                id: ids[1].clone(),
+                path_prefix: format!("/000{}", ids[1]),
+                methods: vec!["GET".to_owned()],
+                upstream_id: upstream.clone(),
+                rewrite_prefix: None,
+                tenant_id: None,
+                scopes: None,
+                tool_policy: None,
+                request_timeout_ms: None,
+                max_response_bytes: None,
+                enabled: Some(true),
+                priority: None,
+            },
+        )
+        .await
+        .expect("prefix edit");
+
+    let second = service
+        .list_routes(PageRequest::new(Some(1), cursor).expect("page"))
+        .await
+        .expect("page after the edit");
+    assert_eq!(
+        second
+            .items
+            .first()
+            .map(|route| route.id.as_str()),
+        Some(ids[1].as_str()),
+        "a prefix edit must not move a route out of the page walk"
+    );
+
+    let third = service
+        .list_routes(PageRequest::new(Some(1), second.next_cursor.clone()).expect("page"))
+        .await
+        .expect("page after the edit");
+    assert_eq!(
+        third
+            .items
+            .first()
+            .map(|route| route.id.as_str()),
+        Some(ids[2].as_str())
+    );
+
+    for id in &ids {
+        service
+            .delete_route(&actor, id)
+            .await
+            .ok();
+    }
+    service
+        .delete_upstream(&actor, &upstream)
+        .await
+        .ok();
 }

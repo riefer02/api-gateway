@@ -342,24 +342,23 @@ impl AdminService {
         &self,
         page: PageRequest,
     ) -> Result<Page<RouteSummary>, AdminError> {
-        let (after_prefix, after_id) = match page.cursor() {
-            Some(cursor) => {
-                let parts = decode_cursor(cursor, 2)?;
-                (Some(parts[0].clone()), Some(parts[1].clone()))
-            }
-            None => (None, None),
+        // Ordered by id, not by path prefix: `id` is the only column a route
+        // keeps across updates, and keyset pagination over a mutable sort key
+        // can skip or repeat the edited row between pages.
+        let after = match page.cursor() {
+            Some(cursor) => Some(decode_cursor(cursor, 1)?.remove(0)),
+            None => None,
         };
 
         let rows = sqlx::query(
             "SELECT id, methods, path_prefix, rewrite_prefix, tenant_id, upstream_id,
                     scopes, tool_policy, request_timeout_ms, max_response_bytes, enabled, priority
              FROM routes
-             WHERE ($1::text IS NULL OR (path_prefix, id) > ($1, $2))
-             ORDER BY path_prefix, id
-             LIMIT $3",
+             WHERE ($1::text IS NULL OR id > $1)
+             ORDER BY id
+             LIMIT $2",
         )
-        .bind(after_prefix.as_deref())
-        .bind(after_id.as_deref())
+        .bind(after.as_deref())
         .bind(i64::from(page.limit.saturating_add(1)))
         .fetch_all(&self.pool)
         .await
@@ -420,7 +419,7 @@ impl AdminService {
         let entries = summaries
             .into_iter()
             .map(|route| {
-                let cursor = encode_cursor(&[route.path_prefix.as_str(), route.id.as_str()]);
+                let cursor = encode_cursor(&[route.id.as_str()]);
                 (route, cursor)
             })
             .collect();

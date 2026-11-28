@@ -181,9 +181,9 @@ api-gateway admin tenant rm acme
 Every listing — `key list`, `route list`, `upstream list`, `audit list`, `audit data` —
 returns one page: default 100 rows, maximum 1000 (`--limit`), and prints the `--cursor` for
 the next page when more exist. The HTTP listings page the same way, with `limit` and
-`cursor`, and return `{"items": [...], "next_cursor": "..."}`. Cursors are keyset-based, so
-a key issued, a route added, or an audit row written between pages cannot shift the
-boundary; see `docs/openapi.yaml`.
+`cursor`, and return `{"items": [...], "next_cursor": "..."}`. Cursors are keyset-based and
+sorted on immutable columns, so a key issued, a route added or re-prefixed, or an audit
+row written between pages cannot shift the boundary; see `docs/openapi.yaml`.
 
 A route `PUT`/`route put` is **partial for security fields**: omitting `tenant_id`,
 `scopes`, `tool_policy`, or the enable flags preserves what is stored. An explicit

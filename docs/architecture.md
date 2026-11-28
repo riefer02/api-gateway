@@ -142,8 +142,9 @@ here.
 
 - **Every control-plane listing is keyset-paginated** — keys (per client), upstreams,
   routes, control-plane audit, and data audit: `limit` (default 100, max 1000) plus an
-  opaque `cursor`, with the next cursor in the response body. Pagination is stable under
-  concurrent inserts and deletes, including audit rows written while an operator pages.
+  opaque `cursor`, with the next cursor in the response body. Every sort key is
+  immutable (`id`, `created_at`, `occurred_at`), so inserts, deletes, and even an edit to
+  a route's path prefix cannot move a row across a page boundary.
 - **Rate limits and breakers are per replica** (ADR 0005). N replicas allow up to N × the
   configured rate, and a breaker needs N × its threshold before every replica opens.
 - **Control-plane writes serialise** on one advisory lock so the audit chain has a single

@@ -208,6 +208,11 @@ impl PageRequest {
 /// Cursors are keyset, not offsets: they name the last row returned, so a row
 /// inserted or deleted between pages cannot shift the page boundary.
 ///
+/// Every listing sorts on a column a row never changes (`id`, `created_at`,
+/// `occurred_at`). Sorting on a mutable column such as a route's path prefix
+/// would let an edit move a row across the boundary, which is a skip or a
+/// repeat the client cannot detect.
+///
 /// Each part is hex-encoded and the parts are joined with `.`, which hex can
 /// never contain. Encoding the parts separately rather than joining them first
 /// matters: a route id or path prefix may contain any character, including the
