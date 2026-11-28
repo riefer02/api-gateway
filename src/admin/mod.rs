@@ -11,6 +11,10 @@ use crate::auth::{
 use crate::mcp::ToolPolicy;
 use crate::routing;
 
+/// The privilege vocabulary is owned by `config`, where `ADMIN_TOKENS` is
+/// parsed. Re-exported so the adapters keep one import site.
+pub(crate) use crate::config::AdminScope;
+
 pub(crate) mod cli;
 pub(crate) mod http;
 
@@ -88,40 +92,6 @@ pub(crate) struct UpstreamSummary {
     pub(crate) timeout_ms: u32,
     pub(crate) audience: Option<String>,
     pub(crate) exchange_scope: Option<String>,
-}
-
-/// Every control-plane privilege. The string form is what `ADMIN_TOKENS` grants.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdminScope {
-    TenantsWrite,
-    KeysRead,
-    KeysWrite,
-    ConfigRead,
-    ConfigWrite,
-    AuditRead,
-}
-
-impl AdminScope {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 6] = [
-        Self::TenantsWrite,
-        Self::KeysRead,
-        Self::KeysWrite,
-        Self::ConfigRead,
-        Self::ConfigWrite,
-        Self::AuditRead,
-    ];
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::TenantsWrite => "tenants:write",
-            Self::KeysRead => "keys:read",
-            Self::KeysWrite => "keys:write",
-            Self::ConfigRead => "config:read",
-            Self::ConfigWrite => "config:write",
-            Self::AuditRead => "audit:read",
-        }
-    }
 }
 
 /// Who performed a mutation, and what their credential allows.
@@ -663,22 +633,22 @@ impl AdminService {
 
         if let Some(ms) = spec.request_timeout_ms
             && ms != 0
-            && u128::from(ms) > self.max_request_timeout.as_millis()
         {
-            return Err(AdminError::Invalid(format!(
-                "request_timeout_ms must not exceed the maximum request deadline ({} ms)",
-                self.max_request_timeout.as_millis()
-            )));
+            // The same range the compiler enforces. Without it, a deployment
+            // with MAX_REQUEST_TIMEOUT_SECS above an hour could store a value
+            // the next refresh rejects, taking the whole route table with it.
+            routing::validate_stored_timeout_ms(i64::from(ms)).map_err(AdminError::Invalid)?;
+
+            if u128::from(ms) > self.max_request_timeout.as_millis() {
+                return Err(AdminError::Invalid(format!(
+                    "request_timeout_ms must not exceed the maximum request deadline ({} ms)",
+                    self.max_request_timeout.as_millis()
+                )));
+            }
         }
 
-        if let Some(cap) = spec.max_response_bytes
-            && cap != 0
-            && !(1024..=1_073_741_824).contains(&cap)
-        {
-            return Err(AdminError::Invalid(
-                "max_response_bytes must be between 1024 and 1073741824 (or 0 for unlimited)"
-                    .to_owned(),
-            ));
+        if let Some(cap) = spec.max_response_bytes {
+            routing::validate_response_cap(cap).map_err(AdminError::Invalid)?;
         }
 
         if let Some(policy) = &spec.tool_policy {
@@ -1488,16 +1458,62 @@ mod tests {
     }
 
     #[test]
-    fn scope_vocabulary_matches_configuration() {
-        let declared: Vec<&str> = AdminScope::ALL
-            .iter()
-            .map(|scope| scope.as_str())
-            .collect();
+    fn scope_parsing_round_trips_the_vocabulary() {
+        for scope in AdminScope::ALL {
+            assert_eq!(
+                AdminScope::parse(scope.as_str()),
+                Some(scope),
+                "{} must parse back to itself",
+                scope.as_str()
+            );
+        }
 
-        assert_eq!(
-            declared,
-            crate::config::ADMIN_SCOPES.to_vec(),
-            "AdminScope and ADMIN_SCOPES must list the same privileges"
+        assert_eq!(AdminScope::parse("keys:delete"), None);
+        assert_eq!(AdminScope::parse("Keys:Read"), None);
+    }
+
+    /// The write path and the compiler must reach the same verdict. If the
+    /// configured hard deadline is above the compiler's per-route ceiling, a
+    /// deadline in between used to be storable and then invalidated every
+    /// reload — an admin write could take the whole route table down.
+    ///
+    /// The pool is lazy: validation must finish without touching the database.
+    #[tokio::test]
+    async fn a_deadline_the_compiler_would_reject_is_refused_at_write_time() {
+        let service = AdminService::new(
+            crate::testing::lazy_pool(),
+            Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+            crate::routing::test_routing(),
+            Arc::new(auth::store::InMemoryApiKeyStore::default()),
+            // Two hours: above the one-hour ceiling the compiler applies.
+            std::time::Duration::from_secs(7_200),
+            false,
+        );
+
+        let error = service
+            .put_route(
+                &Actor::local("test"),
+                RouteSpec {
+                    id: "slow-route".to_owned(),
+                    path_prefix: "/slow".to_owned(),
+                    methods: vec!["GET".to_owned()],
+                    upstream_id: "unused".to_owned(),
+                    rewrite_prefix: None,
+                    tenant_id: None,
+                    scopes: None,
+                    tool_policy: None,
+                    request_timeout_ms: Some(crate::routing::MAX_ROUTE_TIMEOUT_MS + 1),
+                    max_response_bytes: None,
+                    enabled: None,
+                    priority: None,
+                },
+            )
+            .await
+            .expect_err("a deadline above the compiler ceiling must be refused");
+
+        assert!(
+            matches!(error, AdminError::Invalid(ref message) if message.contains("request_timeout_ms must be between")),
+            "expected Invalid, got {error:?}"
         );
     }
 

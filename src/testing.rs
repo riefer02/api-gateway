@@ -42,7 +42,9 @@ pub(crate) fn config_with(overrides: &[(&str, &str)]) -> Config {
     Config::from_source(&source as &dyn EnvSource).expect("test configuration")
 }
 
-fn lazy_pool() -> sqlx::PgPool {
+/// A pool that never connects. Tests that must not touch the database use it;
+/// a stray query fails loudly instead of silently needing Postgres.
+pub(crate) fn lazy_pool() -> sqlx::PgPool {
     PgPoolOptions::new()
         .connect_lazy("postgres://test:test@127.0.0.1:5432/test")
         .expect("lazy pool")

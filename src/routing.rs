@@ -434,6 +434,39 @@ fn is_dot_segment(segment: &str) -> bool {
     segment == "." || segment == ".."
 }
 
+/// The smallest per-route response cap that is not a mistake. Below this the
+/// cap is indistinguishable from truncating every response.
+pub(crate) const MIN_RESPONSE_CAP: u64 = 1024;
+/// Upper bound on a per-route response cap: 1 GiB. Shared by the compiler and
+/// the admin write path so both reach the same verdict on the same number.
+pub(crate) const MAX_RESPONSE_CAP: u64 = 1_073_741_824;
+/// Largest per-route deadline, in milliseconds (one hour).
+pub(crate) const MAX_ROUTE_TIMEOUT_MS: u32 = 3_600_000;
+
+/// `0` means unlimited. Any other value must be in the accepted range.
+pub(crate) fn validate_response_cap(cap: u64) -> Result<(), String> {
+    if cap == 0 || (MIN_RESPONSE_CAP..=MAX_RESPONSE_CAP).contains(&cap) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "max_response_bytes must be 0 (unlimited) or between {MIN_RESPONSE_CAP} and {MAX_RESPONSE_CAP}"
+    ))
+}
+
+/// A stored route deadline. `0` is rejected here: unlike the write path, where
+/// `0` means "clear the override", a stored zero would make every request to
+/// the route time out instantly.
+pub(crate) fn validate_stored_timeout_ms(ms: i64) -> Result<(), String> {
+    if (1..=i64::from(MAX_ROUTE_TIMEOUT_MS)).contains(&ms) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "request_timeout_ms must be between 1 and {MAX_ROUTE_TIMEOUT_MS}"
+    ))
+}
+
 /// Route syntax shared by the compiler and the admin write path.
 pub(crate) fn validate_path_prefix(prefix: &str) -> Result<(), String> {
     if !prefix.starts_with('/') {
@@ -649,11 +682,8 @@ fn compile_optional_deadline(
         return Some(None);
     };
 
-    if !(1..=3_600_000).contains(&ms) {
-        problems.push(format!(
-            "route `{}`: request_timeout_ms must be between 1 and 3600000",
-            row.id
-        ));
+    if let Err(problem) = validate_stored_timeout_ms(i64::from(ms)) {
+        problems.push(format!("route `{}`: {problem}", row.id));
         return None;
     }
 
@@ -673,11 +703,8 @@ fn compile_response_cap(row: &RouteRow, problems: &mut Vec<String>) -> Option<Op
         return None;
     };
 
-    if cap != 0 && !(1024..=1_073_741_824).contains(&cap) {
-        problems.push(format!(
-            "route `{}`: max_response_bytes must be 0 (unlimited) or between 1024 and 1073741824",
-            row.id
-        ));
+    if let Err(problem) = validate_response_cap(cap) {
+        problems.push(format!("route `{}`: {problem}", row.id));
         return None;
     }
 
@@ -1351,6 +1378,45 @@ mod tests {
             table.resolve(&HttpMethod::GET, "/api/private/data", Some("tenant-b")),
             RouteMatch::NotFound
         ));
+    }
+
+    #[test]
+    fn a_stored_limit_outside_the_accepted_range_invalidates_the_table() {
+        let mut zero_deadline = row("zero", "/zero", &["GET"]);
+        zero_deadline.request_timeout_ms = Some(0);
+        let problems = RouteTable::compile(1, vec![zero_deadline], &test_routing(), false)
+            .expect_err("a stored zero deadline must be rejected");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("request_timeout_ms must be between 1 and 3600000")),
+            "{problems:?}"
+        );
+
+        let mut oversized_cap = row("cap", "/cap", &["GET"]);
+        oversized_cap.max_response_bytes = Some(i64::from(u32::MAX));
+        let problems = RouteTable::compile(1, vec![oversized_cap], &test_routing(), false)
+            .expect_err("a cap above 1 GiB must be rejected");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("max_response_bytes must be 0 (unlimited)")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_route_limit_validators_agree_with_the_constants() {
+        assert!(validate_response_cap(0).is_ok());
+        assert!(validate_response_cap(MIN_RESPONSE_CAP).is_ok());
+        assert!(validate_response_cap(MIN_RESPONSE_CAP - 1).is_err());
+        assert!(validate_response_cap(MAX_RESPONSE_CAP).is_ok());
+        assert!(validate_response_cap(MAX_RESPONSE_CAP + 1).is_err());
+
+        assert!(validate_stored_timeout_ms(1).is_ok());
+        assert!(validate_stored_timeout_ms(0).is_err());
+        assert!(validate_stored_timeout_ms(i64::from(MAX_ROUTE_TIMEOUT_MS)).is_ok());
+        assert!(validate_stored_timeout_ms(i64::from(MAX_ROUTE_TIMEOUT_MS) + 1).is_err());
     }
 
     #[test]

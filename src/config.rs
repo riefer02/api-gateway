@@ -245,14 +245,56 @@ pub struct AdminToken {
 }
 
 /// Every privilege a control-plane token can hold.
-pub const ADMIN_SCOPES: &[&str] = &[
-    "tenants:write",
-    "keys:read",
-    "keys:write",
-    "config:read",
-    "config:write",
-    "audit:read",
-];
+///
+/// The canonical vocabulary: `ADMIN_TOKENS` is parsed against it, and
+/// `Actor::require` is checked against it. There is deliberately no second
+/// list of scope strings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdminScope {
+    TenantsWrite,
+    KeysRead,
+    KeysWrite,
+    ConfigRead,
+    ConfigWrite,
+    AuditRead,
+}
+
+impl AdminScope {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::TenantsWrite,
+        Self::KeysRead,
+        Self::KeysWrite,
+        Self::ConfigRead,
+        Self::ConfigWrite,
+        Self::AuditRead,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TenantsWrite => "tenants:write",
+            Self::KeysRead => "keys:read",
+            Self::KeysWrite => "keys:write",
+            Self::ConfigRead => "config:read",
+            Self::ConfigWrite => "config:write",
+            Self::AuditRead => "audit:read",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|scope| scope.as_str() == value)
+    }
+
+    /// The comma-separated list shown when a token names an unknown scope.
+    fn vocabulary() -> String {
+        Self::ALL
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
@@ -1327,10 +1369,10 @@ fn parse_admin_scopes(
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
     {
-        if scope != "*" && !ADMIN_SCOPES.contains(&scope) {
+        if scope != "*" && AdminScope::parse(scope).is_none() {
             problems.push(format!(
                 "ADMIN_TOKENS scope `{scope}` for `{name}` is unknown; valid scopes are {}",
-                ADMIN_SCOPES.join(", ")
+                AdminScope::vocabulary()
             ));
             continue;
         }
