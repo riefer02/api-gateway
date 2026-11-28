@@ -8,7 +8,7 @@ use crate::auth::{
     TenantId,
 };
 
-use super::{ApiKeyStore, NewApiKey, StoreError};
+use super::{ApiKeyStore, KeySummary, NewApiKey, StoreError};
 
 pub(crate) struct PostgresApiKeyStore {
     pool: PgPool,
@@ -132,14 +132,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         .map_err(unavailable)?;
 
         if result.rows_affected() > 0 {
-            // Transactional: the notification commits with the revoke, so no
-            // replica can see one without the other.
-            sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(crate::auth::cache::REVOCATION_CHANNEL)
-                .bind(key_id.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(unavailable)?;
+            notify_key_change(&mut transaction, key_id).await?;
         }
 
         transaction
@@ -150,6 +143,50 @@ impl ApiKeyStore for PostgresApiKeyStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn list_for_client(&self, client_id: &ClientId) -> Result<Vec<KeySummary>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                k.key_id,
+                k.client_id,
+                k.created_at,
+                k.expires_at,
+                k.revoked_at,
+                COALESCE(array_agg(s.scope) FILTER (WHERE s.scope IS NOT NULL), '{}') AS scopes
+            FROM api_keys k
+            LEFT JOIN api_key_scopes s ON s.key_id = k.key_id
+            WHERE k.client_id = $1
+            GROUP BY k.key_id
+            ORDER BY k.created_at DESC
+            "#,
+        )
+        .bind(client_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(unavailable)?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(KeySummary {
+                    key_id: row.try_get("key_id").map_err(decode)?,
+                    client_id: row
+                        .try_get("client_id")
+                        .map_err(decode)?,
+                    scopes: row.try_get("scopes").map_err(decode)?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(decode)?,
+                    expires_at: row
+                        .try_get("expires_at")
+                        .map_err(decode)?,
+                    revoked_at: row
+                        .try_get("revoked_at")
+                        .map_err(decode)?,
+                })
+            })
+            .collect()
+    }
+
     async fn insert_key(&self, key: NewApiKey) -> Result<(), StoreError> {
         let mut transaction = self
             .pool
@@ -157,39 +194,127 @@ impl ApiKeyStore for PostgresApiKeyStore {
             .await
             .map_err(unavailable)?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO api_keys
-                (key_id, client_id, verifier, verifier_version, expires_at)
-            VALUES ($1, $2, $3, $4, $5)
-            "#,
-        )
-        .bind(key.key_id.as_str())
-        .bind(key.client_id.as_str())
-        .bind(key.verifier.0.to_vec())
-        .bind(i16::from(key.verifier_version))
-        .bind(key.expires_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(insert_error)?;
-
-        let scopes: Vec<String> = key.scopes.into_iter().collect();
-
-        sqlx::query(
-            "INSERT INTO api_key_scopes (key_id, scope)
-             SELECT $1, unnest($2::text[])",
-        )
-        .bind(key.key_id.as_str())
-        .bind(&scopes)
-        .execute(&mut *transaction)
-        .await
-        .map_err(unavailable)?;
+        insert_key_in(&mut transaction, &key).await?;
 
         transaction
             .commit()
             .await
             .map_err(unavailable)
     }
+
+    async fn rotate_key(&self, old: &ApiKeyId, new: NewApiKey) -> Result<bool, StoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(unavailable)?;
+
+        // Revoke first: if the old key is gone or already revoked, nothing is
+        // inserted and the caller gets `false` instead of an orphan credential.
+        let revoked = sqlx::query(
+            "UPDATE api_keys SET revoked_at = now()
+             WHERE key_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(old.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(unavailable)?;
+
+        if revoked.rows_affected() == 0 {
+            transaction
+                .rollback()
+                .await
+                .map_err(unavailable)?;
+            return Ok(false);
+        }
+
+        insert_key_in(&mut transaction, &new).await?;
+        notify_key_change(&mut transaction, old).await?;
+        notify_key_change(&mut transaction, &new.key_id).await?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(unavailable)?;
+
+        Ok(true)
+    }
+
+    async fn replace_key(&self, new: NewApiKey) -> Result<(), StoreError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(unavailable)?;
+
+        sqlx::query("DELETE FROM api_keys WHERE key_id = $1")
+            .bind(new.key_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(unavailable)?;
+
+        insert_key_in(&mut transaction, &new).await?;
+        notify_key_change(&mut transaction, &new.key_id).await?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(unavailable)
+    }
+}
+
+/// Inserts the key row and its scopes into an open transaction.
+async fn insert_key_in(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &NewApiKey,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys
+            (key_id, client_id, verifier, verifier_version, expires_at)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(key.key_id.as_str())
+    .bind(key.client_id.as_str())
+    .bind(key.verifier.0.to_vec())
+    .bind(i16::from(key.verifier_version))
+    .bind(key.expires_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(insert_error)?;
+
+    let scopes: Vec<String> = key.scopes.iter().cloned().collect();
+
+    sqlx::query(
+        "INSERT INTO api_key_scopes (key_id, scope)
+         SELECT $1, unnest($2::text[])",
+    )
+    .bind(key.key_id.as_str())
+    .bind(&scopes)
+    .execute(&mut **transaction)
+    .await
+    .map_err(unavailable)?;
+
+    Ok(())
+}
+
+/// Announces a credential change on the revocation channel.
+///
+/// Transactional: the notification commits with the write, so no replica can
+/// see one without the other.
+async fn notify_key_change(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_id: &ApiKeyId,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(crate::auth::cache::REVOCATION_CHANNEL)
+        .bind(key_id.as_str())
+        .execute(&mut **transaction)
+        .await
+        .map_err(unavailable)?;
+
+    Ok(())
 }
 
 fn parse_status(value: &str) -> Result<AccountStatus, StoreError> {
@@ -405,5 +530,205 @@ mod tests {
                 .expect("lookup")
                 .is_none()
         );
+    }
+
+    fn verifier() -> crate::auth::KeyVerifier {
+        crate::auth::KeyVerifier::new(crate::config::SecretString::new("test-pepper"))
+    }
+
+    fn token_for(client: &ClientId, verifier: &crate::auth::KeyVerifier) -> NewApiKey {
+        crate::auth::key::generate(
+            verifier,
+            client.clone(),
+            HashSet::from(["read".to_owned()]),
+            None,
+        )
+        .expect("generate key")
+        .0
+    }
+
+    #[tokio::test]
+    async fn rotation_issues_the_replacement_and_revokes_the_old_key() {
+        let Some(pool) = pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let (tenant_id, client_id) = provision(&pool).await;
+        let store = PostgresApiKeyStore::new(pool.clone());
+        let verifier = verifier();
+
+        let old = token_for(&client_id, &verifier);
+        let old_id = old.key_id.clone();
+        store
+            .insert_key(old)
+            .await
+            .expect("insert");
+
+        let new = token_for(&client_id, &verifier);
+        let new_id = new.key_id.clone();
+        assert!(
+            store
+                .rotate_key(&old_id, new)
+                .await
+                .expect("rotate")
+        );
+
+        let old_row = store
+            .find_by_key_id(&old_id)
+            .await
+            .expect("read old")
+            .expect("old row");
+        assert!(
+            old_row.key.revoked_at.is_some(),
+            "the old key must be revoked in the same transaction"
+        );
+
+        let new_row = store
+            .find_by_key_id(&new_id)
+            .await
+            .expect("read new")
+            .expect("new row");
+        assert!(
+            new_row.key.revoked_at.is_none(),
+            "the replacement must be active"
+        );
+
+        cleanup(&pool, &tenant_id, &client_id).await;
+    }
+
+    #[tokio::test]
+    async fn rotation_of_a_revoked_key_inserts_nothing() {
+        let Some(pool) = pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let (tenant_id, client_id) = provision(&pool).await;
+        let store = PostgresApiKeyStore::new(pool.clone());
+        let verifier = verifier();
+
+        let old = token_for(&client_id, &verifier);
+        let old_id = old.key_id.clone();
+        store
+            .insert_key(old)
+            .await
+            .expect("insert");
+        assert!(
+            store
+                .revoke_by_key_id(&old_id)
+                .await
+                .expect("revoke")
+        );
+
+        let new = token_for(&client_id, &verifier);
+        let new_id = new.key_id.clone();
+
+        assert!(
+            !store
+                .rotate_key(&old_id, new)
+                .await
+                .expect("rotate"),
+            "an inactive key cannot be rotated"
+        );
+        assert!(
+            store
+                .find_by_key_id(&new_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "no credential may be left behind when the rotation is refused"
+        );
+
+        cleanup(&pool, &tenant_id, &client_id).await;
+    }
+
+    #[tokio::test]
+    async fn lists_only_the_clients_keys() {
+        let Some(pool) = pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let (tenant_id, client_id) = provision(&pool).await;
+        let (other_tenant, other_client) = provision(&pool).await;
+        let store = PostgresApiKeyStore::new(pool.clone());
+        let verifier = verifier();
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let key = token_for(&client_id, &verifier);
+            ids.push(key.key_id.0.clone());
+            store
+                .insert_key(key)
+                .await
+                .expect("insert");
+        }
+        store
+            .insert_key(token_for(&other_client, &verifier))
+            .await
+            .expect("insert other");
+
+        let summaries = store
+            .list_for_client(&client_id)
+            .await
+            .expect("list");
+
+        assert_eq!(summaries.len(), 2);
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.client_id == client_id.as_str())
+        );
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.scopes == vec!["read".to_owned()])
+        );
+        assert!(ids.iter().all(|id| {
+            summaries
+                .iter()
+                .any(|summary| &summary.key_id == id)
+        }));
+
+        cleanup(&pool, &tenant_id, &client_id).await;
+        cleanup(&pool, &other_tenant, &other_client).await;
+    }
+
+    #[tokio::test]
+    async fn replacing_a_key_swaps_the_verifier() {
+        let Some(pool) = pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let (tenant_id, client_id) = provision(&pool).await;
+        let store = PostgresApiKeyStore::new(pool.clone());
+        let verifier = verifier();
+
+        let first = token_for(&client_id, &verifier);
+        let key_id = first.key_id.clone();
+        store
+            .insert_key(first)
+            .await
+            .expect("insert");
+
+        let mut second = token_for(&client_id, &verifier);
+        second.key_id = key_id.clone();
+        let expected = second.verifier.0;
+        store
+            .replace_key(second)
+            .await
+            .expect("replace");
+
+        let row = store
+            .find_by_key_id(&key_id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.key.verifier.0, expected);
+        assert!(row.key.revoked_at.is_none());
+
+        cleanup(&pool, &tenant_id, &client_id).await;
     }
 }

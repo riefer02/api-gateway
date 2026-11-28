@@ -40,15 +40,9 @@ pub(crate) struct IssuedKey {
     pub(crate) expires_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug)]
-pub(crate) struct KeySummary {
-    pub(crate) key_id: String,
-    pub(crate) client_id: String,
-    pub(crate) scopes: Vec<String>,
-    pub(crate) created_at: OffsetDateTime,
-    pub(crate) expires_at: Option<OffsetDateTime>,
-    pub(crate) revoked_at: Option<OffsetDateTime>,
-}
+/// The credential listing is a store read model, not a second definition.
+pub(crate) use crate::auth::store::KeySummary;
+pub(crate) use crate::auth::store::NewApiKey;
 
 #[derive(Debug)]
 /// A route write. `None` means "preserve the stored value" for every optional
@@ -334,54 +328,36 @@ impl AdminService {
 
     /// Issues a replacement for `key_id` with the same client, scopes, and
     /// remaining lifetime, then revokes the old key. The old key stays valid
-    /// until the revoke commits.
+    /// Issues a replacement for `key_id` with the same client, scopes, and
+    /// remaining lifetime, then revokes the old key — in one transaction, so
+    /// there is no window where both are active and no compensating revoke.
     pub(crate) async fn rotate_key(
         &self,
         actor: &Actor,
         key_id: &str,
     ) -> Result<IssuedKey, AdminError> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                k.client_id,
-                k.expires_at,
-                k.revoked_at,
-                COALESCE(array_agg(s.scope) FILTER (WHERE s.scope IS NOT NULL), '{}') AS scopes
-            FROM api_keys k
-            LEFT JOIN api_key_scopes s ON s.key_id = k.key_id
-            WHERE k.key_id = $1
-            GROUP BY k.key_id
-            "#,
-        )
-        .bind(key_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound {
-            entity: "key",
-            id: key_id.to_owned(),
-        })?;
+        let old = auth::ApiKeyId(key_id.to_owned());
+        let credential = self
+            .store
+            .find_by_key_id(&old)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| AdminError::NotFound {
+                entity: "key",
+                id: key_id.to_owned(),
+            })?;
 
-        let revoked_at: Option<OffsetDateTime> = row
-            .try_get("revoked_at")
-            .map_err(AdminError::Store)?;
-
-        if revoked_at.is_some() {
+        if credential.key.revoked_at.is_some() {
             return Err(AdminError::Conflict {
                 message: format!("key `{key_id}` is already revoked"),
             });
         }
 
-        let client_id: String = row
-            .try_get("client_id")
-            .map_err(AdminError::Store)?;
-        let scopes: Vec<String> = row
-            .try_get("scopes")
-            .map_err(AdminError::Store)?;
-        let expires_at: Option<OffsetDateTime> = row
-            .try_get("expires_at")
-            .map_err(AdminError::Store)?;
-        if expires_at.is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc()) {
+        if credential
+            .key
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
+        {
             return Err(AdminError::Conflict {
                 message: format!(
                     "key `{key_id}` has expired; issue a new key instead of rotating it"
@@ -389,40 +365,67 @@ impl AdminService {
             });
         }
 
-        let remaining = expires_at;
+        let expires_at = credential.key.expires_at;
+        let scopes: Vec<String> = {
+            let mut scopes: Vec<String> = credential
+                .key
+                .scopes
+                .iter()
+                .cloned()
+                .collect();
+            scopes.sort();
+            scopes
+        };
 
-        let issued = self
-            .issue_key(actor, &client_id, &scopes, remaining)
-            .await?;
+        let (key, secret) = key::generate(
+            &self.verifier,
+            credential.key.client_id.clone(),
+            credential.key.scopes.clone(),
+            expires_at,
+        )
+        .map_err(|error| AdminError::Invalid(format!("could not generate key: {error}")))?;
 
-        let revoked = self
+        let replacement = key.key_id.0.clone();
+        let token = key::token(&key.key_id, &secret);
+
+        if !self
             .store
-            .revoke_by_key_id(&auth::ApiKeyId(key_id.to_owned()))
+            .rotate_key(&old, key)
             .await
-            .map_err(store_error)?;
-
-        if !revoked {
-            // Do not leave an active credential whose token was never shown.
-            let _ = self
-                .store
-                .revoke_by_key_id(&auth::ApiKeyId(issued.key_id.clone()))
-                .await;
-
+            .map_err(store_error)?
+        {
             return Err(AdminError::NotFound {
-                entity: "key",
+                entity: "active key",
                 id: key_id.to_owned(),
             });
         }
+
+        // Same two events as before: the issued credential and the rotation.
+        self.audit_best_effort(
+            actor,
+            "key.create",
+            &replacement,
+            serde_json::json!({
+                "client_id": credential.key.client_id.as_str(),
+                "scopes": scopes,
+            }),
+        )
+        .await;
 
         self.audit_best_effort(
             actor,
             "key.rotate",
             key_id,
-            serde_json::json!({ "replacement": issued.key_id }),
+            serde_json::json!({ "replacement": replacement }),
         )
         .await;
 
-        Ok(issued)
+        Ok(IssuedKey {
+            key_id: replacement,
+            token,
+            scopes,
+            expires_at,
+        })
     }
 
     pub(crate) async fn revoke_key(&self, actor: &Actor, key_id: &str) -> Result<(), AdminError> {
@@ -446,51 +449,10 @@ impl AdminService {
     }
 
     pub(crate) async fn list_keys(&self, client_id: &str) -> Result<Vec<KeySummary>, AdminError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                k.key_id,
-                k.client_id,
-                k.created_at,
-                k.expires_at,
-                k.revoked_at,
-                COALESCE(array_agg(s.scope) FILTER (WHERE s.scope IS NOT NULL), '{}') AS scopes
-            FROM api_keys k
-            LEFT JOIN api_key_scopes s ON s.key_id = k.key_id
-            WHERE k.client_id = $1
-            GROUP BY k.key_id
-            ORDER BY k.created_at DESC
-            "#,
-        )
-        .bind(client_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(AdminError::Store)?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(KeySummary {
-                    key_id: row
-                        .try_get("key_id")
-                        .map_err(AdminError::Store)?,
-                    client_id: row
-                        .try_get("client_id")
-                        .map_err(AdminError::Store)?,
-                    scopes: row
-                        .try_get("scopes")
-                        .map_err(AdminError::Store)?,
-                    created_at: row
-                        .try_get("created_at")
-                        .map_err(AdminError::Store)?,
-                    expires_at: row
-                        .try_get("expires_at")
-                        .map_err(AdminError::Store)?,
-                    revoked_at: row
-                        .try_get("revoked_at")
-                        .map_err(AdminError::Store)?,
-                })
-            })
-            .collect()
+        self.store
+            .list_for_client(&ClientId(client_id.to_owned()))
+            .await
+            .map_err(store_error)
     }
 
     /// Upstreams are declarative: re-adding one updates it. The allowlist is
@@ -928,23 +890,22 @@ impl AdminService {
 
     /// Development convenience: provisions the local tenant/client and seeds
     /// the key from `DEV_API_KEY_SECRET`, replacing any previous one.
+    ///
+    /// The tenant and client rows are this module's own; the credential is the
+    /// store's. Two transactions are acceptable here because the next boot
+    /// re-runs both inserts idempotently.
     pub(crate) async fn seed_development_key(
         &self,
         secret: &str,
         scopes: &[String],
     ) -> Result<(), AdminError> {
         let scopes = normalize_scopes(scopes)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(AdminError::Store)?;
 
         sqlx::query(
             "INSERT INTO tenants (id, status) VALUES ('tenant-local', 'active')
              ON CONFLICT (id) DO NOTHING",
         )
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await
         .map_err(AdminError::Store)?;
 
@@ -953,42 +914,21 @@ impl AdminService {
              VALUES ('client-local', 'tenant-local', 'active')
              ON CONFLICT (id) DO NOTHING",
         )
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await
         .map_err(AdminError::Store)?;
 
-        sqlx::query("DELETE FROM api_keys WHERE key_id = 'dev-local'")
-            .execute(&mut *transaction)
+        self.store
+            .replace_key(NewApiKey {
+                key_id: auth::ApiKeyId("dev-local".to_owned()),
+                client_id: ClientId("client-local".to_owned()),
+                verifier: self.verifier.verifier_for(secret),
+                verifier_version: auth::verifier::VERIFIER_VERSION,
+                scopes: scopes.iter().cloned().collect(),
+                expires_at: None,
+            })
             .await
-            .map_err(AdminError::Store)?;
-
-        sqlx::query(
-            "INSERT INTO api_keys (key_id, client_id, verifier, verifier_version, expires_at)
-             VALUES ('dev-local', 'client-local', $1, $2, NULL)",
-        )
-        .bind(
-            self.verifier
-                .verifier_for(secret)
-                .0
-                .to_vec(),
-        )
-        .bind(i16::from(auth::verifier::VERIFIER_VERSION))
-        .execute(&mut *transaction)
-        .await
-        .map_err(AdminError::Store)?;
-
-        sqlx::query(
-            "INSERT INTO api_key_scopes (key_id, scope) SELECT 'dev-local', unnest($1::text[])",
-        )
-        .bind(&scopes)
-        .execute(&mut *transaction)
-        .await
-        .map_err(AdminError::Store)?;
-
-        transaction
-            .commit()
-            .await
-            .map_err(AdminError::Store)?;
+            .map_err(store_error)?;
 
         self.audit_best_effort(
             &Actor::local("system"),

@@ -27,13 +27,48 @@ pub(crate) struct NewApiKey {
     pub(crate) expires_at: Option<OffsetDateTime>,
 }
 
+/// Read model for the control plane: a key as listed, never with its verifier.
+///
+/// This lives beside the store rather than in `admin` so the table has one
+/// owner: an operator-facing projection cannot drift from the rows it shows.
+#[derive(Debug, Clone)]
+pub(crate) struct KeySummary {
+    pub(crate) key_id: String,
+    pub(crate) client_id: String,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) created_at: OffsetDateTime,
+    pub(crate) expires_at: Option<OffsetDateTime>,
+    pub(crate) revoked_at: Option<OffsetDateTime>,
+}
+
+/// The only interface to `api_keys`.
+///
+/// Every read and write of a credential goes through this trait. Keeping the
+/// SQL here is what lets security review one file, and what makes rotation a
+/// single transaction instead of an insert followed by a compensating revoke.
 #[async_trait]
 pub(crate) trait ApiKeyStore: Send + Sync {
     async fn find_by_key_id(&self, key_id: &ApiKeyId) -> Result<Option<Credential>, StoreError>;
 
+    /// Summary rows for one client, newest first.
+    async fn list_for_client(&self, client_id: &ClientId) -> Result<Vec<KeySummary>, StoreError>;
+
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError>;
 
     async fn insert_key(&self, key: NewApiKey) -> Result<(), StoreError>;
+
+    /// Issues `new` and revokes `old` in one transaction.
+    ///
+    /// Returns `false` when `old` is missing or already revoked, and inserts
+    /// nothing in that case: the caller never ends up with an active key whose
+    /// token it cannot show.
+    async fn rotate_key(&self, old: &ApiKeyId, new: NewApiKey) -> Result<bool, StoreError>;
+
+    /// Replaces the row stored under `new.key_id`, if any (development seed).
+    ///
+    /// Destructive by design: the caller supplies a fixed id and expects a
+    /// fresh verifier for it on every boot.
+    async fn replace_key(&self, new: NewApiKey) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -52,9 +87,17 @@ mod memory {
 
     const TEST_TENANT: &str = "tenant-in-memory";
 
+    /// The production record has no creation time; the listing needs one, so
+    /// the double keeps it beside the credential rather than widening the
+    /// authentication model for a control-plane field.
+    struct StoredKey {
+        credential: Credential,
+        created_at: OffsetDateTime,
+    }
+
     #[derive(Clone, Default)]
     pub(crate) struct InMemoryApiKeyStore {
-        records: Arc<RwLock<HashMap<ApiKeyId, Credential>>>,
+        records: Arc<RwLock<HashMap<ApiKeyId, StoredKey>>>,
     }
 
     impl InMemoryApiKeyStore {
@@ -64,6 +107,21 @@ mod memory {
 
         pub(crate) fn insert_with_status(
             &self,
+            key: NewApiKey,
+            client_status: AccountStatus,
+            tenant_status: AccountStatus,
+        ) -> Result<(), StoreError> {
+            let mut records = self
+                .records
+                .write()
+                .map_err(|_| StoreError::Unavailable)?;
+
+            self.insert_locked(&mut records, key, client_status, tenant_status)
+        }
+
+        fn insert_locked(
+            &self,
+            records: &mut HashMap<ApiKeyId, StoredKey>,
             key: NewApiKey,
             client_status: AccountStatus,
             tenant_status: AccountStatus,
@@ -90,14 +148,12 @@ mod memory {
                 },
             };
 
-            let mut records = self
-                .records
-                .write()
-                .map_err(|_| StoreError::Unavailable)?;
-
             match records.entry(credential.key.key_id.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(credential);
+                    entry.insert(StoredKey {
+                        credential,
+                        created_at: OffsetDateTime::now_utc(),
+                    });
                     Ok(())
                 }
                 std::collections::hash_map::Entry::Occupied(_) => Err(StoreError::DuplicateKey),
@@ -116,7 +172,51 @@ mod memory {
                 .read()
                 .map_err(|_| StoreError::Unavailable)?;
 
-            Ok(records.get(key_id).cloned())
+            Ok(records
+                .get(key_id)
+                .map(|stored| stored.credential.clone()))
+        }
+
+        async fn list_for_client(
+            &self,
+            client_id: &ClientId,
+        ) -> Result<Vec<KeySummary>, StoreError> {
+            let records = self
+                .records
+                .read()
+                .map_err(|_| StoreError::Unavailable)?;
+
+            let mut summaries: Vec<KeySummary> = records
+                .values()
+                .filter(|stored| &stored.credential.key.client_id == client_id)
+                .map(|stored| KeySummary {
+                    key_id: stored.credential.key.key_id.0.clone(),
+                    client_id: stored
+                        .credential
+                        .key
+                        .client_id
+                        .0
+                        .clone(),
+                    scopes: {
+                        let mut scopes: Vec<String> = stored
+                            .credential
+                            .key
+                            .scopes
+                            .iter()
+                            .cloned()
+                            .collect();
+                        scopes.sort();
+                        scopes
+                    },
+                    created_at: stored.created_at,
+                    expires_at: stored.credential.key.expires_at,
+                    revoked_at: stored.credential.key.revoked_at,
+                })
+                .collect();
+
+            summaries.sort_by_key(|summary| std::cmp::Reverse(summary.created_at));
+
+            Ok(summaries)
         }
 
         async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError> {
@@ -125,12 +225,17 @@ mod memory {
                 .write()
                 .map_err(|_| StoreError::Unavailable)?;
 
-            let Some(credential) = records.get_mut(key_id) else {
+            let Some(stored) = records.get_mut(key_id) else {
                 return Ok(false);
             };
 
-            if credential.key.revoked_at.is_none() {
-                credential.key.revoked_at = Some(OffsetDateTime::now_utc());
+            if stored
+                .credential
+                .key
+                .revoked_at
+                .is_none()
+            {
+                stored.credential.key.revoked_at = Some(OffsetDateTime::now_utc());
             }
 
             Ok(true)
@@ -138,6 +243,55 @@ mod memory {
 
         async fn insert_key(&self, key: NewApiKey) -> Result<(), StoreError> {
             self.insert_active(key)
+        }
+
+        async fn rotate_key(&self, old: &ApiKeyId, new: NewApiKey) -> Result<bool, StoreError> {
+            let mut records = self
+                .records
+                .write()
+                .map_err(|_| StoreError::Unavailable)?;
+
+            let Some(previous) = records.get(old) else {
+                return Ok(false);
+            };
+
+            if previous
+                .credential
+                .key
+                .revoked_at
+                .is_some()
+            {
+                return Ok(false);
+            }
+
+            self.insert_locked(
+                &mut records,
+                new,
+                AccountStatus::Active,
+                AccountStatus::Active,
+            )?;
+
+            if let Some(previous) = records.get_mut(old) {
+                previous.credential.key.revoked_at = Some(OffsetDateTime::now_utc());
+            }
+
+            Ok(true)
+        }
+
+        async fn replace_key(&self, new: NewApiKey) -> Result<(), StoreError> {
+            let mut records = self
+                .records
+                .write()
+                .map_err(|_| StoreError::Unavailable)?;
+
+            records.remove(&new.key_id);
+
+            self.insert_locked(
+                &mut records,
+                new,
+                AccountStatus::Active,
+                AccountStatus::Active,
+            )
         }
     }
 }

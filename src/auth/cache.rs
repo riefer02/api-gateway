@@ -8,8 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::auth::store::{ApiKeyStore, NewApiKey, StoreError};
-use crate::auth::{ApiKeyId, Credential};
+use crate::auth::store::{ApiKeyStore, KeySummary, NewApiKey, StoreError};
+use crate::auth::{ApiKeyId, ClientId, Credential};
 
 /// Postgres channel used to tell every replica that a key was revoked.
 pub(crate) const REVOCATION_CHANNEL: &str = "api_key_revoked";
@@ -236,6 +236,14 @@ impl ApiKeyStore for CachedApiKeyStore {
             .await
     }
 
+    async fn list_for_client(&self, client_id: &ClientId) -> Result<Vec<KeySummary>, StoreError> {
+        // A control-plane read: never served from the credential cache, which
+        // is keyed by id and holds no listing.
+        self.inner
+            .list_for_client(client_id)
+            .await
+    }
+
     async fn insert_key(&self, key: NewApiKey) -> Result<(), StoreError> {
         // A negative entry for this id would hide the new key, so publish the
         // invalidation before writing.
@@ -243,6 +251,28 @@ impl ApiKeyStore for CachedApiKeyStore {
         self.tombstones.invalidate(&key.key_id);
 
         self.inner.insert_key(key).await
+    }
+
+    async fn rotate_key(&self, old: &ApiKeyId, new: NewApiKey) -> Result<bool, StoreError> {
+        // The old id must not be served after this call, whether it succeeds or
+        // not. The new id is a live credential: clear a negative entry, but do
+        // not tombstone it.
+        self.invalidate_local(old);
+        self.negative.invalidate(&new.key_id);
+        self.tombstones.invalidate(&new.key_id);
+
+        self.inner.rotate_key(old, new).await
+    }
+
+    async fn replace_key(&self, new: NewApiKey) -> Result<(), StoreError> {
+        // A positive entry for the old row would outlive the replacement.
+        self.generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.cache.invalidate(&new.key_id);
+        self.negative.invalidate(&new.key_id);
+        self.tombstones.invalidate(&new.key_id);
+
+        self.inner.replace_key(new).await
     }
 }
 
@@ -454,5 +484,56 @@ mod tests {
             .unwrap();
 
         assert!(reloaded.key.revoked_at.is_some(), "expired entry reloaded");
+    }
+
+    #[tokio::test]
+    async fn rotation_invalidates_the_old_key_and_publishes_the_new_one() {
+        let (_, store) = store_with_key(Duration::from_secs(60));
+
+        store
+            .insert_key(key("old"))
+            .await
+            .expect("insert old");
+
+        // Warm the positive cache for the old id and the negative cache for the
+        // replacement: rotation must defeat both.
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("old".to_owned()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("new".to_owned()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            store
+                .rotate_key(&ApiKeyId("old".to_owned()), key("new"))
+                .await
+                .expect("rotate")
+        );
+
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("old".to_owned()))
+                .await
+                .unwrap()
+                .is_none(),
+            "the old id must not be served after a local rotation"
+        );
+        assert!(
+            store
+                .find_by_key_id(&ApiKeyId("new".to_owned()))
+                .await
+                .unwrap()
+                .is_some(),
+            "a cached miss must not hide the replacement"
+        );
     }
 }
