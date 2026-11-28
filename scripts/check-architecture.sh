@@ -49,4 +49,14 @@ if matches=$(grep -REn '"gateway_[a-z0-9_]+"' src --include='*.rs' 2>/dev/null \
     failed=1
 fi
 
+# The credential table has one owner (ADR 0006). A control-plane module that
+# queries it is a second owner, and the next schema change will miss one.
+if matches=$(grep -REn '(INSERT INTO|UPDATE|DELETE FROM|FROM|JOIN) api_keys' src --include='*.rs' 2>/dev/null \
+    | grep -v '^src/auth/store/' \
+    | grep -v '^src/admin/tests.rs:'); then
+    echo "architecture: api_keys SQL belongs in src/auth/store" >&2
+    echo "$matches" >&2
+    failed=1
+fi
+
 exit "$failed"
