@@ -8,7 +8,7 @@ use crate::auth::{
     TenantId,
 };
 
-use super::{ApiKeyStore, KeySummary, NewApiKey, StoreError};
+use super::{ApiKeyStore, KeyPage, KeySummary, NewApiKey, StoreError};
 
 pub(crate) struct PostgresApiKeyStore {
     pool: PgPool,
@@ -143,7 +143,16 @@ impl ApiKeyStore for PostgresApiKeyStore {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn list_for_client(&self, client_id: &ClientId) -> Result<Vec<KeySummary>, StoreError> {
+    async fn list_for_client(
+        &self,
+        client_id: &ClientId,
+        page: KeyPage,
+    ) -> Result<Vec<KeySummary>, StoreError> {
+        let (after_at, after_id) = match &page.after {
+            Some((at, id)) => (Some(*at), Some(id.as_str())),
+            None => (None, None),
+        };
+
         let rows = sqlx::query(
             r#"
             SELECT
@@ -156,11 +165,16 @@ impl ApiKeyStore for PostgresApiKeyStore {
             FROM api_keys k
             LEFT JOIN api_key_scopes s ON s.key_id = k.key_id
             WHERE k.client_id = $1
+              AND ($2::timestamptz IS NULL OR (k.created_at, k.key_id) < ($2, $3::text))
             GROUP BY k.key_id
-            ORDER BY k.created_at DESC
+            ORDER BY k.created_at DESC, k.key_id DESC
+            LIMIT $4
             "#,
         )
         .bind(client_id.as_str())
+        .bind(after_at)
+        .bind(after_id)
+        .bind(i64::from(page.limit))
         .fetch_all(&self.pool)
         .await
         .map_err(unavailable)?;
@@ -670,7 +684,13 @@ mod tests {
             .expect("insert other");
 
         let summaries = store
-            .list_for_client(&client_id)
+            .list_for_client(
+                &client_id,
+                KeyPage {
+                    after: None,
+                    limit: 10,
+                },
+            )
             .await
             .expect("list");
 
@@ -693,6 +713,67 @@ mod tests {
 
         cleanup(&pool, &tenant_id, &client_id).await;
         cleanup(&pool, &other_tenant, &other_client).await;
+    }
+
+    #[tokio::test]
+    async fn key_listing_pages_without_gaps_or_repeats() {
+        let Some(pool) = pg_pool().await else {
+            eprintln!("skipping: DATABASE_URL is not set");
+            return;
+        };
+
+        let (tenant_id, client_id) = provision(&pool).await;
+        let store = PostgresApiKeyStore::new(pool.clone());
+        let verifier = verifier();
+
+        let mut key_ids = Vec::new();
+        for _ in 0..3 {
+            let key = token_for(&client_id, &verifier);
+            key_ids.push(key.key_id.0.clone());
+            store
+                .insert_key(key)
+                .await
+                .expect("insert");
+        }
+
+        let first = store
+            .list_for_client(
+                &client_id,
+                KeyPage {
+                    after: None,
+                    limit: 2,
+                },
+            )
+            .await
+            .expect("first page");
+        assert_eq!(first.len(), 2);
+
+        let last = first.last().expect("row");
+        let second = store
+            .list_for_client(
+                &client_id,
+                KeyPage {
+                    after: Some((last.created_at, last.key_id.clone())),
+                    limit: 2,
+                },
+            )
+            .await
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+
+        let mut seen: Vec<String> = first
+            .iter()
+            .chain(second.iter())
+            .map(|summary| summary.key_id.clone())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "every key appears exactly once");
+
+        key_ids.sort_unstable();
+        assert_eq!(seen, key_ids);
+
+        cleanup(&pool, &tenant_id, &client_id).await;
     }
 
     #[tokio::test]

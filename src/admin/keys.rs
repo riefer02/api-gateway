@@ -176,11 +176,51 @@ impl AdminService {
         Ok(())
     }
 
-    pub(crate) async fn list_keys(&self, client_id: &str) -> Result<Vec<KeySummary>, AdminError> {
-        self.store
-            .list_for_client(&ClientId(client_id.to_owned()))
+    pub(crate) async fn list_keys(
+        &self,
+        client_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<KeySummary>, AdminError> {
+        let after = match page.cursor() {
+            Some(cursor) => {
+                let parts = decode_cursor(cursor, 2)?;
+                let nanos: i128 = parts[0]
+                    .parse()
+                    .map_err(|_| invalid_cursor())?;
+                let at = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+                    .map_err(|_| invalid_cursor())?;
+                Some((at, parts[1].clone()))
+            }
+            None => None,
+        };
+
+        let keys = self
+            .store
+            .list_for_client(
+                &ClientId(client_id.to_owned()),
+                crate::auth::store::KeyPage {
+                    // One extra row tells us whether a next page exists
+                    // without a second count query.
+                    after,
+                    limit: page.limit.saturating_add(1),
+                },
+            )
             .await
-            .map_err(store_error)
+            .map_err(store_error)?;
+
+        let entries = keys
+            .into_iter()
+            .map(|key| {
+                let nanos = key
+                    .created_at
+                    .unix_timestamp_nanos()
+                    .to_string();
+                let cursor = encode_cursor(&[nanos.as_str(), key.key_id.as_str()]);
+                (key, cursor)
+            })
+            .collect();
+
+        Ok(finish_page(entries, page.limit))
     }
 
     /// Development convenience: provisions the local tenant/client and seeds

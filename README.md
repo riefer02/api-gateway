@@ -177,6 +177,12 @@ api-gateway admin client rm acme-app
 api-gateway admin tenant rm acme
 ```
 
+`key list` and `route list` return one page: default 100 rows, maximum 1000
+(`--limit`), and they print the `--cursor` for the next page when more exist. The HTTP
+listings page the same way, with `limit` and `cursor`, and return
+`{"items": [...], "next_cursor": "..."}`. Cursors are keyset-based, so a key issued or a
+route added between pages cannot shift the boundary; see `docs/openapi.yaml`.
+
 A route `PUT`/`route put` is **partial for security fields**: omitting `tenant_id`,
 `scopes`, `tool_policy`, or the enable flags preserves what is stored. An explicit
 empty value clears it (for example `--scope` with `--replace-scopes` and no values, or

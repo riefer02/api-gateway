@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::auth::store::{ApiKeyStore, KeySummary, NewApiKey, StoreError};
+use crate::auth::store::{ApiKeyStore, KeyPage, KeySummary, NewApiKey, StoreError};
 use crate::auth::{ApiKeyId, ClientId, Credential};
 
 /// Postgres channel used to tell every replica that a key was revoked.
@@ -236,11 +236,15 @@ impl ApiKeyStore for CachedApiKeyStore {
             .await
     }
 
-    async fn list_for_client(&self, client_id: &ClientId) -> Result<Vec<KeySummary>, StoreError> {
+    async fn list_for_client(
+        &self,
+        client_id: &ClientId,
+        page: KeyPage,
+    ) -> Result<Vec<KeySummary>, StoreError> {
         // A control-plane read: never served from the credential cache, which
         // is keyed by id and holds no listing.
         self.inner
-            .list_for_client(client_id)
+            .list_for_client(client_id, page)
             .await
     }
 

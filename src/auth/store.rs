@@ -41,6 +41,18 @@ pub(crate) struct KeySummary {
     pub(crate) revoked_at: Option<OffsetDateTime>,
 }
 
+/// Where a key listing resumes.
+///
+/// `after` is the last row of the previous page, ordered by
+/// `(created_at, key_id)` descending. Keyset rather than offset: revoking a
+/// key between pages must not shift the boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyPage {
+    pub(crate) after: Option<(OffsetDateTime, String)>,
+    /// Maximum rows to return.
+    pub(crate) limit: u32,
+}
+
 /// The only interface to `api_keys`.
 ///
 /// Every read and write of a credential goes through this trait. Keeping the
@@ -50,8 +62,12 @@ pub(crate) struct KeySummary {
 pub(crate) trait ApiKeyStore: Send + Sync {
     async fn find_by_key_id(&self, key_id: &ApiKeyId) -> Result<Option<Credential>, StoreError>;
 
-    /// Summary rows for one client, newest first.
-    async fn list_for_client(&self, client_id: &ClientId) -> Result<Vec<KeySummary>, StoreError>;
+    /// Summary rows for one client, newest first, at most `page.limit` of them.
+    async fn list_for_client(
+        &self,
+        client_id: &ClientId,
+        page: KeyPage,
+    ) -> Result<Vec<KeySummary>, StoreError>;
 
     async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError>;
 
@@ -180,6 +196,7 @@ mod memory {
         async fn list_for_client(
             &self,
             client_id: &ClientId,
+            page: KeyPage,
         ) -> Result<Vec<KeySummary>, StoreError> {
             let records = self
                 .records
@@ -214,11 +231,23 @@ mod memory {
                 })
                 .collect();
 
-            summaries.sort_by_key(|summary| std::cmp::Reverse(summary.created_at));
+            summaries.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then(right.key_id.cmp(&left.key_id))
+            });
+
+            if let Some((after_at, after_id)) = &page.after {
+                summaries.retain(|summary| {
+                    (summary.created_at, summary.key_id.as_str()) < (*after_at, after_id.as_str())
+                });
+            }
+
+            summaries.truncate(page.limit as usize);
 
             Ok(summaries)
         }
-
         async fn revoke_by_key_id(&self, key_id: &ApiKeyId) -> Result<bool, StoreError> {
             let mut records = self
                 .records

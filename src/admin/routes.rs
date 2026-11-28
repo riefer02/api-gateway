@@ -338,17 +338,35 @@ impl AdminService {
             .map_err(AdminError::Store)
     }
 
-    pub(crate) async fn list_routes(&self) -> Result<Vec<RouteSummary>, AdminError> {
+    pub(crate) async fn list_routes(
+        &self,
+        page: PageRequest,
+    ) -> Result<Page<RouteSummary>, AdminError> {
+        let (after_prefix, after_id) = match page.cursor() {
+            Some(cursor) => {
+                let parts = decode_cursor(cursor, 2)?;
+                (Some(parts[0].clone()), Some(parts[1].clone()))
+            }
+            None => (None, None),
+        };
+
         let rows = sqlx::query(
             "SELECT id, methods, path_prefix, rewrite_prefix, tenant_id, upstream_id,
                     scopes, tool_policy, request_timeout_ms, max_response_bytes, enabled, priority
-             FROM routes ORDER BY path_prefix",
+             FROM routes
+             WHERE ($1::text IS NULL OR (path_prefix, id) > ($1, $2))
+             ORDER BY path_prefix, id
+             LIMIT $3",
         )
+        .bind(after_prefix.as_deref())
+        .bind(after_id.as_deref())
+        .bind(i64::from(page.limit.saturating_add(1)))
         .fetch_all(&self.pool)
         .await
         .map_err(AdminError::Store)?;
 
-        rows.into_iter()
+        let summaries: Vec<RouteSummary> = rows
+            .into_iter()
             .map(|row| {
                 let tool_policy = serde_json::from_value::<ToolPolicy>(
                     row.try_get("tool_policy")
@@ -397,19 +415,43 @@ impl AdminService {
                         .map_err(AdminError::Store)?,
                 })
             })
-            .collect()
+            .collect::<Result<_, AdminError>>()?;
+
+        let entries = summaries
+            .into_iter()
+            .map(|route| {
+                let cursor = encode_cursor(&[route.path_prefix.as_str(), route.id.as_str()]);
+                (route, cursor)
+            })
+            .collect();
+
+        Ok(finish_page(entries, page.limit))
     }
 
-    pub(crate) async fn list_upstreams(&self) -> Result<Vec<UpstreamSummary>, AdminError> {
+    pub(crate) async fn list_upstreams(
+        &self,
+        page: PageRequest,
+    ) -> Result<Page<UpstreamSummary>, AdminError> {
+        let after = match page.cursor() {
+            Some(cursor) => Some(decode_cursor(cursor, 1)?.remove(0)),
+            None => None,
+        };
+
         let rows = sqlx::query(
             "SELECT id, base_url, timeout_ms, audience, exchange_scope
-             FROM upstreams ORDER BY id",
+             FROM upstreams
+             WHERE ($1::text IS NULL OR id > $1)
+             ORDER BY id
+             LIMIT $2",
         )
+        .bind(after.as_deref())
+        .bind(i64::from(page.limit.saturating_add(1)))
         .fetch_all(&self.pool)
         .await
         .map_err(AdminError::Store)?;
 
-        rows.into_iter()
+        let summaries: Vec<UpstreamSummary> = rows
+            .into_iter()
             .map(|row| {
                 Ok(UpstreamSummary {
                     id: row
@@ -431,7 +473,17 @@ impl AdminService {
                         .map_err(AdminError::Store)?,
                 })
             })
-            .collect()
+            .collect::<Result<_, AdminError>>()?;
+
+        let entries = summaries
+            .into_iter()
+            .map(|upstream| {
+                let cursor = encode_cursor(&[upstream.id.as_str()]);
+                (upstream, cursor)
+            })
+            .collect();
+
+        Ok(finish_page(entries, page.limit))
     }
 
     pub(crate) async fn delete_upstream(&self, actor: &Actor, id: &str) -> Result<(), AdminError> {

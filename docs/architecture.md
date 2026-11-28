@@ -140,11 +140,10 @@ document's map in the same commit.
 These are deliberate and documented rather than hidden. Capacity planning should start
 here.
 
-- **Control-plane listings are unpaginated** for keys (per client), upstreams, and routes.
-  Audit listings already clamp to 1000 rows and page by `before_id`. A fleet with tens of
-  thousands of routes should get cursor pagination (`after_id`/`limit`) before the listing
-  becomes the slowest call an operator makes; that is an API change and needs its own
-  decision.
+- **Control-plane listings are keyset-paginated** for keys (per client), upstreams, and
+  routes: `limit` (default 100, max 1000) plus an opaque `cursor`, with the next cursor in
+  the response body. Pagination is stable under concurrent inserts and deletes. Audit
+  listings clamp to 1000 rows and page by `before_id`.
 - **Rate limits and breakers are per replica** (ADR 0005). N replicas allow up to N × the
   configured rate, and a breaker needs N × its threshold before every replica opens.
 - **Control-plane writes serialise** on one advisory lock so the audit chain has a single

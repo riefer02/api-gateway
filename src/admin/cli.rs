@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    admin::{Actor, AdminService, IssuedKey, KeySummary, RouteSpec},
+    admin::{Actor, AdminService, IssuedKey, KeySummary, PageRequest, RouteSpec},
     auth::{KeyVerifier, store::ApiKeyStore},
     config::Config,
     db, observability,
@@ -148,6 +148,12 @@ pub(crate) enum KeyCommand {
     List {
         #[arg(long)]
         client: String,
+        /// Maximum keys to return (1-1000)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Continue from the previous page's next cursor
+        #[arg(long)]
+        cursor: Option<String>,
     },
 }
 
@@ -217,7 +223,14 @@ pub(crate) enum RouteCommand {
         #[arg(long)]
         priority: Option<i32>,
     },
-    List,
+    List {
+        /// Maximum routes to return (1-1000)
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Continue from the previous page's next cursor
+        #[arg(long)]
+        cursor: Option<String>,
+    },
 }
 
 pub(crate) async fn run(args: AdminArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -482,16 +495,25 @@ async fn run_key_command(
                 .await?;
             println!("key `{key_id}` revoked");
         }
-        KeyCommand::List { client } => {
-            let keys = service.list_keys(&client).await?;
+        KeyCommand::List {
+            client,
+            limit,
+            cursor,
+        } => {
+            let page = PageRequest::new(limit, cursor)?;
+            let keys = service.list_keys(&client, page).await?;
 
-            if keys.is_empty() {
+            if keys.items.is_empty() {
                 println!("no keys for client `{client}`");
                 return Ok(());
             }
 
-            for key in keys {
-                print_key_summary(&key);
+            for key in &keys.items {
+                print_key_summary(key);
+            }
+
+            if let Some(cursor) = &keys.next_cursor {
+                println!("\nmore: --cursor {cursor}");
             }
         }
     }
@@ -613,15 +635,16 @@ async fn run_route_command(
 
             println!("route `{id}` configured on `{prefix}`");
         }
-        RouteCommand::List => {
-            let routes = service.list_routes().await?;
+        RouteCommand::List { limit, cursor } => {
+            let page = PageRequest::new(limit, cursor)?;
+            let routes = service.list_routes(page).await?;
 
-            if routes.is_empty() {
+            if routes.items.is_empty() {
                 println!("no routes configured");
                 return Ok(());
             }
 
-            for route in routes {
+            for route in routes.items {
                 let tools = match route.tool_policy.mode {
                     crate::mcp::ToolMode::Off => "tools=off",
                     crate::mcp::ToolMode::AllowList => "tools=allow_list",
@@ -659,6 +682,10 @@ async fn run_route_command(
                     timeout,
                     cap
                 );
+            }
+
+            if let Some(cursor) = &routes.next_cursor {
+                println!("\nmore: --cursor {cursor}");
             }
         }
     }

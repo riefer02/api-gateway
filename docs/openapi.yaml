@@ -145,21 +145,27 @@ paths:
     get:
       tags: [keys]
       summary: List a client's keys (never returns tokens)
+      description: |
+        Newest first. Pages are keyset-based: pass `next_cursor` back as
+        `cursor`. A key issued or revoked between pages cannot shift the page
+        boundary.
       parameters:
         - name: client_id
           in: query
           required: true
           schema:
             type: string
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
       responses:
         "200":
-          description: Keys
+          description: One page of keys
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/KeySummary"
+                $ref: "#/components/schemas/KeyList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /v1/keys/{key_id}:
     delete:
@@ -199,15 +205,19 @@ paths:
     get:
       tags: [upstreams]
       summary: List upstreams
+      description: Ordered by id. Pass `next_cursor` back as `cursor` for the next page.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
       responses:
         "200":
-          description: Upstreams
+          description: One page of upstreams
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Upstream"
+                $ref: "#/components/schemas/UpstreamList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /v1/upstreams/{id}:
     put:
@@ -264,15 +274,19 @@ paths:
     get:
       tags: [routes]
       summary: List routes
+      description: Ordered by path prefix, then id. Pass `next_cursor` back as `cursor`.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
       responses:
         "200":
-          description: Routes
+          description: One page of routes
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Route"
+                $ref: "#/components/schemas/RouteList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /v1/audit:
     get:
@@ -454,6 +468,24 @@ components:
       required: true
       schema:
         type: string
+    Limit:
+      name: limit
+      in: query
+      description: Page size. A value outside the range is a 400, never a silent clamp.
+      schema:
+        type: integer
+        default: 100
+        minimum: 1
+        maximum: 1000
+    Cursor:
+      name: cursor
+      in: query
+      description: |
+        Opaque `next_cursor` from the previous page. Omit it to start at the
+        beginning. Cursors are not offsets and must not be constructed by a
+        client; an invalid one is a 400.
+      schema:
+        type: string
 
   schemas:
     IssuedKey:
@@ -471,6 +503,17 @@ components:
             type: string
         expires_at:
           type: [string, "null"]
+    KeyList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeySummary"
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` for the next page; null when the listing ends.
     KeySummary:
       type: object
       required: [key_id, client_id, scopes, created_at]
@@ -489,6 +532,17 @@ components:
           type: [string, "null"]
         revoked_at:
           type: [string, "null"]
+    UpstreamList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Upstream"
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` for the next page; null when the listing ends.
     Upstream:
       type: object
       required: [id, base_url, timeout_ms]
@@ -503,6 +557,17 @@ components:
           type: [string, "null"]
         exchange_scope:
           type: [string, "null"]
+    RouteList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Route"
+        next_cursor:
+          type: [string, "null"]
+          description: Pass as `cursor` for the next page; null when the listing ends.
     Route:
       type: object
       required: [id, path_prefix, methods, upstream_id]

@@ -227,9 +227,10 @@ async fn a_route_round_trips_tenant_policy_deadline_and_cap() {
         .expect("route");
 
     let saved = service
-        .list_routes()
+        .list_routes(PageRequest::new(None, None).expect("page"))
         .await
         .expect("list routes")
+        .items
         .into_iter()
         .find(|saved| saved.id == route)
         .expect("route");
@@ -403,9 +404,10 @@ async fn a_partial_route_update_preserves_security_fields() {
         .expect("partial route update");
 
     let saved = service
-        .list_routes()
+        .list_routes(PageRequest::new(None, None).expect("page"))
         .await
         .expect("list routes")
+        .items
         .into_iter()
         .find(|saved| saved.id == route)
         .expect("route");
@@ -581,4 +583,161 @@ async fn an_upstream_audience_requires_token_exchange() {
             .to_string()
             .contains("OAUTH_TOKEN_ENDPOINT")
     );
+}
+
+#[test]
+fn cursors_round_trip_and_reject_garbage() {
+    let encoded = encode_cursor(&["/api", "route-1"]);
+
+    assert_eq!(
+        decode_cursor(&encoded, 2).expect("decode"),
+        vec!["/api".to_owned(), "route-1".to_owned()]
+    );
+
+    // A caller must not be able to fabricate a cursor for another listing, or a
+    // truncated one, and silently skip rows.
+    for (candidate, parts) in [
+        // not hex
+        ("zz", 2),
+        // odd-length hex
+        ("abc", 2),
+        ("", 2),
+        // right encoding, wrong arity for this listing
+        (encoded.as_str(), 1),
+    ] {
+        assert!(
+            matches!(decode_cursor(candidate, parts), Err(AdminError::Invalid(_))),
+            "{candidate:?} with {parts} parts must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn route_listing_pages_and_ends() {
+    let Some(pool) = pg_pool().await else {
+        eprintln!("skipping: DATABASE_URL is not set");
+        return;
+    };
+
+    let store: Arc<dyn ApiKeyStore> = Arc::new(auth::store::postgres::PostgresApiKeyStore::new(
+        pool.clone(),
+    ));
+    let service = AdminService::new(
+        pool.clone(),
+        Arc::new(KeyVerifier::new(crate::config::SecretString::new("pepper"))),
+        crate::routing::test_routing(),
+        store,
+        std::time::Duration::from_secs(300),
+        false,
+    );
+
+    let actor = Actor::local("test");
+    let upstream = unique("page-upstream");
+    let tenant = unique("page-tenant");
+
+    service
+        .put_upstream(&actor, &upstream, "https://mcp.internal", 5_000, None, None)
+        .await
+        .expect("upstream");
+    service
+        .create_tenant(&actor, &tenant)
+        .await
+        .expect("tenant");
+
+    let mut route_ids = Vec::new();
+    for suffix in ["a", "b", "c"] {
+        let id = format!("{}-{suffix}", unique("page-route"));
+        service
+            .put_route(
+                &actor,
+                RouteSpec {
+                    id: id.clone(),
+                    path_prefix: format!("/{id}"),
+                    methods: vec!["GET".to_owned()],
+                    upstream_id: upstream.clone(),
+                    rewrite_prefix: None,
+                    tenant_id: None,
+                    scopes: None,
+                    tool_policy: None,
+                    request_timeout_ms: None,
+                    max_response_bytes: None,
+                    enabled: Some(true),
+                    priority: None,
+                },
+            )
+            .await
+            .expect("route");
+        route_ids.push(id);
+    }
+
+    // The listing is global, so walk it to the end rather than assuming these
+    // are the only routes in the database. Page size and ordering are asserted
+    // on the way, and only this test's rows are removed afterwards.
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut last: Option<(String, String)> = None;
+
+    for _ in 0..32 {
+        let page = service
+            .list_routes(PageRequest::new(Some(2), cursor).expect("page"))
+            .await
+            .expect("page");
+
+        assert!(page.items.len() <= 2, "a page is never larger than asked");
+
+        for route in &page.items {
+            let key = (route.path_prefix.clone(), route.id.clone());
+            if let Some(previous) = &last {
+                assert!(
+                    previous < &key,
+                    "pages must be strictly ordered by (prefix, id): {previous:?} then {key:?}"
+                );
+            }
+            last = Some(key);
+            seen.push(route.id.clone());
+        }
+
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    for id in &route_ids {
+        assert_eq!(
+            seen.iter()
+                .filter(|seen| *seen == id)
+                .count(),
+            1,
+            "route `{id}` must appear exactly once across pages"
+        );
+    }
+
+    for id in &route_ids {
+        service
+            .delete_route(&actor, id)
+            .await
+            .ok();
+    }
+    service
+        .delete_upstream(&actor, &upstream)
+        .await
+        .ok();
+    service
+        .delete_tenant(&actor, &tenant)
+        .await
+        .ok();
+}
+
+#[test]
+fn page_requests_are_bounded() {
+    assert_eq!(
+        PageRequest::new(None, None)
+            .expect("default")
+            .limit,
+        DEFAULT_PAGE_SIZE
+    );
+    assert!(PageRequest::new(Some(0), None).is_err());
+    assert!(PageRequest::new(Some(MAX_PAGE_SIZE + 1), None).is_err());
+    assert!(PageRequest::new(Some(MAX_PAGE_SIZE), None).is_ok());
 }

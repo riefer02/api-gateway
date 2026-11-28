@@ -163,6 +163,111 @@ pub(crate) struct DataAuditEntry {
     pub(crate) detail: serde_json::Value,
 }
 
+/// Default page size when a caller does not ask for one.
+pub(crate) const DEFAULT_PAGE_SIZE: u32 = 100;
+/// Largest page a caller may ask for. Bounds the work one request can cause.
+pub(crate) const MAX_PAGE_SIZE: u32 = 1_000;
+
+/// One page of a control-plane listing.
+#[derive(Debug)]
+pub(crate) struct Page<T> {
+    pub(crate) items: Vec<T>,
+    /// Pass to the next request as `cursor`. `None` means the listing ended.
+    pub(crate) next_cursor: Option<String>,
+}
+
+/// A validated page request, shared by the HTTP and CLI adapters.
+#[derive(Debug, Clone)]
+pub(crate) struct PageRequest {
+    pub(crate) limit: u32,
+    cursor: Option<String>,
+}
+
+impl PageRequest {
+    pub(crate) fn new(limit: Option<u32>, cursor: Option<String>) -> Result<Self, AdminError> {
+        let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(AdminError::Invalid(format!(
+                "limit must be between 1 and {MAX_PAGE_SIZE}"
+            )));
+        }
+
+        let cursor = cursor
+            .map(|cursor| cursor.trim().to_owned())
+            .filter(|cursor| !cursor.is_empty());
+
+        Ok(Self { limit, cursor })
+    }
+
+    pub(crate) fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+}
+
+/// Cursors are keyset, not offsets: they name the last row returned, so a row
+/// inserted or deleted between pages cannot shift the page boundary.
+///
+/// The parts are hex-encoded behind a unit separator, which keeps the cursor
+/// opaque (a caller must not build one) and safe in a query string without
+/// pulling in a base64 dependency.
+const CURSOR_SEPARATOR: &str = "\u{1f}";
+/// Generous enough for a long path prefix plus a long id, small enough that a
+/// caller cannot turn decoding into work.
+const MAX_CURSOR_BYTES: usize = 16_384;
+
+pub(crate) fn encode_cursor(parts: &[&str]) -> String {
+    hex::encode(parts.join(CURSOR_SEPARATOR))
+}
+
+/// The one rejection for an unusable cursor, wherever it is decoded.
+pub(crate) fn invalid_cursor() -> AdminError {
+    AdminError::Invalid(
+        "cursor is not valid for this listing; pass `next_cursor` from the previous page"
+            .to_owned(),
+    )
+}
+
+pub(crate) fn decode_cursor(encoded: &str, expected: usize) -> Result<Vec<String>, AdminError> {
+    if encoded.is_empty() || encoded.len() > MAX_CURSOR_BYTES {
+        return Err(invalid_cursor());
+    }
+
+    let bytes = hex::decode(encoded).map_err(|_| invalid_cursor())?;
+    let text = String::from_utf8(bytes).map_err(|_| invalid_cursor())?;
+    let parts: Vec<String> = text
+        .split(CURSOR_SEPARATOR)
+        .map(str::to_owned)
+        .collect();
+
+    if parts.len() != expected || parts.iter().any(String::is_empty) {
+        return Err(invalid_cursor());
+    }
+
+    Ok(parts)
+}
+
+/// Trims the extra row fetched to detect a next page and returns the cursor of
+/// the last row that is actually part of this page.
+fn finish_page<T>(mut entries: Vec<(T, String)>, limit: u32) -> Page<T> {
+    let next_cursor = if entries.len() > limit as usize {
+        entries.truncate(limit as usize);
+        entries
+            .last()
+            .map(|(_, cursor)| cursor.clone())
+    } else {
+        None
+    };
+
+    Page {
+        items: entries
+            .into_iter()
+            .map(|(item, _)| item)
+            .collect(),
+        next_cursor,
+    }
+}
+
 /// The control plane. One implementation, two adapters (CLI now, HTTP later).
 pub(crate) struct AdminService {
     pool: PgPool,

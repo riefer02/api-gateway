@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
-use super::{Actor, AdminError, AdminScope, AdminService, RouteSpec};
+use super::{Actor, AdminError, AdminScope, AdminService, PageRequest, RouteSpec};
 use crate::config::AdminToken;
 use crate::error::AppError;
 use crate::net::TrustedProxies;
@@ -329,22 +329,41 @@ async fn revoke_key(
 #[derive(Deserialize)]
 struct ListKeysQuery {
     client_id: String,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PageQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+/// Every listing is a page: the cursor for the next one rides in the body, so
+/// a client cannot mistake a truncated list for a complete one.
+#[derive(Serialize)]
+struct ListResponse<T> {
+    items: Vec<T>,
+    next_cursor: Option<String>,
 }
 
 async fn list_keys(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
     ApiQuery(query): ApiQuery<ListKeysQuery>,
-) -> Result<Json<Vec<KeySummaryView>>, AppError> {
+) -> Result<Json<ListResponse<KeySummaryView>>, AppError> {
     actor.require(AdminScope::KeysRead)?;
 
+    let page = PageRequest::new(query.limit, query.cursor)?;
     let keys = state
         .service
-        .list_keys(&query.client_id)
+        .list_keys(&query.client_id, page)
         .await?;
 
-    Ok(Json(
-        keys.into_iter()
+    Ok(Json(ListResponse {
+        items: keys
+            .items
+            .into_iter()
             .map(|key| KeySummaryView {
                 key_id: key.key_id,
                 client_id: key.client_id,
@@ -358,7 +377,8 @@ async fn list_keys(
                     .map(|value| value.to_string()),
             })
             .collect(),
-    ))
+        next_cursor: keys.next_cursor,
+    }))
 }
 
 #[derive(Serialize)]
@@ -373,13 +393,19 @@ struct UpstreamView {
 async fn list_upstreams(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
-) -> Result<Json<Vec<UpstreamView>>, AppError> {
+    ApiQuery(query): ApiQuery<PageQuery>,
+) -> Result<Json<ListResponse<UpstreamView>>, AppError> {
     actor.require(AdminScope::ConfigRead)?;
 
-    let upstreams = state.service.list_upstreams().await?;
+    let page = PageRequest::new(query.limit, query.cursor)?;
+    let upstreams = state
+        .service
+        .list_upstreams(page)
+        .await?;
 
-    Ok(Json(
-        upstreams
+    Ok(Json(ListResponse {
+        items: upstreams
+            .items
             .into_iter()
             .map(|upstream| UpstreamView {
                 id: upstream.id,
@@ -389,7 +415,8 @@ async fn list_upstreams(
                 exchange_scope: upstream.exchange_scope,
             })
             .collect(),
-    ))
+        next_cursor: upstreams.next_cursor,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -442,13 +469,16 @@ struct RouteView {
 async fn list_routes(
     State(state): State<AdminState>,
     Extension(actor): Extension<Actor>,
-) -> Result<Json<Vec<RouteView>>, AppError> {
+    ApiQuery(query): ApiQuery<PageQuery>,
+) -> Result<Json<ListResponse<RouteView>>, AppError> {
     actor.require(AdminScope::ConfigRead)?;
 
-    let routes = state.service.list_routes().await?;
+    let page = PageRequest::new(query.limit, query.cursor)?;
+    let routes = state.service.list_routes(page).await?;
 
-    Ok(Json(
-        routes
+    Ok(Json(ListResponse {
+        items: routes
+            .items
             .into_iter()
             .map(|route| RouteView {
                 id: route.id,
@@ -465,7 +495,8 @@ async fn list_routes(
                 priority: route.priority,
             })
             .collect(),
-    ))
+        next_cursor: routes.next_cursor,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -670,6 +701,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_cursor_is_a_bad_request() {
+        // Rejected while decoding, before any database work: the lazy pool in
+        // this fixture proves it.
+        let response = router_with_token("secret")
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/routes?cursor=zz")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_page_size_outside_the_bound_is_a_bad_request() {
+        for uri in ["/v1/routes?limit=0", "/v1/upstreams?limit=1001"] {
+            let response = router_with_token("secret")
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[tokio::test]
